@@ -1,0 +1,15 @@
+# Nunca subir a GitHub
+.env
+*.env
+secrets.txt
+api_keys.txt
+
+# Logs y datos locales
+*.log
+*.jsonl
+*.csv
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db

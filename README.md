@@ -1,185 +1,142 @@
-# 🤖 BingX Trading Bot
+# SATY Elite v11 — BingX + Telegram en Railway
 
-Bot de trading automático para **BingX Futuros Perpetuos** con señales en Telegram.  
-Deploy listo para **Railway**. Estrategias de reversión a la media y scalping.
-
----
-
-## 📊 Estrategias Implementadas
-
-| # | Estrategia | Timeframe | Tipo |
-|---|-----------|-----------|------|
-| 1 | **VWAP + Bandas SD** | 15m | Mean Reversion |
-| 2 | **Bollinger Bands + RSI** | 15m | Mean Reversion |
-| 3 | **EMA Ribbon 9/15** | 5m | Scalping |
-
-### Estrategia 1: VWAP Mean Reversion
-- **SHORT**: precio toca +2SD o +3SD con vela bajista → TP en VWAP
-- **LONG**: precio toca -2SD o -3SD con vela alcista → TP en VWAP
-- Filtro: volatilidad mínima y vela de rechazo confirmada
-
-### Estrategia 2: BB + RSI
-- **LONG**: BB inferior + RSI < 30 + vela alcista → TP en BB Media (SMA20)
-- **SHORT**: BB superior + RSI > 70 + vela bajista → TP en BB Media
-- R:R de 0.75 para maximizar winrate (Bulkowski style)
-
-### Estrategia 3: EMA Ribbon Scalping (5m)
-- Filtro macro: MA200 define dirección
-- **LONG**: EMA9 > EMA15 + pullback a EMA + RSI > 50 + precio > MA200
-- **SHORT**: EMA9 < EMA15 + pullback a EMA + RSI < 50 + precio < MA200
+Bot de trading para BingX Perpetual Futures con alertas completas en Telegram.
+Desplegado en Railway para ejecución 24/7 en la nube.
 
 ---
 
-## 🚀 Setup Rápido
+## 🚀 INSTALACIÓN PASO A PASO
 
-### 1. Clonar el repositorio
-```bash
-git clone https://github.com/tu-usuario/bingx-trading-bot.git
-cd bingx-trading-bot
-```
+### PASO 1 — Subir a GitHub
 
-### 2. Configurar variables de entorno
-```bash
-cp .env.example .env
-# Edita .env con tus credenciales
-nano .env
-```
+1. Ve a **github.com** e inicia sesión (crea cuenta si no tienes)
+2. Click en **"New repository"** (botón verde)
+3. Nombre: `saty-trading-bot`
+4. Visibilidad: **Private** ⚠️ (nunca público con código de trading)
+5. Click **"Create repository"**
+6. En la página del repo vacío, click **"uploading an existing file"**
+7. **Arrastra estos 6 archivos** al área de subida:
+   - `main.py`
+   - `saty_elite_v11.py`
+   - `requirements.txt`
+   - `Procfile`
+   - `railway.json`
+   - `.gitignore`
+8. Click **"Commit changes"**
 
-### 3. Obtener API Key de BingX
-1. Ir a [BingX](https://bingx.com) → Cuenta → Gestión de API
-2. Crear nueva API Key con permisos de **Futuros**
-3. Guardar `API Key` y `Secret Key`
-4. ⚠️ Whitelist de IPs si usas Railway: añade la IP de tu servicio
-
-### 4. Crear Bot de Telegram
-1. Habla con [@BotFather](https://t.me/BotFather) → `/newbot`
-2. Copia el **Token**
-3. Obtén tu **Chat ID**: habla con [@userinfobot](https://t.me/userinfobot)
+✅ Tu código ya está en GitHub
 
 ---
 
-## ☁️ Deploy en Railway
+### PASO 2 — Desplegar en Railway
 
-### Opción A: Desde GitHub (recomendado)
-1. Push del proyecto a GitHub
-2. Ve a [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
-3. Selecciona el repositorio
-4. En **Variables**, añade todas las del `.env.example`:
+1. Ve a **railway.app** e inicia sesión con tu cuenta de GitHub
+2. Click **"New Project"**
+3. Selecciona **"Deploy from GitHub repo"**
+4. Elige tu repo `saty-trading-bot`
+5. Railway detectará el `Procfile` automáticamente
+6. **NO hagas deploy todavía** — primero configura las variables
+
+---
+
+### PASO 3 — Configurar Variables de Entorno en Railway
+
+En tu proyecto Railway:
+1. Click en el servicio creado
+2. Click en la pestaña **"Variables"**
+3. Click **"Add Variable"** y añade CADA UNA de estas:
 
 ```
-BINGX_API_KEY=...
-BINGX_API_SECRET=...
-TELEGRAM_TOKEN=...
-TELEGRAM_CHAT_ID=...
-TRADING_PAIRS=BTC-USDT,ETH-USDT,SOL-USDT
-LEVERAGE=5
-RISK_PER_TRADE=1.0
-MAX_POSITIONS=3
-MAX_DAILY_LOSS=3.0
-TESTNET=false
+BINGX_API_KEY          → tu API Key de BingX
+BINGX_API_SECRET       → tu API Secret de BingX
+TELEGRAM_BOT_TOKEN     → token de tu bot Telegram (de @BotFather)
+TELEGRAM_CHAT_ID       → tu Chat ID (de @userinfobot)
+FIXED_USDT             → 8
+MAX_OPEN_TRADES        → 12
+MIN_SCORE              → 4
+MAX_DRAWDOWN           → 15
+DAILY_LOSS_LIMIT       → 8
+BTC_FILTER             → true
+COOLDOWN_MIN           → 20
+MAX_SPREAD_PCT         → 1.0
+MIN_VOLUME_USDT        → 100000
+TOP_N_SYMBOLS          → 300
+POLL_SECONDS           → 60
 ```
 
-5. Railway detecta el `Dockerfile` automáticamente → Deploy
-
-### Opción B: Railway CLI
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway up
-```
+4. Tras añadir todas, click **"Deploy"**
 
 ---
 
-## 🏃 Ejecución Local
+### PASO 4 — Verificar que funciona
 
-```bash
-# Instalar dependencias
-pip install -r requirements.txt
-
-# Configurar .env
-cp .env.example .env
-# editar .env...
-
-# Ejecutar
-python main.py
-```
-
----
-
-## 📱 Comandos de Telegram
-
-| Comando | Descripción |
-|---------|-------------|
-| `/start` | Información del bot |
-| `/status` | Estado actual (pares, leverage, posiciones) |
-| `/balance` | Balance en BingX Futuros |
-| `/trades` | Posiciones abiertas actualmente |
-| `/pairs` | Lista de pares monitoreados |
-| `/stop` | Señal de parada |
+1. En Railway, click en la pestaña **"Logs"**
+2. Deberías ver:
+   ```
+   SATY ELITE v11 — BingX Real Money + Telegram
+   Variables: OK
+   BingX conectado ✓
+   Universo: XXX pares
+   ```
+3. En **Telegram** recibirás el mensaje de inicio:
+   ```
+   🚀 SATY ELITE v11 — ONLINE
+   Balance: $XXX.XX USDT
+   ...
+   ```
 
 ---
 
-## ⚙️ Variables de Configuración
+## 📱 MENSAJES QUE RECIBIRÁS EN TELEGRAM
 
-| Variable | Default | Descripción |
-|----------|---------|-------------|
-| `TESTNET` | `false` | `true` = sin trades reales |
-| `LEVERAGE` | `5` | Apalancamiento (recomendado: 3-10x) |
-| `RISK_PER_TRADE` | `1.0` | % del balance por trade |
-| `MAX_POSITIONS` | `3` | Máx posiciones simultáneas |
-| `MAX_DAILY_LOSS` | `3.0` | % pérdida diaria para parar |
-| `MEAN_REV_TIMEFRAME` | `15m` | TF para VWAP y BB+RSI |
-| `SCALPING_TIMEFRAME` | `5m` | TF para EMA Ribbon |
-| `ANALYSIS_INTERVAL` | `60` | Segundos entre análisis |
-| `VWAP_MIN_BAND` | `2` | Banda mínima VWAP para señal |
-| `RSI_OVERSOLD` | `30` | RSI nivel sobreventa |
-| `RSI_OVERBOUGHT` | `70` | RSI nivel sobrecompra |
-
----
-
-## 🗂 Estructura del Proyecto
-
-```
-bingx-trading-bot/
-├── main.py                      # Punto de entrada
-├── exchange/
-│   └── bingx_client.py         # Cliente API BingX (con firma HMAC)
-├── strategies/
-│   ├── vwap_strategy.py        # VWAP + Bandas SD
-│   └── bb_rsi_strategy.py      # BB+RSI + EMA Ribbon
-├── bot/
-│   ├── trader.py               # Lógica de trading y ejecución
-│   └── telegram_bot.py         # Bot Telegram + comandos
-├── utils/
-│   ├── risk_manager.py         # Gestión de riesgo
-│   └── logger.py               # Logging
-├── .env.example                # Plantilla de variables
-├── Dockerfile                  # Para Railway/Docker
-├── railway.toml                # Config Railway
-└── requirements.txt
-```
+| Evento | Cuándo |
+|--------|--------|
+| 🚀 **ONLINE** | Al arrancar el bot |
+| 🟢/🔴 **LONG/SHORT** | Al abrir cada trade (con score, TP1, TP2, SL, RSI, ADX) |
+| 🟡 **TP1 + BREAK-EVEN** | Cuando el precio toca TP1 y el SL se mueve a entrada |
+| 🏃/⚡/🔒 **TRAILING** | Cambio de fase del trailing stop |
+| ✅/❌ **CERRADO** | Al cerrar cualquier trade (con PnL, W/L, totales) |
+| 🔔 **RSI EXTREMO** | RSI entre 10-25 o 78-90 (alerta, no entrada) |
+| ₿ **BTC FLIP** | Cuando BTC cambia de alcista a bajista o viceversa |
+| 💓 **HEARTBEAT** | Cada hora (estado del bot, balance, posiciones) |
+| 📡 **RESUMEN** | Cada 20 scans (top señales, posiciones, estadísticas) |
+| 🚨 **CIRCUIT BREAKER** | Si el drawdown supera MAX_DRAWDOWN% |
+| 🚨 **LÍMITE DIARIO** | Si las pérdidas del día superan DAILY_LOSS_LIMIT% |
+| 🔥 **ERROR** | Si hay algún error crítico |
 
 ---
 
-## ⚠️ Advertencias Importantes
+## 💰 COSTES RAILWAY
 
-> **DINERO REAL**: Este bot opera con fondos reales en BingX. Entiende el riesgo antes de activarlo.
-
-- Empieza siempre con **`TESTNET=true`** para verificar que todo funciona
-- Usa un leverage **conservador** (3-5x máximo al comenzar)
-- El `RISK_PER_TRADE=1.0%` es la configuración segura estándar
-- Ninguna estrategia garantiza ganancias. El trading conlleva riesgo de pérdida total
-- Las estrategias funcionan mejor en **mercados laterales/ranging**, no en tendencias fuertes
-- Revisa los logs regularmente en Railway
+- **Hobby Plan**: $5/mes — suficiente para este bot
+- Incluye 512MB RAM y CPU compartida
+- El bot usa ~150MB RAM
 
 ---
 
-## 📋 Checklist Antes de Activar
+## ⚙️ OBTENER API KEYS BINGX
 
-- [ ] API Key de BingX configurada con permisos de Futuros
-- [ ] Bot de Telegram funcionando (probado con `/start`)
-- [ ] Probado con `TESTNET=true` al menos 24h
-- [ ] Balance suficiente en cuenta de Futuros BingX
-- [ ] Entiendes las estrategias y sus condiciones de entrada/salida
-- [ ] Leverage y riesgo configurados conservadoramente
+1. bingx.com → tu cuenta → **API Management**
+2. **Create API** → nombre: `saty-bot`
+3. Permisos: ✅ Read, ✅ Futures Trading, ❌ Withdrawal
+4. Restringe IP si puedes (Railway IPs: variables)
+5. Guarda Key y Secret
+
+---
+
+## 📲 CREAR BOT TELEGRAM
+
+1. Abre Telegram → busca **@BotFather**
+2. Escribe `/newbot`
+3. Nombre: `Saty Trading`
+4. Username: `satymitradingbot` (o cualquiera disponible)
+5. Guarda el **TOKEN** que te da
+6. Busca **@userinfobot** → escríbele cualquier cosa → guarda tu **Chat ID**
+
+---
+
+## ⚠️ AVISO DE RIESGO
+
+Este bot opera con dinero real usando futuros apalancados.
+Puede generar pérdidas. Úsalo bajo tu propia responsabilidad.
+Empieza con `FIXED_USDT=5` y `MAX_OPEN_TRADES=3` para probar.
