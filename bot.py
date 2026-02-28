@@ -1,855 +1,793 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║  SAIYAN ADAPTIVE ENGINE v1.1  (fix: backslash en f-strings)         ║
-║  Modulo de Auto-Aprendizaje + Grid Trading para mercado lateral      ║
-║                                                                      ║
-║  COMO USAR: importar en bot.py y llamar desde el startup:            ║
-║    from adaptive_engine import AdaptiveEngine, GridEngine            ║
-║    adaptive = AdaptiveEngine(st, log)                                ║
-║    grid_engine = GridEngine(ex, st, log, tg)                         ║
-║                                                                      ║
-║  VARIABLES NUEVAS EN RAILWAY:                                        ║
-║    ADAPTIVE_LEARNING  def: true  (auto-ajuste de parametros)         ║
-║    GRID_MODE          def: true  (grid en mercado lateral)           ║
-║    GRID_LEVELS        def: 6     (niveles del grid)                  ║
-║    GRID_SPACING_PCT   def: 0.3   (separacion entre niveles en %)     ║
-║    GRID_USDT          def: 5     (USDT por nivel del grid)           ║
-║    GRID_SYMBOL        def: BTC/USDT:USDT (par para grid)             ║
-║    REGIME_WINDOW      def: 20    (velas para detectar regimen)       ║
-║    REGIME_ADX_THRESH  def: 25    (ADX > 25 = tendencia, < 25 = lat) ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║  SAIYAN AURA FUSION BOT                                      ║
+║  TradingView Webhook → BingX Perpetual Futures + Telegram    ║
+║  Railway 24/7                                                ║
+╠══════════════════════════════════════════════════════════════╣
+║  VARIABLES OBLIGATORIAS:                                     ║
+║    BINGX_API_KEY                                             ║
+║    BINGX_API_SECRET                                          ║
+║    TELEGRAM_BOT_TOKEN                                        ║
+║    TELEGRAM_CHAT_ID                                          ║
+║    WEBHOOK_SECRET    (clave que pones en TradingView)        ║
+║                                                              ║
+║  VARIABLES OPCIONALES:                                       ║
+║    FIXED_USDT        USDT por trade        (def: 20)         ║
+║    LEVERAGE          apalancamiento        (def: 5)          ║
+║    MAX_OPEN_TRADES   max posiciones abiertas (def: 5)        ║
+║    MAX_DRAWDOWN      circuit breaker %     (def: 15)         ║
+║    DAILY_LOSS_LIMIT  perdida diaria %      (def: 8)          ║
+║    TP1_PCT           take profit 1 %       (def: 1.0)        ║
+║    TP2_PCT           take profit 2 %       (def: 1.8)        ║
+║    TP3_PCT           take profit 3 %       (def: 3.0)        ║
+║    SL_PCT            stop loss %           (def: 0.8)        ║
+║  VARIABLES ADAPTIVE ENGINE:                                  ║
+║    ADAPTIVE_LEARNING def: true                               ║
+║    GRID_MODE         def: true                               ║
+║    GRID_LEVELS       def: 6                                  ║
+║    GRID_SPACING_PCT  def: 0.3                                ║
+║    GRID_USDT         def: 5                                  ║
+║    GRID_SYMBOL       def: BTC/USDT:USDT                      ║
+║    REGIME_ADX_THRESH def: 25                                 ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
-import os, time, logging, threading, json, math
-from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass, field
+import os, time, logging, csv, threading
 from datetime import datetime, timezone
-import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional, Dict
 
-# ─────────────────────────────────────────────────────────────────
-# CONFIG ADAPTIVE ENGINE
-# ─────────────────────────────────────────────────────────────────
-ADAPTIVE_LEARNING  = os.environ.get("ADAPTIVE_LEARNING", "true").lower() == "true"
-GRID_MODE          = os.environ.get("GRID_MODE",          "true").lower() == "true"
-GRID_LEVELS        = int  (os.environ.get("GRID_LEVELS",       "6"))
-GRID_SPACING_PCT   = float(os.environ.get("GRID_SPACING_PCT",  "0.3"))
-GRID_USDT          = float(os.environ.get("GRID_USDT",         "5.0"))
-GRID_SYMBOL        = os.environ.get("GRID_SYMBOL", "BTC/USDT:USDT")
-REGIME_WINDOW      = int  (os.environ.get("REGIME_WINDOW",     "20"))
-REGIME_ADX_THRESH  = float(os.environ.get("REGIME_ADX_THRESH", "25.0"))
-LEVERAGE           = int  (os.environ.get("LEVERAGE",          "5"))
+import requests
+import ccxt
+from flask import Flask, request, jsonify
 
-# ─────────────────────────────────────────────────────────────────
-# UTILIDADES
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+log = logging.getLogger("saiyan")
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+API_KEY          = os.environ.get("BINGX_API_KEY",       "")
+API_SECRET       = os.environ.get("BINGX_API_SECRET",    "")
+TG_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN",  "")
+TG_CHAT_ID       = os.environ.get("TELEGRAM_CHAT_ID",    "")
+WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET",      "saiyan2024")
+
+FIXED_USDT       = float(os.environ.get("FIXED_USDT",        "20.0"))
+LEVERAGE         = int  (os.environ.get("LEVERAGE",           "5"))
+MAX_OPEN_TRADES  = int  (os.environ.get("MAX_OPEN_TRADES",    "5"))
+CB_DD            = float(os.environ.get("MAX_DRAWDOWN",       "15.0"))
+DAILY_LOSS_PCT   = float(os.environ.get("DAILY_LOSS_LIMIT",   "8.0"))
+TP1_PCT          = float(os.environ.get("TP1_PCT",            "1.0"))
+TP2_PCT          = float(os.environ.get("TP2_PCT",            "1.8"))
+TP3_PCT          = float(os.environ.get("TP3_PCT",            "3.0"))
+SL_PCT           = float(os.environ.get("SL_PCT",             "0.8"))
+PORT             = int  (os.environ.get("PORT",               "8080"))
+
+CSV_PATH = "/tmp/saiyan_trades.csv"
+_lock    = threading.Lock()
+
+# ─────────────────────────────────────────────
+# STATE
+# ─────────────────────────────────────────────
+@dataclass
+class Trade:
+    symbol:      str
+    side:        str
+    entry_price: float
+    contracts:   float
+    tp1:         float
+    tp2:         float
+    tp3:         float
+    sl:          float
+    entry_time:  str
+    tp1_hit:     bool  = False
+    tp2_hit:     bool  = False
+    sl_at_be:    bool  = False
+
+@dataclass
+class State:
+    trades:         Dict[str, Trade] = field(default_factory=dict)
+    wins:           int   = 0
+    losses:         int   = 0
+    gross_profit:   float = 0.0
+    gross_loss:     float = 0.0
+    peak_equity:    float = 0.0
+    total_pnl:      float = 0.0
+    daily_pnl:      float = 0.0
+    daily_reset_ts: float = field(default_factory=time.time)
+    closed_history: list  = field(default_factory=list)   # para AdaptiveEngine
+
+    def n(self):
+        return len(self.trades)
+
+    def wr(self):
+        t = self.wins + self.losses
+        return self.wins / t * 100 if t else 0.0
+
+    def pf(self):
+        return self.gross_profit / self.gross_loss if self.gross_loss else 0.0
+
+    def cb(self):
+        if self.peak_equity <= 0:
+            return False
+        dd = (self.peak_equity - (self.peak_equity + self.total_pnl)) / self.peak_equity * 100
+        return dd >= CB_DD
+
+    def daily_hit(self):
+        if self.peak_equity <= 0:
+            return False
+        return self.daily_pnl < 0 and abs(self.daily_pnl) / self.peak_equity * 100 >= DAILY_LOSS_PCT
+
+    def reset_daily(self):
+        if time.time() - self.daily_reset_ts > 86400:
+            self.daily_pnl      = 0.0
+            self.daily_reset_ts = time.time()
+            log.info("Daily PnL reset")
+
+    def record_close(self, pnl: float, side: str = "", reason: str = ""):
+        if pnl >= 0:
+            self.wins += 1
+            self.gross_profit += pnl
+        else:
+            self.losses += 1
+            self.gross_loss += abs(pnl)
+        self.total_pnl   += pnl
+        self.daily_pnl   += pnl
+        self.peak_equity  = max(self.peak_equity, self.peak_equity + pnl)
+        # guardar para adaptive engine
+        self.closed_history.append({"pnl": pnl, "side": side, "reason": reason})
+        if len(self.closed_history) > 500:
+            self.closed_history = self.closed_history[-500:]
+
+st = State()
+
+# ─────────────────────────────────────────────
+# EXCHANGE
+# ─────────────────────────────────────────────
+_ex: Optional[ccxt.Exchange] = None
+
+def ex() -> ccxt.Exchange:
+    global _ex
+    if _ex is None:
+        _ex = ccxt.bingx({
+            "apiKey":  API_KEY,
+            "secret":  API_SECRET,
+            "options": {"defaultType": "swap"},
+            "enableRateLimit": True,
+        })
+        _ex.load_markets()
+        log.info("BingX connected")
+    return _ex
+
+def sym(raw: str) -> str:
+    r = raw.upper().strip()
+    if ":" in r: return r
+    if "/" in r:
+        b, q = r.split("/")
+        return "%s/%s:%s" % (b, q, q)
+    if r.endswith("USDT"):
+        return "%s/USDT:USDT" % r[:-4]
+    return r
+
+def price(symbol: str) -> float:
+    return float(ex().fetch_ticker(symbol)["last"])
+
+def balance() -> float:
+    return float(ex().fetch_balance()["USDT"]["free"])
+
+def position(symbol: str) -> Optional[dict]:
+    try:
+        for p in ex().fetch_positions([symbol]):
+            if abs(float(p.get("contracts", 0) or 0)) > 0:
+                return p
+    except Exception:
+        pass
+    return None
+
+def set_lev(symbol: str):
+    try:
+        ex().set_leverage(LEVERAGE, symbol)
+    except Exception as e:
+        log.warning("[%s] leverage: %s", symbol, e)
+
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
+def tg(msg: str, silent: bool = False):
+    if not (TG_TOKEN and TG_CHAT_ID):
+        return
+    try:
+        requests.post(
+            "https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN,
+            data={
+                "chat_id":              TG_CHAT_ID,
+                "text":                 msg,
+                "parse_mode":           "HTML",
+                "disable_notification": "true" if silent else "false",
+            },
+            timeout=10
+        )
+    except Exception as e:
+        log.warning("TG: %s", e)
+
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-def esc(text) -> str:
-    import html
-    return html.escape(str(text), quote=False)
+def msg_start(bal: float):
+    tg(
+        "<b>SAIYAN AURA FUSION — ONLINE</b>\n"
+        "Balance: <b>$%.2f USDT</b>\n"
+        "$%.0f/trade · %dx · max %d pos\n"
+        "TP1 +%.1f%% · TP2 +%.1f%% · TP3 +%.1f%%\n"
+        "SL -%.1f%% · CB -%.1f%% · Diario -%.1f%%\n"
+        "Adaptive Engine: ACTIVO\n"
+        "Webhook listo en /webhook\n"
+        "%s" % (
+            bal, FIXED_USDT, LEVERAGE, MAX_OPEN_TRADES,
+            TP1_PCT, TP2_PCT, TP3_PCT, SL_PCT, CB_DD, DAILY_LOSS_PCT,
+            now()
+        )
+    )
 
+def msg_open(t: Trade, bal: float):
+    d = "LONG" if t.side == "long" else "SHORT"
+    tg(
+        "<b>%s</b> — <code>%s</code>\n"
+        "Entrada:  <code>%.6g</code>\n"
+        "TP1 50%%: <code>%.6g</code>  (+%.1f%%)\n"
+        "TP2 30%%: <code>%.6g</code>  (+%.1f%%)\n"
+        "TP3 20%%: <code>%.6g</code>  (+%.1f%%)\n"
+        "SL:       <code>%.6g</code>   (-%.1f%%)\n"
+        "%.4g contratos · $%.0fx%dx\n"
+        "Balance: $%.2f · %d/%d pos\n"
+        "%s" % (
+            d, t.symbol,
+            t.entry_price,
+            t.tp1, TP1_PCT,
+            t.tp2, TP2_PCT,
+            t.tp3, TP3_PCT,
+            t.sl, SL_PCT,
+            t.contracts, FIXED_USDT, LEVERAGE,
+            bal, st.n(), MAX_OPEN_TRADES,
+            now()
+        )
+    )
 
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 1: ADAPTIVE LEARNING ENGINE
-# ═══════════════════════════════════════════════════════════════════
-class AdaptiveEngine:
-    """
-    Motor de auto-aprendizaje.
-    Analiza closed_history cada hora y ajusta los parametros del bot
-    basandose en patrones de perdidas y ganancias.
-    """
+def msg_tp(t: Trade, label: str, pnl_est: float, remaining: str):
+    be_txt = "SL → Break-Even activado" if label == "TP1" else ""
+    tg(
+        "<b>%s HIT</b> — <code>%s</code>\n"
+        "~$%+.2f parcial\n"
+        "Restante: %s\n"
+        "%s\n"
+        "%s" % (label, t.symbol, pnl_est, remaining, be_txt, now())
+    )
 
-    PARAM_LIMITS = {
-        "RSI_OB":            (60.0,  80.0),
-        "RSI_OS":            (20.0,  40.0),
-        "MAX_SPREAD_PCT":    (0.05,  0.5),
-        "VOL_MULT":          (0.8,   2.5),
-        "ATR_MIN_MULT":      (0.1,   1.0),
-        "SL_PCT":            (0.3,   2.0),
-        "MIN_CONFIRMATIONS": (1,     4),
-        "COOLDOWN_MIN":      (2,     30),
-    }
+def msg_close(t: Trade, exit_p: float, pnl: float, reason: str):
+    e  = "OK" if pnl >= 0 else "XX"
+    pct = (exit_p - t.entry_price) / t.entry_price * 100 * (1 if t.side == "long" else -1)
+    tg(
+        "<b>%s CERRADO · %s</b>\n"
+        "<code>%s</code> %s\n"
+        "<code>%.6g</code> → <code>%.6g</code> (%+.2f%%)\n"
+        "PnL: <b>$%+.2f</b>\n"
+        "%dW/%dL · WR:%.1f%% · PF:%.2f\n"
+        "Hoy: $%+.2f · Total: $%+.2f\n"
+        "%s" % (
+            e, reason,
+            t.symbol, t.side.upper(),
+            t.entry_price, exit_p, pct,
+            pnl,
+            st.wins, st.losses, st.wr(), st.pf(),
+            st.daily_pnl, st.total_pnl,
+            now()
+        )
+    )
 
-    def __init__(self, state, logger):
-        self.st  = state
-        self.log = logger
+def msg_blocked(reason: str, action: str, symbol: str):
+    tg(
+        "<b>BLOQUEADO</b> — %s\n"
+        "Accion: %s %s\n"
+        "%s" % (reason, action, symbol, now())
+    )
 
-        self.params = {
-            "RSI_OB":            float(os.environ.get("RSI_OB",            "72.0")),
-            "RSI_OS":            float(os.environ.get("RSI_OS",            "28.0")),
-            "MAX_SPREAD_PCT":    float(os.environ.get("MAX_SPREAD_PCT",    "0.15")),
-            "VOL_MULT":          float(os.environ.get("VOL_MULT",          "1.2")),
-            "ATR_MIN_MULT":      float(os.environ.get("ATR_MIN_MULT",      "0.3")),
-            "SL_PCT":            float(os.environ.get("SL_PCT",            "0.8")),
-            "MIN_CONFIRMATIONS": int  (os.environ.get("MIN_CONFIRMATIONS", "1")),
-            "COOLDOWN_MIN":      int  (os.environ.get("COOLDOWN_MIN",      "5")),
-        }
+def msg_error(txt: str):
+    tg("<b>ERROR:</b> <code>%s</code>\n%s" % (txt[:300], now()))
 
-        self.adjustment_history: List[dict] = []
-        self.last_analysis_ts    = 0.0
-        self.analysis_interval   = 3600
+# ─────────────────────────────────────────────
+# CSV LOG
+# ─────────────────────────────────────────────
+def csv_log(action: str, t: Trade, exit_p: float = 0.0, pnl: float = 0.0):
+    try:
+        exists = os.path.exists(CSV_PATH)
+        with open(CSV_PATH, "a", newline="") as f:
+            w = csv.writer(f)
+            if not exists:
+                w.writerow(["ts", "action", "symbol", "side", "entry", "exit", "pnl", "qty"])
+            w.writerow([now(), action, t.symbol, t.side,
+                        t.entry_price, exit_p or t.entry_price, round(pnl, 4), t.contracts])
+    except Exception as e:
+        log.warning("CSV: %s", e)
 
-        self.log.info("AdaptiveEngine iniciado - aprendizaje automatico activo")
+# ─────────────────────────────────────────────
+# CORE LOGIC
+# ─────────────────────────────────────────────
+def open_trade(raw_symbol: str, side: str) -> dict:
+    with _lock:
+        symbol = sym(raw_symbol)
 
-    def get(self, param: str):
-        return self.params.get(param)
-
-    def _clamp(self, param: str, value) -> float:
-        lo, hi = self.PARAM_LIMITS[param]
-        return max(lo, min(hi, value))
-
-    def _adjust(self, param: str, delta, reason: str):
-        old = self.params[param]
-        new = self._clamp(param, old + delta)
-        if abs(new - old) < 1e-6:
-            return
-        self.params[param] = new
-        entry = {
-            "ts":     now(),
-            "param":  param,
-            "old":    round(old, 4),
-            "new":    round(new, 4),
-            "reason": reason,
-        }
-        self.adjustment_history.append(entry)
-        if len(self.adjustment_history) > 200:
-            self.adjustment_history = self.adjustment_history[-200:]
-        self.log.info("[ADAPTIVE] %s: %s -> %s (%s)", param, old, new, reason)
-
-    def analyze(self) -> List[dict]:
-        if not ADAPTIVE_LEARNING:
-            return []
-
-        now_ts = time.time()
-        if now_ts - self.last_analysis_ts < self.analysis_interval:
-            return []
-        self.last_analysis_ts = now_ts
-
-        history = self.st.closed_history
-        if len(history) < 5:
-            self.log.info("[ADAPTIVE] Menos de 5 trades - esperando mas datos")
-            return []
-
-        adjustments_made = []
-        recent           = history[-20:]
-        wins             = [t for t in recent if t.get("pnl", 0) >= 0]
-        losses           = [t for t in recent if t.get("pnl", 0) < 0]
-        n_recent         = len(recent)
-        wr_recent        = len(wins) / n_recent * 100 if n_recent > 0 else 0
-
-        self.log.info("[ADAPTIVE] Analizando %d trades. WR: %.1f%%", n_recent, wr_recent)
-
-        # REGLA 1: Muchas perdidas seguidas
-        consecutive = self._count_consecutive_losses(recent)
-        if consecutive >= 3:
-            self._adjust("MIN_CONFIRMATIONS", +1,
-                         "3+ perdidas seguidas (%d)" % consecutive)
-            self._adjust("COOLDOWN_MIN", +2,
-                         "3+ perdidas seguidas - mas cooldown")
-            adjustments_made.append({"type": "safety", "reason": "consecutive_losses", "n": consecutive})
-
-        # REGLA 2: WR bajo
-        if wr_recent < 35 and n_recent >= 10:
-            self._adjust("VOL_MULT",       +0.1,  "WR bajo %.1f%% - mas volumen requerido" % wr_recent)
-            self._adjust("MAX_SPREAD_PCT", -0.02, "WR bajo %.1f%% - menos spread" % wr_recent)
-            adjustments_made.append({"type": "filter", "reason": "low_wr", "wr": wr_recent})
-
-        # REGLA 3: WR alto
-        elif wr_recent > 70 and n_recent >= 10:
-            self._adjust("VOL_MULT",     -0.05, "WR alto %.1f%% - relajando vol" % wr_recent)
-            self._adjust("COOLDOWN_MIN", -1,    "WR alto - menos cooldown")
-            adjustments_made.append({"type": "relax", "reason": "high_wr", "wr": wr_recent})
-
-        # REGLA 4: Longs vs Shorts
-        long_losses  = [t for t in losses if t.get("side") == "long"]
-        short_losses = [t for t in losses if t.get("side") == "short"]
-
-        if len(long_losses) > len(short_losses) * 2 and len(long_losses) >= 3:
-            self._adjust("RSI_OB", -2.0,
-                         "Longs perdiendo (%d vs %d shorts)" % (len(long_losses), len(short_losses)))
-            adjustments_made.append({"type": "side_bias", "reason": "long_losses"})
-
-        elif len(short_losses) > len(long_losses) * 2 and len(short_losses) >= 3:
-            self._adjust("RSI_OS", +2.0,
-                         "Shorts perdiendo (%d vs %d longs)" % (len(short_losses), len(long_losses)))
-            adjustments_made.append({"type": "side_bias", "reason": "short_losses"})
-
-        # REGLA 5: SL frecuente
-        sl_closes = [t for t in recent if "STOP" in t.get("reason", "").upper()
-                     or "SL" in t.get("reason", "").upper()]
-        if len(sl_closes) > n_recent * 0.4 and n_recent >= 8:
-            self._adjust("SL_PCT", +0.1,
-                         "SL tocado %d/%d veces - ampliando SL" % (len(sl_closes), n_recent))
-            adjustments_made.append({"type": "sl_adjust", "reason": "frequent_sl"})
-
-        # REGLA 6: Ratio perdida/ganancia malo
-        if losses:
-            avg_loss_pnl = abs(sum(t.get("pnl", 0) for t in losses) / len(losses))
-            avg_win_pnl  = sum(t.get("pnl", 0) for t in wins) / len(wins) if wins else 0
-            if avg_loss_pnl > avg_win_pnl * 1.5 and len(losses) >= 3:
-                self._adjust("ATR_MIN_MULT", +0.05,
-                             "Perdida media (%.2f) > ganancia media (%.2f)" % (avg_loss_pnl, avg_win_pnl))
-                adjustments_made.append({"type": "rr_adjust", "reason": "bad_rr"})
-
-        if adjustments_made:
-            self.log.info("[ADAPTIVE] %d ajustes aplicados", len(adjustments_made))
-        else:
-            self.log.info("[ADAPTIVE] Sin ajustes necesarios - bot funcionando bien")
-
-        return adjustments_made
-
-    def _count_consecutive_losses(self, trades: list) -> int:
-        count = 0
-        for t in reversed(trades):
-            if t.get("pnl", 0) < 0:
-                count += 1
-            else:
-                break
-        return count
-
-    def get_status(self) -> dict:
-        return {
-            "enabled":            ADAPTIVE_LEARNING,
-            "current_params":     self.params,
-            "adjustments_made":   len(self.adjustment_history),
-            "last_adjustments":   self.adjustment_history[-5:],
-            "next_analysis_in_s": max(0, int(self.analysis_interval - (time.time() - self.last_analysis_ts))),
-        }
-
-    def msg_adaptive_report(self, tg_func):
-        if not self.adjustment_history:
-            tg_func("El bot no ha necesitado ajustes aun. Todo en orden.")
-            return
-
-        recent_adj = self.adjustment_history[-8:]
-        lines = ["<b>REPORTE AUTO-APRENDIZAJE</b>\n" + "=" * 30]
-        for a in reversed(recent_adj):
-            ts     = esc(a["ts"])
-            param  = esc(a["param"])
-            old    = esc(str(a["old"]))
-            new    = esc(str(a["new"]))
-            reason = esc(a["reason"])
-            lines.append(
-                "%s\n  %s: %s -> <b>%s</b>\n  Razon: %s" % (ts, param, old, new, reason)
-            )
-        lines.append("\nTotal ajustes historicos: %d" % len(self.adjustment_history))
-        tg_func("\n".join(lines))
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 2: MARKET REGIME DETECTOR
-# ═══════════════════════════════════════════════════════════════════
-class RegimeDetector:
-    """
-    Detecta el regimen de mercado usando ADX + Bollinger Band Width.
-    TENDENCIA: ADX > 25 y precio alejado de medias
-    LATERAL:   ADX < 25 y precio oscilando en rango estrecho
-    """
-
-    def __init__(self, logger):
-        self.log   = logger
-        self._cache: Dict[str, Tuple[str, float]] = {}
-        self._TTL  = 300
-
-    def _calc_adx(self, highs: np.ndarray, lows: np.ndarray,
-                  closes: np.ndarray, period: int = 14) -> float:
-        if len(closes) < period * 2:
-            return 25.0
-
-        trs, plus_dm, minus_dm = [], [], []
-        for i in range(1, len(closes)):
-            hl  = highs[i] - lows[i]
-            hc  = abs(highs[i] - closes[i - 1])
-            lc  = abs(lows[i]  - closes[i - 1])
-            trs.append(max(hl, hc, lc))
-
-            up   = highs[i]  - highs[i - 1]
-            down = lows[i - 1] - lows[i]
-            plus_dm.append(up   if up > down and up > 0   else 0.0)
-            minus_dm.append(down if down > up and down > 0 else 0.0)
-
-        def wilder_smooth(data, p):
-            result = [sum(data[:p])]
-            for v in data[p:]:
-                result.append(result[-1] - result[-1] / p + v)
-            return result
-
-        atr14    = wilder_smooth(trs,      period)
-        plus_14  = wilder_smooth(plus_dm,  period)
-        minus_14 = wilder_smooth(minus_dm, period)
-
-        dx_vals = []
-        for a, p, m in zip(atr14, plus_14, minus_14):
-            if a == 0:
-                continue
-            pdi   = 100 * p / a
-            mdi   = 100 * m / a
-            denom = pdi + mdi
-            if denom == 0:
-                continue
-            dx_vals.append(100 * abs(pdi - mdi) / denom)
-
-        if not dx_vals:
-            return 25.0
-
-        adx = sum(dx_vals[-period:]) / min(period, len(dx_vals))
-        return round(adx, 2)
-
-    def _calc_bb_width(self, closes: np.ndarray, period: int = 20) -> float:
-        if len(closes) < period:
-            return 0.05
-        recent = closes[-period:]
-        mid    = float(np.mean(recent))
-        std    = float(np.std(recent))
-        if mid == 0:
-            return 0.05
-        return round((4 * std) / mid, 4)
-
-    def detect(self, symbol: str, exchange) -> str:
-        cached = self._cache.get(symbol)
-        if cached and (time.time() - cached[1]) < self._TTL:
-            return cached[0]
+        if st.n() >= MAX_OPEN_TRADES:
+            msg_blocked("Max posiciones abiertas", side, symbol)
+            return {"result": "blocked_max_trades"}
+        if symbol in st.trades:
+            return {"result": "already_open"}
+        if st.cb():
+            msg_blocked("Circuit Breaker >=%.1f%%" % CB_DD, side, symbol)
+            return {"result": "blocked_circuit_breaker"}
+        if st.daily_hit():
+            msg_blocked("Limite diario >=%.1f%%" % DAILY_LOSS_PCT, side, symbol)
+            return {"result": "blocked_daily_limit"}
 
         try:
-            data = exchange.fetch_ohlcv(symbol, "1h", limit=60)
-            if not data or len(data) < 30:
-                return "unknown"
-
-            arr    = np.array(data, dtype=float)
-            highs  = arr[:, 2]
-            lows   = arr[:, 3]
-            closes = arr[:, 4]
-
-            adx      = self._calc_adx(highs, lows, closes, 14)
-            bb_width = self._calc_bb_width(closes, 20)
-
-            if adx >= REGIME_ADX_THRESH and bb_width > 0.04:
-                regime = "trending"
-            elif adx < REGIME_ADX_THRESH:
-                regime = "sideways"
-            else:
-                regime = "trending"
-
-            self._cache[symbol] = (regime, time.time())
-            self.log.info("[REGIME] %s: %s (ADX=%.1f, BBW=%.4f)", symbol, regime.upper(), adx, bb_width)
-            return regime
-
-        except Exception as e:
-            self.log.warning("[REGIME] detect(%s): %s", symbol, e)
-            return "unknown"
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 3: GRID ENGINE
-# ═══════════════════════════════════════════════════════════════════
-@dataclass
-class GridLevel:
-    price:    float
-    side:     str
-    order_id: str   = ""
-    filled:   bool  = False
-    pnl:      float = 0.0
-
-@dataclass
-class ActiveGrid:
-    symbol:       str
-    center_price: float
-    spacing_pct:  float
-    levels:       List[GridLevel] = field(default_factory=list)
-    total_pnl:    float = 0.0
-    trades_count: int   = 0
-    created_at:   str   = field(default_factory=now)
-    active:       bool  = True
-
-
-class GridEngine:
-    """
-    Motor de Grid Trading para mercados laterales.
-
-    Ejemplo con BTC a $95,000 y spacing 0.3%:
-      Venta  @ $95,855 (precio + 3 niveles)
-      Venta  @ $95,570 (precio + 2 niveles)
-      Venta  @ $95,285 (precio + 1 nivel)
-      [PRECIO ACTUAL: $95,000]
-      Compra @ $94,715 (precio - 1 nivel)
-      Compra @ $94,430 (precio - 2 niveles)
-      Compra @ $94,145 (precio - 3 niveles)
-    """
-
-    def __init__(self, exchange_fn, state, logger, tg_fn):
-        self.ex      = exchange_fn
-        self.st      = state
-        self.log     = logger
-        self.tg      = tg_fn
-        self.regime  = RegimeDetector(logger)
-        self.grids:  Dict[str, ActiveGrid] = {}
-        self._lock   = threading.Lock()
-        self.dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
-
-    # ── CREAR GRID ────────────────────────────────────────────────
-    def create_grid(self, symbol: str, center_price: Optional[float] = None) -> dict:
-        if not GRID_MODE:
-            return {"result": "grid_disabled"}
-
-        with self._lock:
-            if symbol in self.grids and self.grids[symbol].active:
-                return {"result": "already_active", "symbol": symbol}
-
-        try:
-            e = self.ex()
+            e = ex()
             if symbol not in e.markets:
                 e.load_markets()
+            if symbol not in e.markets:
+                raise ValueError("Symbol not found: %s" % symbol)
 
-            ticker = e.fetch_ticker(symbol)
-            px     = center_price or float(ticker["last"])
+            set_lev(symbol)
+            px    = price(symbol)
+            bal   = balance()
+            notl  = FIXED_USDT * LEVERAGE
+            raw_q = notl / px
+            qty   = float(e.amount_to_precision(symbol, raw_q))
 
-            if px <= 0:
-                return {"result": "error", "detail": "invalid price"}
+            if qty * px < 5:
+                raise ValueError("Notional too small: %.2f" % (qty * px))
 
-            half   = GRID_LEVELS // 2
-            levels = []
+            order_side = "buy" if side == "long" else "sell"
+            log.info("[OPEN] %s %s qty=%s @~%.6g", symbol, side.upper(), qty, px)
 
-            for i in range(1, half + 1):
-                buy_price  = round(px * (1 - i * GRID_SPACING_PCT / 100), 8)
-                sell_price = round(px * (1 + i * GRID_SPACING_PCT / 100), 8)
-                levels.append(GridLevel(price=buy_price,  side="buy"))
-                levels.append(GridLevel(price=sell_price, side="sell"))
+            order   = e.create_order(symbol, "market", order_side, qty,
+                                     params={"reduceOnly": False})
+            entry_p = float(order.get("average") or px)
 
-            levels.sort(key=lambda lv: lv.price)
+            mult = 1 if side == "long" else -1
+            tp1  = float(e.price_to_precision(symbol, entry_p * (1 + mult * TP1_PCT / 100)))
+            tp2  = float(e.price_to_precision(symbol, entry_p * (1 + mult * TP2_PCT / 100)))
+            tp3  = float(e.price_to_precision(symbol, entry_p * (1 + mult * TP3_PCT / 100)))
+            sl   = float(e.price_to_precision(symbol, entry_p * (1 - mult * SL_PCT  / 100)))
 
-            grid = ActiveGrid(
-                symbol=symbol,
-                center_price=px,
-                spacing_pct=GRID_SPACING_PCT,
-                levels=levels
-            )
+            close_side = "sell" if side == "long" else "buy"
+            ep         = {"reduceOnly": True}
 
-            if not self.dry_run:
-                self._place_grid_orders(e, symbol, grid)
-            else:
-                self.log.info("[GRID DRY] Grid simulado para %s", symbol)
+            splits = [(0.50, tp1, "TP1"), (0.30, tp2, "TP2"), (0.20, tp3, "TP3")]
+            for frac, px_tp, lbl in splits:
+                q = float(e.amount_to_precision(symbol, qty * frac))
+                try:
+                    e.create_order(symbol, "limit", close_side, q, px_tp, ep)
+                    log.info("  %s @ %.6g qty=%s", lbl, px_tp, q)
+                except Exception as err:
+                    log.warning("  %s: %s", lbl, err)
 
-            with self._lock:
-                self.grids[symbol] = grid
-
-            dry_label = "[DRY-RUN]" if self.dry_run else "Ordenes colocadas"
-            msg = (
-                "<b>GRID ACTIVADO</b> - <code>%s</code>\n"
-                "%s\n"
-                "Centro: <code>%s</code>\n"
-                "Niveles: %d (x%d buy + x%d sell)\n"
-                "Espaciado: %s%% por nivel\n"
-                "Capital: $%s x nivel\n"
-                "%s\n"
-                "%s"
-            ) % (
-                esc(symbol), "=" * 30,
-                esc("%.6g" % px),
-                GRID_LEVELS, half, half,
-                esc(str(GRID_SPACING_PCT)),
-                esc(str(GRID_USDT)),
-                dry_label,
-                now()
-            )
-            self.tg(msg)
-            self.log.info("[GRID] Creado para %s @ %.6g", symbol, px)
-            return {"result": "created", "symbol": symbol, "center": px, "levels": len(levels)}
-
-        except Exception as ex:
-            self.log.error("[GRID] create_grid(%s): %s", symbol, ex)
-            return {"result": "error", "detail": str(ex)}
-
-    def _place_grid_orders(self, e, symbol: str, grid: ActiveGrid):
-        notional_per_level = GRID_USDT * LEVERAGE
-        for level in grid.levels:
             try:
-                qty = float(e.amount_to_precision(symbol, notional_per_level / level.price))
-                if qty * level.price < 5:
-                    continue
-                order = e.create_order(
-                    symbol, "limit", level.side, qty, level.price,
-                    {"reduceOnly": False}
-                )
-                level.order_id = order.get("id", "")
-                self.log.info("  [GRID] %s @ %.6g qty=%s", level.side, level.price, qty)
-            except Exception as ex:
-                self.log.warning("  [GRID] order %s@%.6g: %s", level.side, level.price, ex)
+                e.create_order(symbol, "stop_market", close_side, qty, None,
+                               {**ep, "stopPrice": sl})
+                log.info("  SL @ %.6g", sl)
+            except Exception as err:
+                log.warning("  SL: %s", err)
 
-    # ── CANCELAR GRID ─────────────────────────────────────────────
-    def cancel_grid(self, symbol: str) -> dict:
-        with self._lock:
-            if symbol not in self.grids:
-                return {"result": "not_found"}
-            grid = self.grids[symbol]
-            grid.active = False
+            t = Trade(symbol=symbol, side=side, entry_price=entry_p,
+                      contracts=qty, tp1=tp1, tp2=tp2, tp3=tp3, sl=sl,
+                      entry_time=now())
+            st.trades[symbol] = t
+            csv_log("OPEN", t)
+            msg_open(t, bal)
+            return {"result": "opened", "symbol": symbol, "side": side,
+                    "entry": entry_p, "qty": qty}
 
+        except Exception as e:
+            log.error("open_trade %s: %s", symbol, e)
+            msg_error("open_trade %s: %s" % (symbol, e))
+            return {"result": "error", "detail": str(e)}
+
+
+def close_trade(raw_symbol: str, reason: str) -> dict:
+    with _lock:
+        symbol = sym(raw_symbol)
+        if symbol not in st.trades:
+            log.warning("close_trade: %s not in state", symbol)
+            return {"result": "not_found"}
+
+        t = st.trades[symbol]
         try:
-            if not self.dry_run:
-                e = self.ex()
+            e = ex()
+            try:
                 e.cancel_all_orders(symbol)
+            except Exception as err:
+                log.warning("cancel_all: %s", err)
 
-            pnl = grid.total_pnl
-            msg = (
-                "<b>GRID CANCELADO</b> - <code>%s</code>\n"
-                "Trades: %d\n"
-                "PnL grid: $%s\n"
-                "Activo desde: %s\n"
-                "%s"
-            ) % (
-                esc(symbol),
-                grid.trades_count,
-                esc("%+.2f" % pnl),
-                esc(grid.created_at),
-                now()
-            )
-            self.tg(msg)
-            self.log.info("[GRID] Cancelado %s. PnL=%.2f", symbol, pnl)
+            pos    = position(symbol)
+            exit_p = price(symbol)
+            pnl    = 0.0
 
-            with self._lock:
-                del self.grids[symbol]
+            if pos:
+                qty        = abs(float(pos.get("contracts", 0)))
+                close_side = "sell" if t.side == "long" else "buy"
+                ord_       = e.create_order(symbol, "market", close_side, qty,
+                                            params={"reduceOnly": True})
+                exit_p     = float(ord_.get("average") or exit_p)
+                pnl        = ((exit_p - t.entry_price) if t.side == "long"
+                              else (t.entry_price - exit_p)) * qty
 
-            return {"result": "cancelled", "pnl": pnl}
+            st.record_close(pnl, side=t.side, reason=reason)
+            csv_log("CLOSE", t, exit_p, pnl)
+            msg_close(t, exit_p, pnl, reason)
+            del st.trades[symbol]
+            return {"result": "closed", "pnl": round(pnl, 4)}
 
-        except Exception as ex:
-            self.log.error("[GRID] cancel_grid(%s): %s", symbol, ex)
-            return {"result": "error", "detail": str(ex)}
+        except Exception as e:
+            log.error("close_trade %s: %s", symbol, e)
+            msg_error("close_trade %s: %s" % (symbol, e))
+            return {"result": "error", "detail": str(e)}
 
-    # ── MONITOR DEL GRID ─────────────────────────────────────────
-    def monitor(self):
-        with self._lock:
-            symbols = list(self.grids.keys())
 
-        for symbol in symbols:
-            try:
-                with self._lock:
-                    if symbol not in self.grids:
-                        continue
-                    grid = self.grids[symbol]
-                    if not grid.active:
-                        continue
+def handle_tp(raw_symbol: str, tp_label: str) -> dict:
+    with _lock:
+        symbol = sym(raw_symbol)
+        if symbol not in st.trades:
+            return {"result": "not_found"}
 
-                if self.dry_run:
-                    self._simulate_grid_fills(grid)
-                    continue
-
-                e = self.ex()
-                for level in grid.levels:
-                    if level.filled or not level.order_id:
-                        continue
-                    try:
-                        order  = e.fetch_order(level.order_id, symbol)
-                        status = str(order.get("status", "")).lower()
-                        if status in ("closed", "filled"):
-                            self._handle_grid_fill(e, symbol, grid, level, order)
-                    except Exception as ex:
-                        self.log.warning("[GRID] check order %s: %s", level.order_id, ex)
-
-            except Exception as ex:
-                self.log.warning("[GRID] monitor(%s): %s", symbol, ex)
-
-    def _handle_grid_fill(self, e, symbol: str, grid: ActiveGrid,
-                          level: GridLevel, order: dict):
-        fill_price       = float(order.get("average") or order.get("price") or level.price)
-        level.filled      = True
-        grid.trades_count += 1
-
-        profit_per_trade  = GRID_USDT * GRID_SPACING_PCT / 100 * LEVERAGE
-        grid.total_pnl   += profit_per_trade
-        level.pnl         = profit_per_trade
-
-        self.log.info("[GRID] FILL: %s @ %.6g profit ~$%.3f",
-                      level.side, fill_price, profit_per_trade)
-
-        self.tg(
-            "<b>GRID FILL</b> <code>%s</code>\n%s @ %s\nPnL grid acum: $%s\nTrades: %d" % (
-                esc(symbol),
-                esc(level.side.upper()),
-                esc("%.6g" % fill_price),
-                esc("%+.3f" % grid.total_pnl),
-                grid.trades_count
-            ),
-            silent=True
-        )
-
+        t = st.trades[symbol]
         try:
-            notional = GRID_USDT * LEVERAGE
-            qty      = float(e.amount_to_precision(symbol, notional / fill_price))
-
-            if level.side == "buy":
-                sell_price = round(fill_price * (1 + GRID_SPACING_PCT / 100), 8)
-                sell_price = float(e.price_to_precision(symbol, sell_price))
-                new_order  = e.create_order(symbol, "limit", "sell", qty, sell_price,
-                                            {"reduceOnly": False})
-                new_level  = GridLevel(price=sell_price, side="sell",
-                                       order_id=new_order.get("id", ""))
-            else:
-                buy_price = round(fill_price * (1 - GRID_SPACING_PCT / 100), 8)
-                buy_price = float(e.price_to_precision(symbol, buy_price))
-                new_order = e.create_order(symbol, "limit", "buy", qty, buy_price,
-                                           {"reduceOnly": False})
-                new_level = GridLevel(price=buy_price, side="buy",
-                                      order_id=new_order.get("id", ""))
-
-            grid.levels.append(new_level)
-            self.log.info("[GRID] Nueva orden contraria: %s @ %.6g",
-                          new_level.side, new_level.price)
-
-        except Exception as ex:
-            self.log.warning("[GRID] orden contraria: %s", ex)
-
-    def _simulate_grid_fills(self, grid: ActiveGrid):
-        try:
-            e  = self.ex()
-            px = float(e.fetch_ticker(grid.symbol).get("last", 0))
-            if px <= 0:
-                return
-            for level in grid.levels:
-                if level.filled:
-                    continue
-                if level.side == "buy" and px <= level.price * 1.001:
-                    profit = GRID_USDT * GRID_SPACING_PCT / 100
-                    grid.total_pnl    += profit
-                    grid.trades_count += 1
-                    level.filled       = True
-                    self.log.info("[GRID SIM] BUY fill @ %.6g +$%.4f", level.price, profit)
-                elif level.side == "sell" and px >= level.price * 0.999:
-                    profit = GRID_USDT * GRID_SPACING_PCT / 100
-                    grid.total_pnl    += profit
-                    grid.trades_count += 1
-                    level.filled       = True
-                    self.log.info("[GRID SIM] SELL fill @ %.6g +$%.4f", level.price, profit)
-        except Exception as ex:
-            self.log.warning("[GRID SIM] %s", ex)
-
-    # ── AUTO-DETECCION DE REGIMEN ─────────────────────────────────
-    def auto_manage(self, symbols: List[str]):
-        if not GRID_MODE:
-            return
-        try:
-            e = self.ex()
-            for symbol in symbols:
-                regime = self.regime.detect(symbol, e)
-                with self._lock:
-                    grid_active = symbol in self.grids and self.grids[symbol].active
-
-                if regime == "sideways" and not grid_active:
-                    self.log.info("[AUTO-GRID] %s: LATERAL detectado - activando grid", symbol)
-                    self.create_grid(symbol)
-                elif regime == "trending" and grid_active:
-                    self.log.info("[AUTO-GRID] %s: TENDENCIA detectada - cancelando grid", symbol)
-                    self.cancel_grid(symbol)
-
-        except Exception as ex:
-            self.log.warning("[AUTO-GRID] auto_manage: %s", ex)
-
-    def get_status(self) -> dict:
-        with self._lock:
-            result = {}
-            for sym, grid in self.grids.items():
-                filled  = sum(1 for lv in grid.levels if lv.filled)
-                pending = sum(1 for lv in grid.levels if not lv.filled)
-                result[sym] = {
-                    "active":         grid.active,
-                    "center_price":   grid.center_price,
-                    "spacing_pct":    grid.spacing_pct,
-                    "total_pnl":      round(grid.total_pnl, 4),
-                    "trades_count":   grid.trades_count,
-                    "filled_levels":  filled,
-                    "pending_levels": pending,
-                    "created_at":     grid.created_at,
-                    "dry_run":        self.dry_run,
-                }
-            return result
-
-    def msg_grid_status(self, tg_func):
-        status = self.get_status()
-        if not status:
-            tg_func("No hay grids activos.\nUsa /grid_start SYMBOL para crear uno.")
-            return
-
-        lines = ["<b>GRIDS ACTIVOS</b>\n" + "=" * 30]
-        for sym, s in status.items():
-            # Variables locales para evitar backslash dentro de expresiones
-            centro  = esc("%.6g" % s["center_price"])
-            pnl_str = esc("%+.4f" % s["total_pnl"])
-            desde   = esc(s["created_at"])
-            lines.append(
-                "<code>%s</code>\n"
-                "  Centro: %s\n"
-                "  PnL: $%s\n"
-                "  Trades: %d\n"
-                "  Niveles: %d llenos / %d pendientes\n"
-                "  Desde: %s" % (
-                    esc(sym), centro, pnl_str,
-                    s["trades_count"],
-                    s["filled_levels"], s["pending_levels"],
-                    desde
-                )
-            )
-        tg_func("\n".join(lines))
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 4: WORKERS
-# ═══════════════════════════════════════════════════════════════════
-def start_adaptive_worker(adaptive_engine: AdaptiveEngine, tg_func, logger):
-    def _worker():
-        time.sleep(300)
-        while True:
+            e   = ex()
+            pos = None
             try:
-                adjustments = adaptive_engine.analyze()
-                if adjustments:
-                    details = "\n".join(
-                        "  %s: %s" % (esc(a.get("type", "?")), esc(a.get("reason", "?")))
-                        for a in adjustments
-                    )
-                    tg_func(
-                        "<b>AUTO-APRENDIZAJE</b> - %d ajustes\n%s\nUsa /adaptive para ver detalles\n%s"
-                        % (len(adjustments), details, now())
-                    )
-            except Exception as ex:
-                logger.warning("adaptive_worker: %s", ex)
-            time.sleep(3600)
+                for p in e.fetch_positions([symbol]):
+                    if abs(float(p.get("contracts", 0))) > 0:
+                        pos = p
+                        break
+            except Exception:
+                pass
 
-    threading.Thread(target=_worker, daemon=True, name="adaptive").start()
-    logger.info("Adaptive learning worker iniciado")
+            rem = "%.4g" % abs(float(pos.get("contracts", 0))) if pos else "~restante"
 
+            if tp_label == "TP1" and not t.tp1_hit:
+                t.tp1_hit = True
+                pnl_est   = abs(t.tp1 - t.entry_price) * t.contracts * 0.50
+                try:
+                    be = float(e.price_to_precision(symbol, t.entry_price))
+                    e.create_order(symbol, "stop_market",
+                                   "sell" if t.side == "long" else "buy",
+                                   t.contracts, None,
+                                   {"reduceOnly": True, "stopPrice": be})
+                    t.sl = be
+                    t.sl_at_be = True
+                    log.info("[%s] SL → BE @ %.6g", symbol, be)
+                except Exception as err:
+                    log.warning("BE: %s", err)
+                msg_tp(t, "TP1", pnl_est, rem)
 
-def start_grid_worker(grid_engine: GridEngine, logger):
-    def _worker():
-        time.sleep(60)
-        while True:
-            try:
-                grid_engine.monitor()
-            except Exception as ex:
-                logger.warning("grid_worker monitor: %s", ex)
-            time.sleep(30)
+            elif tp_label == "TP2" and not t.tp2_hit:
+                t.tp2_hit = True
+                pnl_est   = abs(t.tp2 - t.entry_price) * t.contracts * 0.30
+                msg_tp(t, "TP2", pnl_est, rem)
 
-    threading.Thread(target=_worker, daemon=True, name="grid_monitor").start()
-    logger.info("Grid monitor worker iniciado")
+            elif tp_label == "TP3":
+                pnl_est = abs(t.tp3 - t.entry_price) * t.contracts * 0.20
+                msg_tp(t, "TP3", pnl_est, "0")
 
+            return {"result": "%s_handled" % tp_label}
 
-def start_regime_worker(grid_engine: GridEngine, symbols: List[str], logger):
-    def _worker():
-        time.sleep(120)
-        while True:
-            try:
-                grid_engine.auto_manage(symbols)
-            except Exception as ex:
-                logger.warning("regime_worker: %s", ex)
-            time.sleep(900)
-
-    threading.Thread(target=_worker, daemon=True, name="regime").start()
-    logger.info("Regime detection worker iniciado")
+        except Exception as e:
+            log.error("handle_tp %s %s: %s", symbol, tp_label, e)
+            return {"result": "error", "detail": str(e)}
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 5: COMANDOS TELEGRAM NUEVOS
-#  Agregar estos casos en el _tg_commands_worker de bot.py
-# ═══════════════════════════════════════════════════════════════════
-"""
-COMANDOS NUEVOS A AGREGAR EN bot.py dentro de _tg_commands_worker:
+# ─────────────────────────────────────────────
+# ADAPTIVE ENGINE — importacion segura
+# ─────────────────────────────────────────────
+adaptive     = None
+grid_engine  = None
 
-elif text == "/adaptive":
-    adaptive.msg_adaptive_report(tg)
-
-elif text == "/grid":
-    grid_engine.msg_grid_status(tg)
-
-elif text.startswith("/grid_start"):
-    parts = text.split()
-    sym   = parts[1].upper() if len(parts) > 1 else GRID_SYMBOL
-    tg("Creando grid para %s..." % sym)
-    res = grid_engine.create_grid(sym)
-    tg("Grid: %s" % str(res))
-
-elif text.startswith("/grid_stop"):
-    parts = text.split()
-    sym   = parts[1].upper() if len(parts) > 1 else GRID_SYMBOL
-    res   = grid_engine.cancel_grid(sym)
-    tg("Grid cancelado: PnL=%+.4f" % res.get("pnl", 0))
-
-elif text == "/regime":
-    detector = RegimeDetector(log)
-    for pair in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
-        r = detector.detect(pair, ex())
-        tg("%s: %s" % (pair, r.upper()))
-"""
+try:
+    from adaptive_engine import (
+        AdaptiveEngine, GridEngine,
+        start_adaptive_worker,
+        start_grid_worker,
+        start_regime_worker,
+        GRID_SYMBOL,
+    )
+    adaptive    = AdaptiveEngine(st, log)
+    grid_engine = GridEngine(ex, st, log, tg)
+    log.info("Adaptive Engine cargado OK")
+except Exception as _ae_err:
+    log.warning("adaptive_engine no disponible: %s", _ae_err)
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 6: ENDPOINTS REST NUEVOS
-#  Agregar en el Flask app de bot.py
-# ═══════════════════════════════════════════════════════════════════
-"""
-ENDPOINTS NUEVOS A AGREGAR EN bot.py:
+# ─────────────────────────────────────────────
+# FLASK APP
+# ─────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({
+        "status":          "alive",
+        "bot":             "SAIYAN AURA FUSION",
+        "open_trades":     st.n(),
+        "wins":            st.wins,
+        "losses":          st.losses,
+        "win_rate":        round(st.wr(), 1),
+        "profit_factor":   round(st.pf(), 2),
+        "total_pnl":       round(st.total_pnl, 2),
+        "daily_pnl":       round(st.daily_pnl, 2),
+        "circuit_breaker": st.cb(),
+        "daily_limit":     st.daily_hit(),
+        "time":            now(),
+    })
+
+@app.route("/positions", methods=["GET"])
+def positions():
+    return jsonify({
+        s: {
+            "side":     t.side,
+            "entry":    t.entry_price,
+            "tp1":      t.tp1,
+            "tp2":      t.tp2,
+            "tp3":      t.tp3,
+            "sl":       t.sl,
+            "sl_at_be": t.sl_at_be,
+            "tp1_hit":  t.tp1_hit,
+            "tp2_hit":  t.tp2_hit,
+            "since":    t.entry_time,
+        }
+        for s, t in st.trades.items()
+    })
 
 @app.route("/adaptive", methods=["GET"])
 def adaptive_endpoint():
-    return jsonify(adaptive.get_status())
+    if adaptive:
+        return jsonify(adaptive.get_status())
+    return jsonify({"error": "adaptive engine no disponible"}), 503
 
 @app.route("/grid", methods=["GET"])
 def grid_status_endpoint():
-    return jsonify(grid_engine.get_status())
+    if grid_engine:
+        return jsonify(grid_engine.get_status())
+    return jsonify({"error": "grid engine no disponible"}), 503
 
 @app.route("/grid/start/<raw_sym>", methods=["POST"])
-def grid_start_endpoint(raw_sym: str):
-    result = grid_engine.create_grid(raw_sym.upper())
-    return jsonify(result)
+def grid_start_endpoint(raw_sym):
+    if grid_engine:
+        return jsonify(grid_engine.create_grid(raw_sym.upper()))
+    return jsonify({"error": "grid engine no disponible"}), 503
 
 @app.route("/grid/stop/<raw_sym>", methods=["POST"])
-def grid_stop_endpoint(raw_sym: str):
-    result = grid_engine.cancel_grid(raw_sym.upper())
-    return jsonify(result)
+def grid_stop_endpoint(raw_sym):
+    if grid_engine:
+        return jsonify(grid_engine.cancel_grid(raw_sym.upper()))
+    return jsonify({"error": "grid engine no disponible"}), 503
 
 @app.route("/regime/<raw_sym>", methods=["GET"])
-def regime_endpoint(raw_sym: str):
-    symbol   = raw_sym.upper()
-    detector = RegimeDetector(log)
-    regime   = detector.detect(symbol, ex())
-    return jsonify({"symbol": symbol, "regime": regime})
-"""
+def regime_endpoint(raw_sym):
+    if grid_engine:
+        regime = grid_engine.regime.detect(raw_sym.upper(), ex())
+        return jsonify({"symbol": raw_sym.upper(), "regime": regime})
+    return jsonify({"error": "grid engine no disponible"}), 503
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """
+    Payload JSON desde TradingView:
+    {
+      "secret":  "TU_CLAVE",
+      "action":  "Long Entry" | "Short Entry" | "Long Exit" | "Short Exit"
+                 | "TP1 Hit" | "TP2 Hit" | "TP3 Hit" | "Stop Loss Hit",
+      "symbol":  "{{ticker}}"
+    }
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        log.info("Webhook: %s", data)
+
+        if data.get("secret", "") != WEBHOOK_SECRET:
+            log.warning("Unauthorized webhook")
+            return jsonify({"error": "unauthorized"}), 401
+
+        action = str(data.get("action", "")).strip().lower()
+        symbol = str(data.get("symbol", "")).strip()
+
+        if not action or not symbol:
+            return jsonify({"error": "missing action or symbol"}), 400
+
+        st.reset_daily()
+
+        if   "long entry"  in action: res = open_trade(symbol, "long")
+        elif "short entry" in action: res = open_trade(symbol, "short")
+        elif "long exit"   in action: res = close_trade(symbol, "LONG EXIT")
+        elif "short exit"  in action: res = close_trade(symbol, "SHORT EXIT")
+        elif "stop loss"   in action: res = close_trade(symbol, "STOP LOSS")
+        elif "tp1"         in action: res = handle_tp(symbol, "TP1")
+        elif "tp2"         in action: res = handle_tp(symbol, "TP2")
+        elif "tp3"         in action: res = handle_tp(symbol, "TP3")
+        else:
+            log.warning("Unknown action: %s", action)
+            return jsonify({"error": "unknown action: %s" % action}), 400
+
+        return jsonify(res), 200
+
+    except Exception as e:
+        log.exception("Webhook crash: %s", e)
+        msg_error("Webhook: %s" % e)
+        return jsonify({"error": str(e)}), 500
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  PARTE 7: INSTRUCCIONES DE INTEGRACION
-# ═══════════════════════════════════════════════════════════════════
-INTEGRATION_GUIDE = """
-╔══════════════════════════════════════════════════════╗
-║  COMO INTEGRAR adaptive_engine.py EN bot.py          ║
-╠══════════════════════════════════════════════════════╣
-║  1. Subir adaptive_engine.py al mismo directorio     ║
-║     que bot.py en GitHub                             ║
-║  2. Al inicio de bot.py agregar:                     ║
-║     from adaptive_engine import (                    ║
-║         AdaptiveEngine, GridEngine,                  ║
-║         start_adaptive_worker,                       ║
-║         start_grid_worker,                           ║
-║         start_regime_worker                          ║
-║     )                                                ║
-║  3. Despues de st = State() agregar:                 ║
-║     adaptive     = AdaptiveEngine(st, log)           ║
-║     grid_engine  = GridEngine(ex, st, log, tg)       ║
-║  4. En la funcion startup() agregar:                 ║
-║     start_adaptive_worker(adaptive, tg, log)         ║
-║     start_grid_worker(grid_engine, log)              ║
-║     start_regime_worker(grid_engine,                 ║
-║         ["BTC/USDT:USDT"], log)                      ║
-║  5. En _tg_commands_worker agregar los nuevos        ║
-║     comandos (ver PARTE 5 de este archivo)           ║
-║  6. En el Flask app agregar los endpoints            ║
-║     (ver PARTE 6 de este archivo)                    ║
-║  7. Variables nuevas en Railway:                     ║
-║     ADAPTIVE_LEARNING = true                         ║
-║     GRID_MODE         = true                         ║
-║     GRID_LEVELS       = 6                            ║
-║     GRID_SPACING_PCT  = 0.3                          ║
-║     GRID_USDT         = 5                            ║
-║     GRID_SYMBOL       = BTC/USDT:USDT               ║
-║     REGIME_ADX_THRESH = 25                           ║
-╚══════════════════════════════════════════════════════╝
-"""
+# ─────────────────────────────────────────────
+# TELEGRAM COMMANDS WORKER
+# ─────────────────────────────────────────────
+def _tg_commands_worker():
+    offset = 0
+    while True:
+        try:
+            url = "https://api.telegram.org/bot%s/getUpdates" % TG_TOKEN
+            r   = requests.get(url, params={"offset": offset, "timeout": 30}, timeout=35)
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                text   = upd.get("message", {}).get("text", "").strip()
+                chat   = str(upd.get("message", {}).get("chat", {}).get("id", ""))
+                if chat != TG_CHAT_ID:
+                    continue
+
+                if text == "/status":
+                    tg(
+                        "<b>STATUS</b>\n"
+                        "Pos: %d/%d\n"
+                        "%dW/%dL · WR:%.1f%% · PF:%.2f\n"
+                        "Hoy: $%+.2f · Total: $%+.2f\n"
+                        "CB: %s · Daily: %s\n"
+                        "%s" % (
+                            st.n(), MAX_OPEN_TRADES,
+                            st.wins, st.losses, st.wr(), st.pf(),
+                            st.daily_pnl, st.total_pnl,
+                            st.cb(), st.daily_hit(),
+                            now()
+                        )
+                    )
+
+                elif text == "/positions":
+                    if not st.trades:
+                        tg("Sin posiciones abiertas.")
+                    else:
+                        for s, t in st.trades.items():
+                            tg(
+                                "<code>%s</code> %s\n"
+                                "Entrada: %.6g\n"
+                                "TP1: %.6g · TP2: %.6g · TP3: %.6g\n"
+                                "SL: %.6g %s\n"
+                                "Desde: %s" % (
+                                    s, t.side.upper(),
+                                    t.entry_price,
+                                    t.tp1, t.tp2, t.tp3,
+                                    t.sl, "(BE)" if t.sl_at_be else "",
+                                    t.entry_time
+                                )
+                            )
+
+                elif text == "/adaptive":
+                    if adaptive:
+                        adaptive.msg_adaptive_report(tg)
+                    else:
+                        tg("Adaptive engine no disponible.")
+
+                elif text == "/grid":
+                    if grid_engine:
+                        grid_engine.msg_grid_status(tg)
+                    else:
+                        tg("Grid engine no disponible.")
+
+                elif text.startswith("/grid_start"):
+                    if grid_engine:
+                        parts = text.split()
+                        s     = parts[1].upper() if len(parts) > 1 else GRID_SYMBOL
+                        tg("Creando grid para %s..." % s)
+                        res = grid_engine.create_grid(s)
+                        tg("Grid: %s" % str(res))
+                    else:
+                        tg("Grid engine no disponible.")
+
+                elif text.startswith("/grid_stop"):
+                    if grid_engine:
+                        parts = text.split()
+                        s     = parts[1].upper() if len(parts) > 1 else GRID_SYMBOL
+                        res   = grid_engine.cancel_grid(s)
+                        tg("Grid cancelado: PnL=%+.4f" % res.get("pnl", 0))
+                    else:
+                        tg("Grid engine no disponible.")
+
+                elif text == "/regime":
+                    if grid_engine:
+                        for pair in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
+                            r2 = grid_engine.regime.detect(pair, ex())
+                            tg("%s: %s" % (pair, r2.upper()))
+                    else:
+                        tg("Grid engine no disponible.")
+
+                elif text == "/help":
+                    tg(
+                        "<b>COMANDOS</b>\n"
+                        "/status — estado del bot\n"
+                        "/positions — posiciones abiertas\n"
+                        "/adaptive — reporte auto-aprendizaje\n"
+                        "/grid — grids activos\n"
+                        "/grid_start SYMBOL — iniciar grid\n"
+                        "/grid_stop SYMBOL — detener grid\n"
+                        "/regime — regimen de mercado\n"
+                        "/help — esta ayuda"
+                    )
+
+        except Exception as e:
+            log.warning("tg_commands: %s", e)
+        time.sleep(1)
+
+
+# ─────────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────────
+def startup():
+    log.info("=" * 55)
+    log.info("  SAIYAN AURA FUSION BOT — Starting...")
+    log.info("=" * 55)
+    log.info("  USDT/trade: $%s | Leverage: %sx", FIXED_USDT, LEVERAGE)
+    log.info("  TP1:%.1f%% TP2:%.1f%% TP3:%.1f%% SL:%.1f%%",
+             TP1_PCT, TP2_PCT, TP3_PCT, SL_PCT)
+    log.info("  Max trades: %s | CB:%.1f%% | Daily:%.1f%%",
+             MAX_OPEN_TRADES, CB_DD, DAILY_LOSS_PCT)
+    log.info("=" * 55)
+
+    if not (API_KEY and API_SECRET):
+        log.warning("No API keys — orders will FAIL")
+
+    for attempt in range(10):
+        try:
+            bal = balance()
+            st.peak_equity    = bal
+            st.daily_reset_ts = time.time()
+            log.info("Balance: $%.2f USDT", bal)
+            msg_start(bal)
+            break
+        except Exception as e:
+            wait = min(2 ** attempt, 60)
+            log.warning("Startup %d/10: %s — retry %ds", attempt + 1, e, wait)
+            time.sleep(wait)
+
+    # Iniciar workers
+    if TG_TOKEN and TG_CHAT_ID:
+        threading.Thread(target=_tg_commands_worker, daemon=True,
+                         name="tg_cmd").start()
+        log.info("Telegram commands worker iniciado")
+
+    if adaptive:
+        start_adaptive_worker(adaptive, tg, log)
+
+    if grid_engine:
+        start_grid_worker(grid_engine, log)
+        try:
+            gs = os.environ.get("GRID_SYMBOL", "BTC/USDT:USDT")
+            start_regime_worker(grid_engine, [gs], log)
+        except Exception as e:
+            log.warning("regime_worker: %s", e)
+
+
+startup()
 
 if __name__ == "__main__":
-    print(INTEGRATION_GUIDE)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
