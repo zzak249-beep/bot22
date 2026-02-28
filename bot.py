@@ -557,6 +557,8 @@ def startup():
             time.sleep(wait)
 
 
+# ── Run startup in background thread so gunicorn workers don't block
+threading.Thread(target=startup, daemon=True).start()
+
 if __name__ == "__main__":
-    startup()
     app.run(host="0.0.0.0", port=PORT, debug=False)
