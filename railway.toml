@@ -1,0 +1,9 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/"
+healthcheckTimeout = 30
