@@ -1,269 +1,336 @@
 """
-brain.py — Motor de Aprendizaje Adaptativo
-Aprende de cada trade cerrado y ajusta parámetros automáticamente.
+╔══════════════════════════════════════════════════════════════╗
+║              BRAIN v3 — Sistema de Aprendizaje              ║
+║  Aprende de cada trade: qué módulos, score, RSI, ADX,       ║
+║  mercado BTC, hora UTC → ajusta pesos automáticamente       ║
+║  Guarda historial en brain_data.json (persistente Railway)  ║
+╚══════════════════════════════════════════════════════════════╝
 """
-import json, os, time, logging
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+import os, json, time, logging
 from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional
+from datetime import datetime, timezone
 
 log = logging.getLogger("brain")
+BRAIN_FILE = os.environ.get("BRAIN_FILE", "brain_data.json")
+MIN_SCORE_BASE = int(os.environ.get("MIN_SCORE", "5"))
 
-BRAIN_FILE         = "brain_data.json"
-MIN_SAMPLES        = 10
-MAX_BOOST          = 2.0
-MIN_BOOST          = 0.3
-LEARNING_RATE      = 0.15
-BLACKLIST_WR       = 0.30
-BLACKLIST_H        = 24
-WINDOW             = 30
+# ── Cuántos trades mínimos para ajustar pesos ────────────
+MIN_TRADES_ADJUST = 10
+# ── Factor de aprendizaje (0.05 = 5% por trade) ──────────
+LR = 0.05
+# ── Penalización máxima de score (multiplicador) ─────────
+MAX_PENALTY = 0.6
+MIN_BOOST   = 1.5
+
+@dataclass
+class ComboStats:
+    combo: str
+    wins: int = 0
+    losses: int = 0
+    total_pnl: float = 0.0
+    avg_score: float = 0.0
+    weight: float = 1.0       # multiplicador de min_score
+    last_updated: str = ""
+
+    def wr(self):
+        t = self.wins + self.losses
+        return (self.wins / t * 100) if t else 0.0
+
+    def total(self):
+        return self.wins + self.losses
+
+@dataclass
+class HourStats:
+    hour: int
+    wins: int = 0
+    losses: int = 0
+    total_pnl: float = 0.0
+
+    def wr(self):
+        t = self.wins + self.losses
+        return (self.wins / t * 100) if t else 0.0
 
 @dataclass
 class BrainData:
-    version:             int   = 2
-    total_trades:        int   = 0
-    last_updated:        str   = ""
-    last_review:         float = 0.0
-    history:             List[dict] = field(default_factory=list)
-    module_stats:        Dict[str,dict] = field(default_factory=dict)
-    hour_stats:          Dict[str,dict] = field(default_factory=dict)
-    min_score_overrides: Dict[str,int]  = field(default_factory=dict)
-    effective_min_score: int   = 5
-    effective_cd_min:    int   = 30
-    consec_losses_today: int   = 0
-    last_loss_ts:        float = 0.0
-    insights:            List[str] = field(default_factory=list)
+    total_trades: int = 0
+    total_wins: int = 0
+    total_losses: int = 0
+    total_pnl: float = 0.0
+    combos: Dict[str, dict] = field(default_factory=dict)
+    hours: Dict[str, dict] = field(default_factory=dict)
+    rsi_zones: Dict[str, dict] = field(default_factory=dict)   # "os","mid","ob"
+    adx_zones: Dict[str, dict] = field(default_factory=dict)   # "weak","trend","strong"
+    market_modes: Dict[str, dict] = field(default_factory=dict) # "bull","bear","lateral"
+    error_log: List[dict] = field(default_factory=list)         # últimos 50 errores
+    recent_trades: List[dict] = field(default_factory=list)     # últimos 100 trades
 
 class Brain:
     def __init__(self):
         self.data = BrainData()
-        self.load()
+        self._load()
 
-    def load(self):
+    # ── Persistencia ──────────────────────────────────────
+    def _load(self):
         try:
             if os.path.exists(BRAIN_FILE):
-                with open(BRAIN_FILE) as f: raw=json.load(f)
-                self.data=BrainData(
-                    version=raw.get("version",1), total_trades=raw.get("total_trades",0),
-                    last_updated=raw.get("last_updated",""), last_review=raw.get("last_review",0.0),
-                    history=raw.get("history",[])[-500:],
-                    module_stats=raw.get("module_stats",{}),
-                    hour_stats=raw.get("hour_stats",{}),
-                    min_score_overrides=raw.get("min_score_overrides",{}),
-                    effective_min_score=raw.get("effective_min_score",5),
-                    effective_cd_min=raw.get("effective_cd_min",30),
-                    consec_losses_today=raw.get("consec_losses_today",0),
-                    last_loss_ts=raw.get("last_loss_ts",0.0),
-                    insights=raw.get("insights",[])[-20:],
-                )
-                log.info(f"Brain: {self.data.total_trades} trades históricos cargados")
+                with open(BRAIN_FILE, "r") as f:
+                    d = json.load(f)
+                self.data = BrainData(**d)
+                log.info(f"🧠 Brain cargado: {self.data.total_trades} trades históricos")
         except Exception as e:
-            log.warning(f"Brain load: {e}"); self.data=BrainData()
+            log.warning(f"Brain load error: {e} → empezando limpio")
+            self.data = BrainData()
 
-    def save(self):
+    def _save(self):
         try:
-            self.data.last_updated=datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-            with open(BRAIN_FILE,"w") as f: json.dump(asdict(self.data),f,indent=2)
-        except Exception as e: log.warning(f"Brain save: {e}")
+            with open(BRAIN_FILE, "w") as f:
+                json.dump(asdict(self.data), f, indent=2)
+        except Exception as e:
+            log.warning(f"Brain save error: {e}")
 
-    def record_trade(self, symbol,side,modules,signals,entry_score,pnl,pnl_pct,
-                     max_profit,reason,duration_min,btc_bull,btc_bear,btc_adx,
-                     rsi_entry=0.0,adx_entry=0.0):
-        now_h=datetime.now(timezone.utc).hour
-        win=pnl>0
-        rec={"ts":datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M"),
-             "symbol":symbol,"side":side,"modules":modules,"signals":signals[:80],
-             "entry_score":entry_score,"pnl":pnl,"pnl_pct":pnl_pct,
-             "max_profit":max_profit,"reason":reason,"duration_min":duration_min,
-             "btc_bull":btc_bull,"btc_bear":btc_bear,"btc_adx":btc_adx,
-             "rsi_entry":rsi_entry,"adx_entry":adx_entry,"hour_utc":now_h,"win":win}
-        self.data.history.append(rec)
-        if len(self.data.history)>500: self.data.history=self.data.history[-500:]
-        self.data.total_trades+=1
-        self._update_mods(modules,win,pnl)
-        self._update_hours(now_h,win,pnl)
-        if not win: self.data.consec_losses_today+=1; self.data.last_loss_ts=time.time()
-        else: self.data.consec_losses_today=0
-        if self.data.total_trades%10==0 or time.time()-self.data.last_review>86400:
-            self._review()
-        self.save()
-        log.info(f"Brain: {'✅' if win else '❌'} {symbol} {pnl:+.2f} [{modules}] | total:{self.data.total_trades}")
+    # ── Helpers de zona ───────────────────────────────────
+    @staticmethod
+    def _rsi_zone(rsi: float) -> str:
+        if rsi < 35:   return "os"
+        if rsi > 65:   return "ob"
+        return "mid"
 
-    def _update_mods(self,modules,win,pnl):
-        k=modules or "unknown"
-        if k not in self.data.module_stats:
-            self.data.module_stats[k]={"name":k,"trades":0,"wins":0,"total_pnl":0.0,"avg_pnl":0.0,"boost":1.0,"blacklisted_until":0.0}
-        s=self.data.module_stats[k]
-        s["trades"]+=1; s["wins"]+=1 if win else 0; s["total_pnl"]+=pnl
-        s["avg_pnl"]=s["total_pnl"]/s["trades"]
-        wr=s["wins"]/s["trades"]
-        target=0.3+(wr/0.70)*1.7; target=max(MIN_BOOST,min(MAX_BOOST,target))
-        if s["trades"]>=MIN_SAMPLES:
-            s["boost"]=s.get("boost",1.0)+LEARNING_RATE*(target-s.get("boost",1.0))
-        if s["trades"]>=15 and wr<BLACKLIST_WR:
-            s["blacklisted_until"]=time.time()+BLACKLIST_H*3600
-            log.warning(f"Brain: {k} BLACKLIST 24h (WR:{wr*100:.0f}%)")
-        elif s["trades"]>=20 and wr>=0.50 and s.get("blacklisted_until",0)>0:
-            s["blacklisted_until"]=0
+    @staticmethod
+    def _adx_zone(adx: float) -> str:
+        if adx < 20:   return "weak"
+        if adx < 35:   return "trend"
+        return "strong"
 
-    def _update_hours(self,hour,win,pnl):
-        k=str(hour)
-        if k not in self.data.hour_stats:
-            self.data.hour_stats[k]={"hour":hour,"trades":0,"wins":0,"pnl":0.0}
-        s=self.data.hour_stats[k]
-        s["trades"]+=1; s["wins"]+=1 if win else 0; s["pnl"]+=pnl
+    @staticmethod
+    def _market_mode(btc_bull: bool, btc_bear: bool) -> str:
+        if btc_bull:   return "bull"
+        if btc_bear:   return "bear"
+        return "lateral"
 
-    def _review(self):
-        self.data.last_review=time.time(); insights=[]
-        if self.data.total_trades<MIN_SAMPLES: return
-        recent=self.data.history[-WINDOW:]
-        if len(recent)>=10:
-            rwr=sum(1 for t in recent if t["pnl"]>0)/len(recent)
-            t5=[t for t in recent if t["entry_score"]>=5]
-            if len(t5)>=5:
-                wr5=sum(1 for t in t5 if t["pnl"]>0)/len(t5)
-                if wr5<0.45 and self.data.effective_min_score<8:
-                    self.data.effective_min_score+=1
-                    insights.append(f"⬆️ Score mín → {self.data.effective_min_score} (WR@5={wr5*100:.0f}%)")
-                elif wr5>0.65 and self.data.effective_min_score>4:
-                    self.data.effective_min_score-=1
-                    insights.append(f"⬇️ Score mín → {self.data.effective_min_score} (WR@5={wr5*100:.0f}%)")
-        for combo,s in self.data.module_stats.items():
-            if s["trades"]<MIN_SAMPLES: continue
-            b=s.get("boost",1.0)
-            if b<0.7:
-                self.data.min_score_overrides[combo]=self.data.effective_min_score+2
-                insights.append(f"🎯 {combo}: score local→{self.data.effective_min_score+2}")
-            elif b>1.3 and combo in self.data.min_score_overrides:
-                del self.data.min_score_overrides[combo]
-        worst=[(int(h),s) for h,s in self.data.hour_stats.items() if s["trades"]>=5 and s["wins"]/s["trades"]<=0.35]
-        best =[(int(h),s) for h,s in self.data.hour_stats.items() if s["trades"]>=5 and s["wins"]/s["trades"]>=0.70]
-        if worst: insights.append(f"⚠️ Horas malas UTC: {sorted([h for h,_ in worst])} → pos. 50%")
-        if best:  insights.append(f"⭐ Horas buenas UTC: {sorted([h for h,_ in best])} → pos. 120%")
-        if insights:
-            self.data.insights=insights+self.data.insights
-            self.data.insights=self.data.insights[:20]
-            for ins in insights: log.info(f"Brain: {ins}")
+    @staticmethod
+    def _hour_now() -> int:
+        return datetime.now(timezone.utc).hour
 
-    def get_module_boost(self,modules) -> float:
-        s=self.data.module_stats.get(modules,{})
-        if not s: return 1.0
-        if s.get("blacklisted_until",0)>time.time(): return 0.0
-        return float(s.get("boost",1.0))
+    def _zone_update(self, d: dict, key: str, win: bool, pnl: float):
+        if key not in d:
+            d[key] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
+        d[key]["wins" if win else "losses"] += 1
+        d[key]["total_pnl"] = round(d[key]["total_pnl"] + pnl, 4)
 
-    def is_blacklisted(self,modules) -> bool:
-        return self.data.module_stats.get(modules,{}).get("blacklisted_until",0)>time.time()
+    # ── Registrar trade cerrado ───────────────────────────
+    def on_trade_closed(self, trade, pnl: float, reason: str,
+                        btc_bull: bool, btc_bear: bool, btc_adx: float,
+                        rsi: float, adx: float):
+        win = pnl > 0
+        combo = trade.modules
+        hour = self._hour_now()
+        rz = self._rsi_zone(rsi)
+        az = self._adx_zone(adx)
+        mm = self._market_mode(btc_bull, btc_bear)
 
-    def get_effective_min_score(self,modules) -> int:
-        return self.data.min_score_overrides.get(modules,self.data.effective_min_score)
+        # ── Totales ───────────────────────────────────────
+        self.data.total_trades += 1
+        if win: self.data.total_wins += 1
+        else:   self.data.total_losses += 1
+        self.data.total_pnl = round(self.data.total_pnl + pnl, 4)
 
-    def get_hour_mult(self,h=None) -> float:
-        h=h if h is not None else datetime.now(timezone.utc).hour
-        s=self.data.hour_stats.get(str(h),{})
-        if not s or s.get("trades",0)<5: return 1.0
-        wr=s["wins"]/s["trades"]
-        if wr>=0.65: return 1.2
-        if wr>=0.50: return 1.0
-        if wr>=0.40: return 0.7
-        return 0.5
+        # ── Combo stats ───────────────────────────────────
+        if combo not in self.data.combos:
+            self.data.combos[combo] = asdict(ComboStats(combo=combo))
+        cs = self.data.combos[combo]
+        cs["wins" if win else "losses"] += 1
+        cs["total_pnl"] = round(cs["total_pnl"] + pnl, 4)
+        cs["avg_score"] = round(
+            cs["avg_score"] * 0.9 + trade.score * 0.1, 2)
+        cs["last_updated"] = datetime.now(timezone.utc).isoformat()
 
-    def adjusted_score(self,raw,modules) -> float:
-        return raw*self.get_module_boost(modules)
+        # ── Ajustar peso del combo ────────────────────────
+        total_c = cs["wins"] + cs["losses"]
+        if total_c >= MIN_TRADES_ADJUST:
+            wr = cs["wins"] / total_c
+            # peso sube si WR>55%, baja si WR<45%
+            if wr > 0.55:
+                cs["weight"] = min(cs["weight"] + LR, MIN_BOOST)
+            elif wr < 0.45:
+                cs["weight"] = max(cs["weight"] - LR, MAX_PENALTY)
+            # si pierde 3 seguidas → penalizar más fuerte
+            recent = [t for t in self.data.recent_trades[-10:]
+                      if t.get("combo") == combo]
+            if len(recent) >= 3 and all(not t["win"] for t in recent[-3:]):
+                cs["weight"] = max(cs["weight"] - LR * 2, MAX_PENALTY)
+                log.warning(f"🧠 Combo {combo} penalizado (3 pérdidas seguidas)")
 
-    def should_enter(self,raw,modules) -> Tuple[bool,str]:
-        if self.is_blacklisted(modules):
-            s=self.data.module_stats.get(modules,{})
-            wr=s["wins"]/s["trades"]*100 if s.get("trades",0)>0 else 0
-            h=(s.get("blacklisted_until",0)-time.time())/3600
-            return False,f"blacklisted WR:{wr:.0f}% ({h:.1f}h)"
-        adj=self.adjusted_score(raw,modules)
-        mn=self.get_effective_min_score(modules)
-        if adj<mn: return False,f"score_adj {adj:.1f}<{mn}"
-        return True,""
+        # ── Zonas ─────────────────────────────────────────
+        self._zone_update(self.data.hours, str(hour), win, pnl)
+        self._zone_update(self.data.rsi_zones, rz, win, pnl)
+        self._zone_update(self.data.adx_zones, az, win, pnl)
+        self._zone_update(self.data.market_modes, mm, win, pnl)
+
+        # ── Log de errores (pérdidas > 1 ATR) ────────────
+        if not win:
+            err = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "combo": combo,
+                "score": trade.score,
+                "rsi": round(rsi, 1),
+                "adx": round(adx, 1),
+                "market": mm,
+                "hour": hour,
+                "reason": reason,
+                "pnl": round(pnl, 4),
+                "lesson": self._lesson(reason, mm, rz, az)
+            }
+            self.data.error_log = (self.data.error_log + [err])[-50:]
+            log.info(f"🧠 Error registrado: {err['lesson']}")
+
+        # ── Historial reciente ─────────────────────────────
+        self.data.recent_trades = (self.data.recent_trades + [{
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "symbol": trade.symbol,
+            "side": trade.side,
+            "combo": combo,
+            "score": trade.score,
+            "win": win,
+            "pnl": round(pnl, 4),
+            "reason": reason,
+            "market": mm,
+            "rsi_zone": rz,
+            "adx_zone": az,
+            "hour": hour
+        }])[-100:]
+
+        self._save()
+
+    @staticmethod
+    def _lesson(reason: str, market: str, rsi_z: str, adx_z: str) -> str:
+        lessons = []
+        if "SL" in reason or "PÉRDIDA" in reason:
+            if adx_z == "weak": lessons.append("evitar ADX<20")
+            if market == "lateral": lessons.append("mercado lateral: reducir tamaño")
+            if rsi_z == "mid": lessons.append("RSI en zona media: señal débil")
+        if "FLIP" in reason:
+            lessons.append("reversión rápida: usar SL más ajustado")
+        if "TRAIL" in reason and "ULTRA" not in reason:
+            lessons.append("trailing muy agresivo: ajustar multiplicador")
+        return "; ".join(lessons) if lessons else "revisar contexto de mercado"
+
+    # ── Consulta: ¿entrar? ────────────────────────────────
+    def check_entry(self, score: int, combo: str, size: float):
+        """
+        Devuelve (can_enter, adjusted_size, reason)
+        """
+        eff = self.get_effective_min_score(combo)
+        if score < eff:
+            return False, size, f"score {score}<{eff} (combo penalizado)"
+
+        # Reducir tamaño si combo tiene mal historial reciente
+        cs = self.data.combos.get(combo, {})
+        weight = cs.get("weight", 1.0)
+        if weight < 0.8:
+            adj_size = round(size * weight, 2)
+            return True, adj_size, f"tamaño reducido x{weight:.2f}"
+
+        # Hora mala → reducir tamaño (si >10 trades en esa hora y WR<40%)
+        hour = str(self._hour_now())
+        h = self.data.hours.get(hour, {})
+        htot = h.get("wins", 0) + h.get("losses", 0)
+        if htot >= 10:
+            hwr = h.get("wins", 0) / htot
+            if hwr < 0.40:
+                return True, round(size * 0.6, 2), f"hora UTC:{hour} WR:{hwr*100:.0f}%<40%"
+
+        return True, size, ""
+
+    def get_effective_min_score(self, combo: str) -> int:
+        cs = self.data.combos.get(combo, {})
+        weight = cs.get("weight", 1.0)
+        # peso<1 → subir umbral (más exigente), peso>1 → bajar umbral
+        adjusted = MIN_SCORE_BASE / weight
+        return max(3, min(12, round(adjusted)))
+
+    # ── Resumen Telegram ──────────────────────────────────
+    def telegram_summary_line(self) -> str:
+        d = self.data
+        wr = (d.total_wins / d.total_trades * 100) if d.total_trades else 0
+        return (f"🧠 Brain: {d.total_trades}T "
+                f"{d.total_wins}W/{d.total_losses}L "
+                f"WR:{wr:.1f}% PnL:${d.total_pnl:+.2f}")
 
     def telegram_report(self) -> str:
-        lines=["🧠 <b>BRAIN — Aprendizaje Adaptativo</b>",
-               "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-               f"📊 Trades: <b>{self.data.total_trades}</b>",
-               f"🎯 Score mín efectivo: <b>{self.data.effective_min_score}</b>"]
-        if self.data.module_stats:
-            sm=sorted([(k,v) for k,v in self.data.module_stats.items() if v.get("trades",0)>=3],
-                      key=lambda x:x[1]["wins"]/max(x[1]["trades"],1),reverse=True)
-            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("📈 <b>Módulos:</b>")
-            for k,v in sm[:6]:
-                t=v.get("trades",0); w=v.get("wins",0)
-                wr=w/t*100 if t>0 else 0; b=v.get("boost",1.0)
-                bl=" ⛔BL" if v.get("blacklisted_until",0)>time.time() else ""
-                ic="🟢" if wr>=55 else "🟡" if wr>=45 else "🔴"
-                lines.append(f"  {ic} {k[:28]}: {t}t {wr:.0f}% b:{b:.2f}{bl}")
-        if self.data.hour_stats:
-            hd=[(int(h),v) for h,v in self.data.hour_stats.items() if v.get("trades",0)>=5]
-            if hd:
-                best=max(hd,key=lambda x:x[1]["wins"]/x[1]["trades"])
-                worst=min(hd,key=lambda x:x[1]["wins"]/x[1]["trades"])
-                bwr=best[1]["wins"]/best[1]["trades"]*100; wwr=worst[1]["wins"]/worst[1]["trades"]*100
-                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                lines.append(f"⏰ Mejor hora: {best[0]:02d}h UTC ({bwr:.0f}%) ×{self.get_hour_mult(best[0]):.1f}")
-                lines.append(f"⏰ Peor hora:  {worst[0]:02d}h UTC ({wwr:.0f}%) ×{self.get_hour_mult(worst[0]):.1f}")
-        if self.data.insights:
-            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("💡 <b>Insights:</b>")
-            for ins in self.data.insights[:5]: lines.append(f"  {ins}")
-        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🕐 {datetime.now(timezone.utc).strftime('%d/%m %H:%M UTC')}")
-        return "\n".join(lines)
+        d = self.data
+        wr = (d.total_wins / d.total_trades * 100) if d.total_trades else 0
+        lines = [
+            f"🧠 <b>BRAIN REPORT v3</b>",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"📊 {d.total_trades} trades | WR:{wr:.1f}% | ${d.total_pnl:+.2f}",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"🏆 Top combos:",
+        ]
+        combos_sorted = sorted(
+            d.combos.items(),
+            key=lambda x: x[1].get("total_pnl", 0), reverse=True
+        )[:5]
+        for name, cs in combos_sorted:
+            tot = cs["wins"] + cs["losses"]
+            cwr = (cs["wins"] / tot * 100) if tot else 0
+            w = cs.get("weight", 1.0)
+            lines.append(f"  {'🟢' if w>=1 else '🔴'} {name[:30]}: "
+                         f"{cs['wins']}W/{cs['losses']}L WR:{cwr:.0f}% "
+                         f"w:{w:.2f} ${cs['total_pnl']:+.2f}")
 
-    def telegram_summary_line(self) -> str:
-        if self.data.total_trades<5: return "🧠 Brain: aprendiendo ..."
-        recent=self.data.history[-20:]
-        if not recent: return ""
-        rwr=sum(1 for t in recent if t["pnl"]>0)/len(recent)*100
-        bl=sum(1 for s in self.data.module_stats.values() if s.get("blacklisted_until",0)>time.time())
-        return (f"🧠 {self.data.total_trades}t | WR:{rwr:.0f}% | "
-                f"ScoreMín:{self.data.effective_min_score} | BL:{bl}")
+        # Zonas RSI
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📉 RSI zones:")
+        for z, stats in d.rsi_zones.items():
+            tot = stats["wins"] + stats["losses"]
+            zwr = (stats["wins"] / tot * 100) if tot else 0
+            lines.append(f"  {z}: {tot}T WR:{zwr:.0f}% ${stats['total_pnl']:+.2f}")
+
+        # Modo mercado
+        lines.append(f"🌐 Mercado:")
+        for m, stats in d.market_modes.items():
+            tot = stats["wins"] + stats["losses"]
+            mwr = (stats["wins"] / tot * 100) if tot else 0
+            lines.append(f"  {m}: {tot}T WR:{mwr:.0f}% ${stats['total_pnl']:+.2f}")
+
+        # Últimos errores
+        if d.error_log:
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"❌ Últimos errores:")
+            for e in d.error_log[-3:]:
+                lines.append(f"  {e['symbol']} {e['side']} [{e['combo'][:20]}]")
+                lines.append(f"    → {e['lesson']}")
+
+        return "\n".join(lines)
 
     def score_distribution_bar(self) -> str:
-        if len(self.data.history)<15: return ""
-        buckets={}
-        for t in self.data.history:
-            sc=t.get("entry_score",0); b=f"{(sc//2)*2}-{(sc//2)*2+1}"
-            if b not in buckets: buckets[b]={"w":0,"t":0}
-            buckets[b]["t"]+=1
-            if t["pnl"]>0: buckets[b]["w"]+=1
-        lines=["📊 WR por score:"]
-        for k in sorted(buckets):
-            v=buckets[k]; wr=v["w"]/v["t"]*100 if v["t"]>0 else 0
-            bar="█"*int(wr/10)+"░"*(10-int(wr/10))
-            lines.append(f"  {k:>4}pt: {bar} {wr:.0f}% ({v['t']}t)")
+        if self.data.total_trades < 5:
+            return ""
+        buckets = {}
+        for t in self.data.recent_trades:
+            sc = t.get("score", 0)
+            b = f"{(sc//2)*2}-{(sc//2)*2+1}"
+            if b not in buckets:
+                buckets[b] = {"w": 0, "l": 0}
+            if t["win"]: buckets[b]["w"] += 1
+            else:        buckets[b]["l"] += 1
+        lines = ["Score distribution (recent):"]
+        for b in sorted(buckets):
+            s = buckets[b]
+            tot = s["w"] + s["l"]
+            bar = "█" * s["w"] + "░" * s["l"]
+            wr = s["w"] / tot * 100 if tot else 0
+            lines.append(f"  {b}: {bar} WR:{wr:.0f}%")
         return "\n".join(lines)
 
+# ── Instancia global ──────────────────────────────────────
 brain = Brain()
 
-def on_trade_closed(trade_state, pnl, reason, btc_bull, btc_bear, btc_adx, rsi_entry=0.0, adx_entry=0.0):
-    try:
-        pnl_pct=0.0
-        if trade_state.contracts>0 and trade_state.entry_price>0:
-            pnl_pct=pnl/(trade_state.entry_price*trade_state.contracts)*100
-        dur=0
-        try:
-            from datetime import datetime
-            et=datetime.strptime(trade_state.entry_time,"%d/%m/%Y %H:%M UTC")
-            dur=int((datetime.utcnow()-et).total_seconds()/60)
-        except Exception: pass
-        brain.record_trade(
-            symbol=trade_state.symbol, side=trade_state.side,
-            modules=trade_state.modules, signals=trade_state.signals[:80],
-            entry_score=trade_state.score, pnl=pnl, pnl_pct=pnl_pct,
-            max_profit=trade_state.max_pct, reason=reason, duration_min=dur,
-            btc_bull=btc_bull, btc_bear=btc_bear, btc_adx=btc_adx,
-            rsi_entry=rsi_entry, adx_entry=adx_entry)
-    except Exception as e: log.warning(f"on_trade_closed: {e}")
+def on_trade_closed(trade, pnl, reason, btc_bull, btc_bear, btc_adx, rsi, adx):
+    brain.on_trade_closed(trade, pnl, reason, btc_bull, btc_bear, btc_adx, rsi, adx)
 
-def check_entry(raw_score, modules, size_usdt):
-    try:
-        can,reason=brain.should_enter(raw_score,modules)
-        if not can: return False,0.0,reason
-        mult=brain.get_hour_mult()
-        return True,size_usdt*mult,f"adj={brain.adjusted_score(raw_score,modules):.1f} h×{mult:.1f}"
-    except Exception as e:
-        log.warning(f"check_entry: {e}"); return True,size_usdt,"brain_err"
+def check_entry(score, mods, size):
+    return brain.check_entry(score, mods, size)

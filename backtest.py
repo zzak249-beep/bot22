@@ -1,370 +1,689 @@
 """
-backtest.py — Motor de Backtesting para SATY v14
-══════════════════════════════════════════════════════════════
-Usa datos históricos reales de BingX para simular exactamente
-el comportamiento del bot: 6 módulos + TP1/TP2/TP3 + trailing.
-
-USO:
-  python backtest.py                      # top 20 pares, 90 días
-  python backtest.py --symbol BTC/USDT:USDT
-  python backtest.py --days 180 --tf 15m
-  python backtest.py --minscore 6 --top 50
-  python backtest.py --feedbrain          # pre-entrena el Brain
-
-SALIDA:
-  backtest_results.csv   → todos los trades
-  backtest_report.html   → equity curve + métricas interactivas
-  brain_data.json        → Brain actualizado (con --feedbrain)
+╔══════════════════════════════════════════════════════════════╗
+║           BACKTEST v2 — Motor propio SATY ELITE             ║
+║  Walk-forward · Lateral detection · Brain learning sim      ║
+║  Uso: python backtest.py [--symbol BTC/USDT:USDT] [--tf 5m]║
+║       [--days 90] [--plot] [--lateral]                      ║
+╚══════════════════════════════════════════════════════════════╝
 """
-
-import os, sys, csv, argparse, logging
+import os, sys, json, time, logging, argparse
 from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from collections import defaultdict
 
 import ccxt
 import pandas as pd
 import numpy as np
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ── Importar módulos del bot ──────────────────────────────
+try:
+    from bingx_bot2_saty_v15 import (
+        fetch_df, atr, rsi, adx, bb, ema, sma, sqz_mom, pct_b,
+        ph, pl, htf_bias,
+        mod_conf_pro, mod_bollinger_hunter, mod_smc,
+        mod_powertrend, mod_bbpct, mod_rsi_plus,
+        consensus,
+        TP1_M, TP2_M, TP3_M, SL_M, MIN_SCORE, MIN_MODULES,
+        ADX_MIN, MIN_RR, FAST, SLOW, BB_LEN, ATR_LEN
+    )
+    BOT_MODULE = "bingx_bot2_saty_v15"
+except ImportError:
+    print("⚠️  No se encontró bingx_bot2_saty_v15.py — importando indicadores locales")
+    # Fallback: definir indicadores básicos si el bot no está disponible
+    def ema(s,n):   return s.ewm(span=n,adjust=False).mean()
+    def sma(s,n):   return s.rolling(n).mean()
+    def atr(df,n=14):
+        h,l,c=df["high"],df["low"],df["close"]
+        tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+        return tr.ewm(span=n,adjust=False).mean()
+    def rsi(s,n=14):
+        d=s.diff(); g=d.clip(lower=0).ewm(span=n,adjust=False).mean()
+        lo=(-d.clip(upper=0)).ewm(span=n,adjust=False).mean()
+        return 100-(100/(1+g/lo.replace(0,np.nan)))
+    def adx(df,n=14):
+        h,l=df["high"],df["low"]; up,dn=h.diff(),-l.diff()
+        pdm=up.where((up>dn)&(up>0),0.0); mdm=dn.where((dn>up)&(dn>0),0.0)
+        a=atr(df,n)
+        dip=100*pdm.ewm(span=n,adjust=False).mean()/a
+        dim=100*mdm.ewm(span=n,adjust=False).mean()/a
+        dx=100*(dip-dim).abs()/(dip+dim).replace(0,np.nan)
+        return dip,dim,dx.ewm(span=n,adjust=False).mean()
+    TP1_M=1.2; TP2_M=2.5; TP3_M=4.5; SL_M=1.0
+    MIN_SCORE=5; MIN_MODULES=2; ADX_MIN=20; MIN_RR=1.5
+    FAST=9; SLOW=21; BB_LEN=20; ATR_LEN=14
+    BOT_MODULE = "fallback"
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("backtest")
 
-API_KEY    = os.environ.get("BINGX_API_KEY",    "")
-API_SECRET = os.environ.get("BINGX_API_SECRET", "")
-CAPITAL    = float(os.environ.get("BT_CAPITAL",  "1000"))
-FIXED_USDT = float(os.environ.get("BT_USDT",     "20"))
-LEVERAGE   = float(os.environ.get("BT_LEVERAGE", "10"))
-COMM       = 0.0005  # 0.05% taker
-SLIP       = 0.0003  # slippage
-TP1_M=1.0; TP2_M=2.0; TP3_M=4.0; SL_M=1.0
+# ══════════════════════════════════════════════════════════
+# DETECCIÓN DE MERCADO LATERAL
+# ══════════════════════════════════════════════════════════
+def detect_lateral(df: pd.DataFrame, lookback: int = 50) -> Tuple[bool, float, float, float]:
+    """
+    Detecta si el mercado está lateral.
+    Returns: (is_lateral, range_high, range_low, range_pct)
+    
+    Criterios:
+    - ADX < 20 (sin tendencia)
+    - Precio oscila dentro de un rango definido (BB Width estrecho)
+    - Sin nuevos máximos/mínimos significativos
+    """
+    if len(df) < lookback + 10:
+        return False, 0, 0, 0
 
+    i = len(df) - 2
+    window = df.iloc[max(0, i-lookback):i+1]
+
+    # ADX bajo → sin tendencia
+    _, _, adx_s = adx(df.iloc[max(0, i-lookback-20):i+1])
+    adx_val = float(adx_s.iloc[-2]) if not adx_s.empty else 30.0
+
+    # Bollinger Width → volatilidad relativa
+    mid, upper, lower = bb(df["close"])
+    bbw = float(((upper - lower) / mid).iloc[i])
+
+    # Rango del precio en la ventana
+    rng_hi = float(window["high"].max())
+    rng_lo = float(window["low"].min())
+    rng_pct = (rng_hi - rng_lo) / rng_lo * 100 if rng_lo > 0 else 999
+
+    # Criterio lateral: ADX<20, BBW<0.04, rango<8%
+    is_lateral = adx_val < 20 and bbw < 0.04 and rng_pct < 8.0
+
+    return is_lateral, rng_hi, rng_lo, rng_pct
+
+def lateral_signal(df: pd.DataFrame, lookback: int = 50) -> Optional[dict]:
+    """
+    Genera señal para mercado lateral:
+    - LONG en soporte del rango + RSI sobreventa
+    - SHORT en resistencia del rango + RSI sobrecompra
+    """
+    is_lat, rng_hi, rng_lo, rng_pct = detect_lateral(df, lookback)
+    if not is_lat or rng_pct < 1.0:
+        return None
+
+    i = len(df) - 2
+    price = float(df["close"].iloc[i])
+    rs = rsi(df["close"])
+    rv = float(rs.iloc[i])
+    atr_v = float(atr(df).iloc[i])
+
+    rng_mid = (rng_hi + rng_lo) / 2
+    proximity = 0.015  # 1.5% del borde del rango
+
+    # LONG: cerca del soporte + RSI < 40
+    if price <= rng_lo * (1 + proximity) and rv < 40:
+        return {
+            "direction": "long",
+            "score": 6,
+            "modules": "LATERAL",
+            "signals": f"range_support RSI:{rv:.0f} range:{rng_pct:.1f}%",
+            "tp1": rng_mid,
+            "tp2": rng_hi * 0.98,
+            "tp3": rng_hi * 0.995,
+            "sl": rng_lo * (1 - proximity * 2),
+            "rng_hi": rng_hi,
+            "rng_lo": rng_lo,
+            "rng_pct": rng_pct,
+            "atr": atr_v,
+        }
+
+    # SHORT: cerca de la resistencia + RSI > 60
+    if price >= rng_hi * (1 - proximity) and rv > 60:
+        return {
+            "direction": "short",
+            "score": 6,
+            "modules": "LATERAL",
+            "signals": f"range_resistance RSI:{rv:.0f} range:{rng_pct:.1f}%",
+            "tp1": rng_mid,
+            "tp2": rng_lo * 1.02,
+            "tp3": rng_lo * 1.005,
+            "sl": rng_hi * (1 + proximity * 2),
+            "rng_hi": rng_hi,
+            "rng_lo": rng_lo,
+            "rng_pct": rng_pct,
+            "atr": atr_v,
+        }
+
+    return None
+
+# ══════════════════════════════════════════════════════════
+# DATACLASSES BACKTEST
+# ══════════════════════════════════════════════════════════
 @dataclass
 class BtTrade:
-    symbol:str=""; side:str=""; entry_bar:int=0; exit_bar:int=0
-    entry_price:float=0.0; exit_price:float=0.0
-    tp1:float=0.0; tp2:float=0.0; tp3:float=0.0; sl:float=0.0
-    pnl:float=0.0; pnl_pct:float=0.0; max_pct:float=0.0
-    reason:str=""; score:int=0; modules:str=""; signals:str=""
-    atr:float=0.0; rsi:float=0.0; adx:float=0.0
-    bars:int=0; entry_time:str=""; exit_time:str=""
-    tp1_hit:bool=False; tp2_hit:bool=False
+    idx: int
+    symbol: str
+    side: str
+    entry: float
+    tp1: float
+    tp2: float
+    tp3: float
+    sl: float
+    score: int
+    modules: str
+    rsi: float
+    adx: float
+    atr: float
+    rr: float
+    market_mode: str   # "trend" o "lateral"
+    exit_price: float = 0.0
+    exit_reason: str = ""
+    pnl_pct: float = 0.0
+    bars_held: int = 0
+    win: bool = False
 
-def fetch_hist(ex, sym, tf, days):
-    tf_m={"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240}.get(tf,5)
-    since=int((datetime.now(timezone.utc)-timedelta(days=days)).timestamp()*1000)
-    bars=[]; limit=500
-    while True:
+@dataclass
+class BtResult:
+    symbol: str
+    tf: str
+    days: int
+    initial_capital: float
+    final_capital: float
+    total_trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
+    max_dd: float = 0.0
+    max_dd_pct: float = 0.0
+    sharpe: float = 0.0
+    trades: List[BtTrade] = field(default_factory=list)
+    equity_curve: List[float] = field(default_factory=list)
+    lateral_trades: int = 0
+    trend_trades: int = 0
+    lateral_wr: float = 0.0
+    trend_wr: float = 0.0
+
+    def wr(self):
+        return (self.wins / self.total_trades * 100) if self.total_trades else 0.0
+
+    def profit_factor(self):
+        return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
+
+    def net_pnl(self):
+        return self.final_capital - self.initial_capital
+
+# ══════════════════════════════════════════════════════════
+# MOTOR DE BACKTEST
+# ══════════════════════════════════════════════════════════
+class Backtester:
+    def __init__(self,
+                 api_key: str = "",
+                 api_secret: str = "",
+                 initial_capital: float = 100.0,
+                 risk_pct: float = 2.0,
+                 leverage: float = 10.0,
+                 commission_pct: float = 0.05,
+                 include_lateral: bool = True):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.capital = initial_capital
+        self.initial_capital = initial_capital
+        self.risk_pct = risk_pct
+        self.leverage = leverage
+        self.commission = commission_pct / 100
+        self.include_lateral = include_lateral
+        self.ex = None
+
+    def _build_ex(self):
+        self.ex = ccxt.bingx({
+            "apiKey": self.api_key,
+            "secret": self.api_secret,
+            "options": {"defaultType": "swap"},
+            "enableRateLimit": True,
+        })
+        self.ex.load_markets()
+
+    def _fetch_history(self, symbol: str, tf: str, days: int) -> pd.DataFrame:
+        """Descarga histórico completo usando paginación."""
+        log.info(f"Descargando {days} días de {symbol} [{tf}]...")
+        since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+        all_ohlcv = []
+        while True:
+            try:
+                batch = self.ex.fetch_ohlcv(symbol, tf, since=since, limit=1000)
+                if not batch: break
+                all_ohlcv.extend(batch)
+                since = batch[-1][0] + 1
+                if len(batch) < 1000: break
+                time.sleep(0.3)
+            except Exception as e:
+                log.warning(f"fetch error: {e}"); break
+        if not all_ohlcv:
+            raise ValueError(f"Sin datos para {symbol}")
+        df = pd.DataFrame(all_ohlcv, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True); df = df.astype(float)
+        log.info(f"  → {len(df)} velas descargadas")
+        return df
+
+    def _signal_at(self, df: pd.DataFrame, df_htf1: pd.DataFrame,
+                   df_htf2: pd.DataFrame, i: int) -> Optional[dict]:
+        """Genera señal en la vela i usando los 6 módulos."""
+        if i < 250: return None
+        sub  = df.iloc[:i+1]
+        sub1 = df_htf1.iloc[:min(len(df_htf1), i//3+1)]
+        sub2 = df_htf2.iloc[:min(len(df_htf2), i//12+1)]
+        if len(sub) < 150 or len(sub1) < 50 or len(sub2) < 30:
+            return None
         try:
-            raw=ex.fetch_ohlcv(sym,tf,since=since,limit=limit)
-            if not raw: break
-            bars.extend(raw); since=raw[-1][0]+1
-            if len(raw)<limit: break
-        except Exception as e: log.warning(f"{sym}: {e}"); break
-    if not bars: return pd.DataFrame()
-    df=pd.DataFrame(bars,columns=["timestamp","open","high","low","close","volume"])
-    df["timestamp"]=pd.to_datetime(df["timestamp"],unit="ms"); df.set_index("timestamp",inplace=True)
-    return df.astype(float).drop_duplicates()
+            htf1b, htf1bear = htf_bias(sub1)
+            htf2b, htf2bear = htf_bias(sub2)
+            m1l, m1s = mod_conf_pro(sub, htf1b, htf1bear)
+            m2l, m2s = mod_bollinger_hunter(sub, htf2b, htf2bear)
+            m3l, m3s = mod_smc(sub, sub1)
+            m4l, m4s = mod_powertrend(sub, htf1b, htf1bear)
+            m5l, m5s = mod_bbpct(sub, htf1b, htf1bear)
+            m6l, m6s = mod_rsi_plus(sub, htf1b, htf1bear)
+            d, sc, mods, sigs = consensus(m1l, m1s, m2l, m2s, m3l, m3s,
+                                           m4l, m4s, m5l, m5s, m6l, m6s)
+            if d is None: return None
+            at_v = float(atr(sub).iloc[-1])
+            price = float(sub["close"].iloc[-1])
+            sl_d = at_v * SL_M; tp_d = at_v * TP3_M
+            rr = tp_d / max(sl_d, 1e-9)
+            if rr < MIN_RR: return None
+            rs = rsi(sub["close"]); ax = adx(sub)[2]
+            return {"direction": d, "score": sc, "modules": mods,
+                    "signals": sigs, "atr": at_v, "price": price,
+                    "rsi": float(rs.iloc[-1]), "adx": float(ax.iloc[-1]),
+                    "rr": round(rr, 2)}
+        except Exception as e:
+            log.debug(f"signal_at {i}: {e}")
+            return None
 
-def resamp(df,tf):
-    r={"15m":"15T","1h":"1H","4h":"4H","1d":"1D"}.get(tf,"15T")
-    return df.resample(r).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+    def _simulate_trade(self, df: pd.DataFrame, entry_i: int,
+                        direction: str, entry: float, tp1: float,
+                        tp2: float, tp3: float, sl: float) -> Tuple[float, str, int]:
+        """
+        Simula el trade barra a barra desde entry_i.
+        Returns: (exit_price, reason, bars_held)
+        """
+        max_bars = 200
+        tp1_hit = False
+        for j in range(entry_i + 1, min(entry_i + max_bars, len(df))):
+            h = float(df["high"].iloc[j])
+            l = float(df["low"].iloc[j])
+            c = float(df["close"].iloc[j])
 
-def run_signal(df_full, dh1, dh2, bar, min_score, min_mods):
-    """Ejecuta los 6 módulos en la barra `bar` sin look-ahead."""
-    from saty_v14 import (mod_conf_pro,mod_bollinger_hunter,mod_smc,
-                           mod_powertrend,mod_bbpct,mod_rsi_plus,
-                           consensus,htf_bias,rsi,atr,adx)
-    df  = df_full.iloc[:bar+1]
-    d1  = dh1[dh1.index<=df_full.index[bar]]
-    d2  = dh2[dh2.index<=df_full.index[bar]]
-    if len(df)<200 or len(d1)<30 or len(d2)<30: return None
-    try:
-        rv=float(rsi(df["close"]).iloc[-2]); av=float(atr(df).iloc[-2])
-        _,_,ax=adx(df); axv=float(ax.iloc[-2])
-        if pd.isna(rv) or pd.isna(axv): return None
-        htf1b,htf1bear=htf_bias(d1); htf2b,htf2bear=htf_bias(d2)
-        m1l,m1s=mod_conf_pro(df,htf1b,htf1bear)
-        m2l,m2s=mod_bollinger_hunter(df,htf2b,htf2bear)
-        m3l,m3s=mod_smc(df,d1)
-        m4l,m4s=mod_powertrend(df,htf1b,htf1bear)
-        m5l,m5s=mod_bbpct(df,htf1b,htf1bear)
-        m6l,m6s=mod_rsi_plus(df,htf1b,htf1bear)
-        d,sc,mods,sigs=consensus(m1l,m1s,m2l,m2s,m3l,m3s,m4l,m4s,m5l,m5s,m6l,m6s)
-        if d is None or sc<min_score: return None
-        return {"direction":d,"score":sc,"modules":mods,"signals":sigs,"atr":av,"rsi":rv,"adx":axv}
-    except Exception as e: log.debug(f"signal bar {bar}: {e}"); return None
-
-def simulate(df, entry_bar, sig, sym):
-    """Simula el trade con TP1/TP2/TP3 + trailing exactamente como el bot."""
-    side=sig["direction"]; ep=float(df["close"].iloc[entry_bar])
-    slip=ep*SLIP; ep=ep+slip if side=="long" else ep-slip
-    atr_v=sig["atr"]; notional=FIXED_USDT*LEVERAGE; contracts=notional/ep
-    if side=="long":
-        sl=ep-atr_v*SL_M; tp1=ep+atr_v*TP1_M; tp2=ep+atr_v*TP2_M; tp3=ep+atr_v*TP3_M
-    else:
-        sl=ep+atr_v*SL_M; tp1=ep-atr_v*TP1_M; tp2=ep-atr_v*TP2_M; tp3=ep-atr_v*TP3_M
-    t=BtTrade(symbol=sym,side=side,entry_bar=entry_bar,entry_price=ep,
-              sl=sl,tp1=tp1,tp2=tp2,tp3=tp3,score=sig["score"],
-              modules=sig["modules"],signals=sig["signals"][:60],
-              atr=atr_v,rsi=sig["rsi"],adx=sig["adx"],
-              entry_time=str(df.index[entry_bar]))
-    rem=1.0; pnl=-notional*COMM; tp1h=False; tp2h=False
-    tr_h=tr_l=peak=ep; stall=0; phase="normal"; sl_now=sl; max_p=0.0
-    for bar in range(entry_bar+1, min(entry_bar+600,len(df))):
-        h=float(df["high"].iloc[bar]); l=float(df["low"].iloc[bar]); c=float(df["close"].iloc[bar])
-        cp=((c-ep)/ep*100 if side=="long" else (ep-c)/ep*100); max_p=max(max_p,cp)
-        if not tp1h:
-            if (side=="long" and h>=tp1) or (side=="short" and l<=tp1):
-                pnl+=((tp1-ep if side=="long" else ep-tp1)*contracts*0.25)-notional*0.25*COMM
-                rem-=0.25; tp1h=True; sl_now=ep; t.tp1_hit=True; peak=tp1
-        if tp1h and not tp2h:
-            if (side=="long" and h>=tp2) or (side=="short" and l<=tp2):
-                pnl+=((tp2-ep if side=="long" else ep-tp2)*contracts*0.25)-notional*0.25*COMM
-                rem-=0.25; tp2h=True; sl_now=tp1; t.tp2_hit=True
-        if tp1h and rem>0:
-            np2=(c>peak if side=="long" else c<peak)
-            if np2: peak=c; stall=0
-            else: stall+=1
-            ret=((peak-c)/max(abs(peak-ep),1e-9)*100 if side=="long" else (c-peak)/max(abs(peak-ep),1e-9)*100)
-            if   cp>5.0:   phase="ultra"
-            elif ret>30:   phase="locked"
-            elif stall>=3: phase="tight"
-            else:          phase="normal"
-            tm={"normal":0.8,"tight":0.4,"locked":0.2,"ultra":0.15}[phase]
-            if side=="long":
-                tr_h=max(tr_h,c); ts=tr_h-atr_v*tm
-                if l<=ts:
-                    xp=max(ts,l); pnl+=((xp-ep)*contracts*rem)-notional*rem*COMM
-                    t.exit_bar=bar; t.exit_price=xp; t.reason=f"TRAIL_{phase.upper()}"
-                    t.exit_time=str(df.index[bar]); break
+            if direction == "long":
+                if l <= sl:                 return sl,  "SL",  j-entry_i
+                if not tp1_hit and h >= tp1:
+                    tp1_hit = True; sl = entry  # break-even
+                if tp1_hit and h >= tp2:
+                    sl = tp1                    # lock TP1
+                if h >= tp3:                return tp3, "TP3", j-entry_i
+                if tp1_hit and l <= sl:     return sl,  "BE/TP1", j-entry_i
             else:
-                tr_l=min(tr_l,c); ts=tr_l+atr_v*tm
-                if h>=ts:
-                    xp=min(ts,h); pnl+=((ep-xp)*contracts*rem)-notional*rem*COMM
-                    t.exit_bar=bar; t.exit_price=xp; t.reason=f"TRAIL_{phase.upper()}"
-                    t.exit_time=str(df.index[bar]); break
-        if (side=="long" and l<=sl_now) or (side=="short" and h>=sl_now):
-            xp=sl_now; pnl+=((xp-ep if side=="long" else ep-xp)*contracts*rem)-notional*rem*COMM
-            t.exit_bar=bar; t.exit_price=xp
-            t.reason="TP3" if ((side=="long" and h>=tp3) or (side=="short" and l<=tp3)) else "SL"
-            t.exit_time=str(df.index[bar]); break
-        if tp2h and rem>0:
-            if (side=="long" and h>=tp3) or (side=="short" and l<=tp3):
-                xp=tp3; pnl+=((xp-ep if side=="long" else ep-xp)*contracts*rem)-notional*rem*COMM
-                t.exit_bar=bar; t.exit_price=xp; t.reason="TP3_COMP"
-                t.exit_time=str(df.index[bar]); break
-    else:
-        if rem>0:
-            xp=float(df["close"].iloc[-1])
-            pnl+=((xp-ep if side=="long" else ep-xp)*contracts*rem)-notional*rem*COMM
-            t.exit_bar=len(df)-1; t.exit_price=xp; t.reason="TIMEOUT"
-            t.exit_time=str(df.index[-1])
-    t.pnl=round(pnl,4); t.pnl_pct=round(pnl/FIXED_USDT*100,2)
-    t.max_pct=round(max_p,2); t.bars=t.exit_bar-entry_bar
-    return t
+                if h >= sl:                 return sl,  "SL",  j-entry_i
+                if not tp1_hit and l <= tp1:
+                    tp1_hit = True; sl = entry
+                if tp1_hit and l <= tp2:
+                    sl = tp1
+                if l <= tp3:                return tp3, "TP3", j-entry_i
+                if tp1_hit and h >= sl:     return sl,  "BE/TP1", j-entry_i
 
-def bt_symbol(ex,sym,tf,htf1,htf2,days,min_score,min_mods):
-    log.info(f"  BT {sym} {tf} {days}d ...")
-    df=fetch_hist(ex,sym,tf,days); dh1=fetch_hist(ex,sym,htf1,days); dh2=fetch_hist(ex,sym,htf2,days)
-    if len(df)<300: log.warning(f"  {sym}: insuf ({len(df)}b)"); return []
-    if len(dh1)<50: dh1=resamp(df,htf1)
-    if len(dh2)<50: dh2=resamp(df,htf2)
-    tf_m={"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60}.get(tf,5)
-    cd_bars=max(5,30*60//tf_m)
-    trades=[]; last_exit=-cd_bars; bar=200
-    while bar<len(df)-1:
-        if bar-last_exit<cd_bars: bar+=1; continue
-        sig=run_signal(df,dh1,dh2,bar,min_score,min_mods)
-        if sig:
-            t=simulate(df,bar,sig,sym); trades.append(t)
-            last_exit=t.exit_bar; bar=t.exit_bar+1
-        else: bar+=1
-    return trades
+        # Timeout
+        return float(df["close"].iloc[min(entry_i + max_bars - 1, len(df)-1)]), "TIMEOUT", max_bars
 
-def print_report(trades):
-    if not trades: print("Sin trades."); return
-    wins=sum(1 for t in trades if t.pnl>0); tot=len(trades); losses=tot-wins
-    wr=wins/tot*100; gp=sum(t.pnl for t in trades if t.pnl>0)
-    gl=abs(sum(t.pnl for t in trades if t.pnl<=0)); tp=sum(t.pnl for t in trades)
-    pf=gp/gl if gl>0 else 0; aw=gp/wins if wins>0 else 0; al=gl/losses if losses>0 else 0
-    rr=aw/al if al>0 else 0; exp=(wr/100)*aw-(1-wr/100)*al
-    eq=CAPITAL; peak=eq; mdd=0.0
-    for t in trades:
-        eq+=t.pnl
-        if eq>peak: peak=eq
-        dd=(peak-eq)/peak*100
-        if dd>mdd: mdd=dd
-    print(f"\n{'='*60}\n  SATY v14 — BACKTEST\n{'='*60}")
-    for k,v in [("Trades",tot),("Win Rate",f"{wr:.1f}%"),("PF",f"{pf:.2f}"),
-                ("PnL",f"${tp:+.2f}"),("ROI",f"{tp/CAPITAL*100:+.1f}%"),
-                ("Max DD",f"{mdd:.1f}%"),("R:R",f"{rr:.2f}"),
-                ("Expectancy",f"${exp:+.2f}"),("Capital final",f"${CAPITAL+tp:.2f}")]:
-        print(f"  {k:<18} {v:>15}")
-    ms={}
-    for t in trades:
-        k=t.modules or "?"
-        if k not in ms: ms[k]={"t":0,"w":0,"pnl":0.0}
-        ms[k]["t"]+=1; ms[k]["w"]+=1 if t.pnl>0 else 0; ms[k]["pnl"]+=t.pnl
-    print(f"\n  MÓDULOS:")
-    for k,v in sorted(ms.items(),key=lambda x:-x[1]["pnl"])[:8]:
-        wr_m=v["w"]/v["t"]*100; ic="🟢" if wr_m>=55 else "🟡" if wr_m>=45 else "🔴"
-        print(f"  {ic} {k[:38]:<38} {v['t']:>4}t {wr_m:>5.1f}% ${v['pnl']:>+8.2f}")
-    print(f"\n  WR POR SCORE:")
-    sc_s={}
-    for t in trades:
-        if t.score not in sc_s: sc_s[t.score]={"t":0,"w":0}
-        sc_s[t.score]["t"]+=1; sc_s[t.score]["w"]+=1 if t.pnl>0 else 0
-    for s in sorted(sc_s):
-        v=sc_s[s]; wr_s=v["w"]/v["t"]*100
-        bar2="█"*int(wr_s/10)+"░"*(10-int(wr_s/10))
-        print(f"  Score {s:>2}: {bar2} {wr_s:>5.1f}% ({v['t']}t)")
-    print("="*60)
+    def run(self, symbol: str, tf: str = "5m", days: int = 90) -> BtResult:
+        """Ejecuta el backtest completo con walk-forward."""
+        if self.ex is None:
+            self._build_ex()
 
-def save_csv(trades,path="backtest_results.csv"):
-    with open(path,"w",newline="") as f:
-        w=csv.writer(f)
-        w.writerow(["symbol","side","entry_time","exit_time","entry","exit","pnl","pnl%","max%","reason","score","modules","rsi","adx","tp1","tp2","bars"])
-        for t in trades:
-            w.writerow([t.symbol,t.side,t.entry_time,t.exit_time,
-                        round(t.entry_price,8),round(t.exit_price,8),
-                        round(t.pnl,4),round(t.pnl_pct,2),round(t.max_pct,2),
-                        t.reason,t.score,t.modules,round(t.rsi,1),round(t.adx,1),t.tp1_hit,t.tp2_hit,t.bars])
-    log.info(f"✅ CSV: {path}")
+        # Calcular HTF equivalentes en días
+        days_needed = days + 10
+        df      = self._fetch_history(symbol, tf, days_needed)
+        df_htf1 = self._fetch_history(symbol, "15m", days_needed)
+        df_htf2 = self._fetch_history(symbol, "1h", days_needed)
 
-def save_html(trades,path="backtest_report.html"):
-    trades=sorted(trades,key=lambda t:t.entry_time)
-    eq=[CAPITAL]; ec=CAPITAL
-    for t in trades: ec+=t.pnl; eq.append(round(ec,2))
-    wins=sum(1 for t in trades if t.pnl>0); tot=len(trades)
-    wr=wins/tot*100 if tot else 0; tp=sum(t.pnl for t in trades)
-    gp=sum(t.pnl for t in trades if t.pnl>0); gl=abs(sum(t.pnl for t in trades if t.pnl<=0))
-    pf=gp/gl if gl>0 else 0; roi=tp/CAPITAL*100
-    ms={}
-    for t in trades:
-        k=t.modules or "?"
-        if k not in ms: ms[k]={"t":0,"w":0,"pnl":0.0}
-        ms[k]["t"]+=1; ms[k]["w"]+=1 if t.pnl>0 else 0; ms[k]["pnl"]+=t.pnl
-    mod_rows="".join(
-        f'<tr><td>{k[:42]}</td><td>{v["t"]}</td>'
-        f'<td style="color:{"#3fb950" if v["w"]/max(v["t"],1)*100>=55 else "#d29922" if v["w"]/max(v["t"],1)*100>=45 else "#f85149"}">'
-        f'{v["w"]/max(v["t"],1)*100:.1f}%</td><td>${v["pnl"]:+.2f}</td></tr>'
-        for k,v in sorted(ms.items(),key=lambda x:-x[1]["pnl"])[:15])
-    trade_rows="".join(
-        f'<tr style="color:{"#3fb950" if t.pnl>0 else "#f85149"}">'
-        f'<td>{t.symbol}</td><td>{t.side}</td><td>{t.entry_time[:16]}</td><td>{t.exit_time[:16]}</td>'
-        f'<td>{t.entry_price:.6g}</td><td>{t.exit_price:.6g}</td><td>${t.pnl:+.2f}</td>'
-        f'<td>{t.pnl_pct:+.1f}%</td><td>{t.reason}</td><td>{t.score}</td><td>{t.modules[:28]}</td></tr>'
-        for t in trades[-60:])
-    dates_js=",".join(f'"{t.entry_time[:10]}"' for t in trades)+(',"end"' if trades else '')
-    html=f"""<!DOCTYPE html><html lang="es">
-<head><meta charset="UTF-8"><title>SATY v14 Backtest</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-body{{background:#0d1117;color:#c9d1d9;font-family:monospace;margin:24px}}
-h1{{color:#58a6ff}} h2{{color:#79c0ff;border-bottom:1px solid #30363d;padding-bottom:6px;margin-top:28px}}
-.g{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}}
-.c{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;text-align:center}}
-.v{{font-size:1.7em;font-weight:bold}} .l{{font-size:0.78em;color:#8b949e;margin-top:4px}}
-.green{{color:#3fb950}} .red{{color:#f85149}} .yellow{{color:#d29922}}
-table{{width:100%;border-collapse:collapse;font-size:0.83em}} th{{background:#21262d;padding:8px;text-align:left;border:1px solid #30363d}} td{{padding:5px 8px;border:1px solid #161b22}} tr:hover{{background:#21262d}}
-canvas{{max-height:300px}}
-</style></head><body>
-<h1>📊 SATY ELITE v14 — Backtest Report</h1>
-<p style="color:#8b949e">Generado: {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')} | Capital: ${CAPITAL:.0f} | Trades: {tot}</p>
-<div class="g">
-  <div class="c"><div class="v {'green' if wr>=50 else 'red'}">{wr:.1f}%</div><div class="l">Win Rate</div></div>
-  <div class="c"><div class="v {'green' if pf>=1.5 else 'yellow' if pf>=1 else 'red'}">{pf:.2f}</div><div class="l">Profit Factor</div></div>
-  <div class="c"><div class="v {'green' if tp>0 else 'red'}">${tp:+.2f}</div><div class="l">PnL Total</div></div>
-  <div class="c"><div class="v {'green' if roi>0 else 'red'}">{roi:+.1f}%</div><div class="l">ROI</div></div>
-  <div class="c"><div class="v green">{wins}</div><div class="l">Ganadores</div></div>
-  <div class="c"><div class="v red">{tot-wins}</div><div class="l">Perdedores</div></div>
-  <div class="c"><div class="v green">${gp:.2f}</div><div class="l">Ganancia bruta</div></div>
-  <div class="c"><div class="v red">${gl:.2f}</div><div class="l">Pérdida bruta</div></div>
-</div>
-<h2>📈 Equity Curve</h2>
-<canvas id="ec"></canvas>
-<script>
-new Chart(document.getElementById('ec').getContext('2d'),{{
-  type:'line',data:{{labels:[{dates_js}],datasets:[{{label:'Equity ($)',
-    data:[{','.join(str(e) for e in eq)}],borderColor:'#58a6ff',
-    backgroundColor:'rgba(88,166,255,0.07)',fill:true,tension:0.3,pointRadius:0,borderWidth:2}}]}},
-  options:{{responsive:true,plugins:{{legend:{{labels:{{color:'#c9d1d9'}}}}}},
-    scales:{{y:{{grid:{{color:'#21262d'}},ticks:{{color:'#8b949e'}}}},
-             x:{{ticks:{{maxTicksLimit:12,color:'#8b949e'}},grid:{{color:'#21262d'}}}}}}}}
-}});
-</script>
-<h2>🧠 Módulos</h2>
-<table><tr><th>Combinación</th><th>Trades</th><th>Win Rate</th><th>PnL</th></tr>{mod_rows}</table>
-<h2>📋 Últimos 60 Trades</h2>
-<table><tr><th>Sym</th><th>Side</th><th>Entrada</th><th>Salida</th><th>E.P</th><th>S.P</th><th>PnL</th><th>%</th><th>Razón</th><th>Score</th><th>Módulos</th></tr>{trade_rows}</table>
-</body></html>"""
-    with open(path,"w",encoding="utf-8") as f: f.write(html)
-    log.info(f"✅ HTML: {path}")
+        result = BtResult(
+            symbol=symbol, tf=tf, days=days,
+            initial_capital=self.initial_capital,
+            final_capital=self.initial_capital,
+        )
 
-def feed_brain(trades):
+        equity = self.initial_capital
+        peak_eq = equity
+        max_dd = 0.0
+        equity_curve = [equity]
+        trades: List[BtTrade] = []
+        in_trade = False
+        active: Optional[BtTrade] = None
+
+        log.info(f"Simulando {len(df)} velas...")
+        skip_until = 0
+
+        for i in range(250, len(df) - 1):
+            if i < skip_until: continue
+
+            # ── Lateral detection ─────────────────────────
+            lat_sig = None
+            if self.include_lateral:
+                lat_sig = lateral_signal(df.iloc[:i+1])
+
+            # ── Trend signal ──────────────────────────────
+            sig = self._signal_at(df, df_htf1, df_htf2, i)
+
+            # Priorizar señal de tendencia sobre lateral
+            chosen_sig = sig if sig else lat_sig
+            if chosen_sig is None: continue
+
+            d = chosen_sig["direction"]
+            price = float(df["close"].iloc[i])
+            at_v  = chosen_sig.get("atr", float(atr(df.iloc[:i+1]).iloc[-1]))
+
+            # Calcular TP/SL
+            if "tp1" in chosen_sig:  # señal lateral ya tiene TP/SL calculados
+                tp1 = chosen_sig["tp1"]; tp2 = chosen_sig["tp2"]
+                tp3 = chosen_sig["tp3"]; sl  = chosen_sig["sl"]
+            else:
+                if d == "long":
+                    sl  = price - at_v * SL_M
+                    tp1 = price + at_v * TP1_M
+                    tp2 = price + at_v * TP2_M
+                    tp3 = price + at_v * TP3_M
+                else:
+                    sl  = price + at_v * SL_M
+                    tp1 = price - at_v * TP1_M
+                    tp2 = price - at_v * TP2_M
+                    tp3 = price - at_v * TP3_M
+
+            rr = abs(tp3 - price) / max(abs(sl - price), 1e-9)
+            if rr < MIN_RR: continue
+
+            # Position sizing (riesgo fijo %)
+            risk_usd  = equity * (self.risk_pct / 100)
+            sl_dist   = abs(price - sl)
+            contracts = (risk_usd * self.leverage) / max(sl_dist * price, 1e-6)
+            notional  = contracts * price
+
+            # Simular
+            exit_p, reason, bars = self._simulate_trade(df, i, d, price, tp1, tp2, tp3, sl)
+
+            # PnL
+            raw_pnl = (exit_p - price if d == "long" else price - exit_p) * contracts
+            commission = notional * self.commission * 2  # entrada + salida
+            net_pnl = raw_pnl - commission
+            pnl_pct = net_pnl / equity * 100
+
+            equity += net_pnl
+            equity_curve.append(round(equity, 4))
+            peak_eq = max(peak_eq, equity)
+            dd = (peak_eq - equity) / peak_eq * 100
+            max_dd = max(max_dd, dd)
+
+            win = net_pnl > 0
+            rs_v = chosen_sig.get("rsi", 50.0)
+            ax_v = chosen_sig.get("adx", 20.0)
+            market_mode = "lateral" if lat_sig and not sig else "trend"
+
+            t = BtTrade(
+                idx=i, symbol=symbol, side=d,
+                entry=round(price, 8), tp1=round(tp1, 8),
+                tp2=round(tp2, 8), tp3=round(tp3, 8), sl=round(sl, 8),
+                score=chosen_sig.get("score", 0),
+                modules=chosen_sig.get("modules", ""),
+                rsi=round(rs_v, 1), adx=round(ax_v, 1),
+                atr=round(at_v, 8), rr=round(rr, 2),
+                market_mode=market_mode,
+                exit_price=round(exit_p, 8),
+                exit_reason=reason,
+                pnl_pct=round(pnl_pct, 3),
+                bars_held=bars, win=win
+            )
+            trades.append(t)
+            result.total_trades += 1
+            if win:
+                result.wins += 1; result.gross_profit += net_pnl
+            else:
+                result.losses += 1; result.gross_loss += abs(net_pnl)
+
+            if market_mode == "lateral": result.lateral_trades += 1
+            else:                        result.trend_trades += 1
+
+            skip_until = i + max(1, bars)
+
+            if result.total_trades % 20 == 0:
+                log.info(f"  Progreso: {result.total_trades} trades | "
+                         f"Equity: ${equity:.2f} | DD: {dd:.1f}%")
+
+        # Estadísticas finales
+        result.final_capital = round(equity, 2)
+        result.max_dd = round(max_dd, 2)
+        result.max_dd_pct = round(max_dd, 2)
+        result.trades = trades
+        result.equity_curve = equity_curve
+
+        # WR por modo
+        lat_t = [t for t in trades if t.market_mode == "lateral"]
+        trd_t = [t for t in trades if t.market_mode == "trend"]
+        result.lateral_wr = (sum(1 for t in lat_t if t.win) / len(lat_t) * 100) if lat_t else 0
+        result.trend_wr   = (sum(1 for t in trd_t if t.win) / len(trd_t) * 100) if trd_t else 0
+
+        # Sharpe (simplificado: PnL medio / std de PnLs)
+        pnls = [t.pnl_pct for t in trades]
+        if len(pnls) > 2:
+            result.sharpe = round(np.mean(pnls) / (np.std(pnls) + 1e-9) * np.sqrt(252), 2)
+
+        return result
+
+# ══════════════════════════════════════════════════════════
+# REPORTE
+# ══════════════════════════════════════════════════════════
+def print_report(r: BtResult):
+    sep = "═" * 60
+    print(f"\n{sep}")
+    print(f"  BACKTEST SATY ELITE v15 — {r.symbol} [{r.tf}] {r.days}d")
+    print(sep)
+    print(f"  Capital inicial:  ${r.initial_capital:.2f}")
+    print(f"  Capital final:    ${r.final_capital:.2f}")
+    nk = r.net_pnl()
+    print(f"  PnL neto:         ${nk:+.2f} ({nk/r.initial_capital*100:+.1f}%)")
+    print(f"  Max Drawdown:     {r.max_dd_pct:.1f}%")
+    print(f"  Sharpe ratio:     {r.sharpe:.2f}")
+    print(sep)
+    print(f"  Total trades:     {r.total_trades}")
+    print(f"  Ganadores:        {r.wins} ({r.wr():.1f}%)")
+    print(f"  Perdedores:       {r.losses}")
+    print(f"  Profit Factor:    {r.profit_factor():.2f}")
+    print(sep)
+    print(f"  TENDENCIA:        {r.trend_trades} trades | WR: {r.trend_wr:.1f}%")
+    print(f"  LATERAL:          {r.lateral_trades} trades | WR: {r.lateral_wr:.1f}%")
+    print(sep)
+
+    # Top 5 mejores trades
+    if r.trades:
+        best = sorted(r.trades, key=lambda x: x.pnl_pct, reverse=True)[:5]
+        print(f"\n  🏆 TOP 5 trades:")
+        for t in best:
+            print(f"    {'🟢' if t.win else '🔴'} {t.side.upper()} [{t.modules}] "
+                  f"R/R:{t.rr} → {t.exit_reason} {t.pnl_pct:+.2f}% "
+                  f"({t.market_mode})")
+
+        # Top 5 peores
+        worst = sorted(r.trades, key=lambda x: x.pnl_pct)[:5]
+        print(f"\n  ❌ TOP 5 pérdidas:")
+        for t in worst:
+            print(f"    {'🟢' if t.win else '🔴'} {t.side.upper()} [{t.modules}] "
+                  f"R/R:{t.rr} → {t.exit_reason} {t.pnl_pct:+.2f}% "
+                  f"({t.market_mode})")
+
+        # Análisis por módulo
+        combos = defaultdict(lambda: {"w": 0, "l": 0, "pnl": 0.0})
+        for t in r.trades:
+            combos[t.modules]["w" if t.win else "l"] += 1
+            combos[t.modules]["pnl"] += t.pnl_pct
+        print(f"\n  📊 Por combo:")
+        for c, s in sorted(combos.items(), key=lambda x: x[1]["pnl"], reverse=True)[:8]:
+            tot = s["w"] + s["l"]
+            cwr = s["w"] / tot * 100 if tot else 0
+            print(f"    {c[:35]:35s} {tot:3d}T WR:{cwr:.0f}% PnL:{s['pnl']:+.1f}%")
+
+    print(f"\n{sep}\n")
+
+def save_report(r: BtResult, path: str = "backtest_report.json"):
+    """Guarda reporte en JSON para análisis externo."""
+    data = {
+        "symbol": r.symbol, "tf": r.tf, "days": r.days,
+        "initial_capital": r.initial_capital,
+        "final_capital": r.final_capital,
+        "net_pnl": r.net_pnl(),
+        "net_pnl_pct": round(r.net_pnl() / r.initial_capital * 100, 2),
+        "total_trades": r.total_trades,
+        "wins": r.wins, "losses": r.losses,
+        "win_rate": round(r.wr(), 2),
+        "profit_factor": round(r.profit_factor(), 2),
+        "max_dd_pct": r.max_dd_pct,
+        "sharpe": r.sharpe,
+        "trend_trades": r.trend_trades, "trend_wr": round(r.trend_wr, 1),
+        "lateral_trades": r.lateral_trades, "lateral_wr": round(r.lateral_wr, 1),
+        "equity_curve": r.equity_curve,
+        "trades": [
+            {"idx": t.idx, "side": t.side, "entry": t.entry,
+             "exit": t.exit_price, "reason": t.exit_reason,
+             "pnl_pct": t.pnl_pct, "bars": t.bars_held,
+             "modules": t.modules, "score": t.score,
+             "rsi": t.rsi, "adx": t.adx, "rr": t.rr,
+             "market_mode": t.market_mode, "win": t.win}
+            for t in r.trades
+        ]
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    log.info(f"Reporte guardado en {path}")
+
+def plot_equity(r: BtResult):
+    """Grafica la curva de equity (requiere matplotlib)."""
     try:
-        from brain import brain
-        log.info(f"Alimentando Brain con {len(trades)} trades ...")
-        for t in sorted(trades,key=lambda x:x.entry_time):
-            brain.record_trade(symbol=t.symbol,side=t.side,modules=t.modules,signals=t.signals,
-                               entry_score=t.score,pnl=t.pnl,pnl_pct=t.pnl_pct,
-                               max_profit=t.max_pct,reason=t.reason,duration_min=t.bars*5,
-                               btc_bull=True,btc_bear=False,btc_adx=20.0,rsi_entry=t.rsi,adx_entry=t.adx)
-        log.info(f"Brain: {brain.data.total_trades}t | score_min={brain.data.effective_min_score}")
-        for ins in brain.data.insights[:8]: log.info(f"  💡 {ins}")
-    except Exception as e: log.warning(f"feed_brain: {e}")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(2, 1, figsize=(14, 8))
 
+        # Equity curve
+        axes[0].plot(r.equity_curve, color="cyan", linewidth=1.5)
+        axes[0].axhline(r.initial_capital, color="gray", linestyle="--", alpha=0.5)
+        axes[0].fill_between(range(len(r.equity_curve)),
+                             r.initial_capital, r.equity_curve,
+                             where=[e >= r.initial_capital for e in r.equity_curve],
+                             alpha=0.3, color="green")
+        axes[0].fill_between(range(len(r.equity_curve)),
+                             r.initial_capital, r.equity_curve,
+                             where=[e < r.initial_capital for e in r.equity_curve],
+                             alpha=0.3, color="red")
+        axes[0].set_title(f"SATY v15 Backtest — {r.symbol} [{r.tf}] {r.days}d | "
+                          f"WR:{r.wr():.1f}% PF:{r.profit_factor():.2f} DD:{r.max_dd_pct:.1f}%")
+        axes[0].set_ylabel("Capital ($)")
+        axes[0].grid(alpha=0.3)
+
+        # PnL por trade
+        colors = ["green" if t.win else "red" for t in r.trades]
+        axes[1].bar(range(len(r.trades)),
+                    [t.pnl_pct for t in r.trades], color=colors, alpha=0.7)
+        axes[1].axhline(0, color="white", linewidth=0.5)
+        axes[1].set_title(f"PnL por trade (verde=tendencia, rojo=lateral)")
+        axes[1].set_ylabel("PnL %")
+        axes[1].grid(alpha=0.3)
+
+        plt.tight_layout()
+        fname = f"backtest_{r.symbol.replace('/', '_').replace(':', '_')}_{r.tf}.png"
+        plt.savefig(fname, dpi=150, bbox_inches="tight",
+                    facecolor="#1a1a2e", edgecolor="none")
+        log.info(f"Gráfico guardado: {fname}")
+        plt.show()
+    except ImportError:
+        log.warning("matplotlib no disponible — instala con: pip install matplotlib")
+
+# ══════════════════════════════════════════════════════════
+# WALK-FORWARD VALIDATION
+# ══════════════════════════════════════════════════════════
+def walk_forward(bt: Backtester, symbol: str, tf: str,
+                 total_days: int = 180, window_days: int = 30) -> List[BtResult]:
+    """
+    Walk-forward: entrena en 2/3, valida en 1/3 de cada ventana.
+    Muestra si los parámetros son robustos fuera de muestra.
+    """
+    results = []
+    start = 0
+    while start + window_days <= total_days:
+        r = bt.run(symbol, tf, window_days)
+        results.append(r)
+        log.info(f"  WF ventana {start}-{start+window_days}d: "
+                 f"WR:{r.wr():.1f}% PF:{r.profit_factor():.2f} PnL:${r.net_pnl():+.2f}")
+        start += window_days // 2  # 50% overlap
+
+    # Resumen walk-forward
+    print("\n" + "═"*60)
+    print("  WALK-FORWARD VALIDATION")
+    print("═"*60)
+    for i, r in enumerate(results):
+        print(f"  Ventana {i+1}: WR:{r.wr():.1f}% PF:{r.profit_factor():.2f} "
+              f"DD:{r.max_dd_pct:.1f}% PnL:${r.net_pnl():+.2f}")
+    avg_wr = sum(r.wr() for r in results) / len(results) if results else 0
+    avg_pf = sum(r.profit_factor() for r in results) / len(results) if results else 0
+    print(f"  PROMEDIO: WR:{avg_wr:.1f}% PF:{avg_pf:.2f}")
+    print("═"*60)
+    return results
+
+# ══════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════
 def main():
-    p=argparse.ArgumentParser(description="SATY v14 Backtester")
-    p.add_argument("--symbol",   default=None)
-    p.add_argument("--days",     type=int,   default=90)
-    p.add_argument("--tf",       default="5m")
-    p.add_argument("--htf1",     default="15m")
-    p.add_argument("--htf2",     default="1h")
-    p.add_argument("--top",      type=int,   default=20)
-    p.add_argument("--minscore", type=int,   default=5)
-    p.add_argument("--minmods",  type=int,   default=2)
-    p.add_argument("--capital",  type=float, default=1000)
-    p.add_argument("--feedbrain",action="store_true")
-    p.add_argument("--no-html",  action="store_true")
-    args=p.parse_args()
+    parser = argparse.ArgumentParser(description="SATY ELITE v15 Backtester")
+    parser.add_argument("--symbol",   default="BTC/USDT:USDT", help="Par a testear")
+    parser.add_argument("--tf",       default="5m",             help="Timeframe")
+    parser.add_argument("--days",     type=int, default=90,     help="Días históricos")
+    parser.add_argument("--capital",  type=float, default=100,  help="Capital inicial")
+    parser.add_argument("--risk",     type=float, default=2.0,  help="Riesgo por trade %%")
+    parser.add_argument("--leverage", type=float, default=10.0, help="Apalancamiento")
+    parser.add_argument("--plot",     action="store_true",      help="Mostrar gráfico")
+    parser.add_argument("--wf",       action="store_true",      help="Walk-forward")
+    parser.add_argument("--no-lateral", action="store_true",    help="Sin mercado lateral")
+    parser.add_argument("--multi",    action="store_true",      help="Testear múltiples pares")
+    args = parser.parse_args()
 
-    global CAPITAL; CAPITAL=args.capital
-    log.info(f"SATY v14 BACKTESTER | {args.days}d | {args.tf} | score≥{args.minscore}")
+    api_key    = os.environ.get("BINGX_API_KEY","").strip().strip('"').strip("'")
+    api_secret = os.environ.get("BINGX_API_SECRET","").strip().strip('"').strip("'")
 
-    if not (API_KEY and API_SECRET):
-        log.error("Faltan BINGX_API_KEY / BINGX_API_SECRET"); sys.exit(1)
-    ex=ccxt.bingx({"apiKey":API_KEY,"secret":API_SECRET,"options":{"defaultType":"swap"},"enableRateLimit":True})
-    ex.load_markets()
+    bt = Backtester(
+        api_key=api_key, api_secret=api_secret,
+        initial_capital=args.capital,
+        risk_pct=args.risk, leverage=args.leverage,
+        include_lateral=not args.no_lateral
+    )
+    bt._build_ex()
 
-    if args.symbol:
-        symbols=[args.symbol]
+    if args.multi:
+        # Testear los top 10 pares por volumen
+        symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+                   "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+                   "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT"]
+        all_results = []
+        for sym in symbols:
+            try:
+                r = bt.run(sym, args.tf, args.days)
+                print_report(r)
+                all_results.append(r)
+            except Exception as e:
+                log.error(f"{sym}: {e}")
+        # Resumen multi
+        print("\n" + "═"*60)
+        print("  RESUMEN MULTI-SÍMBOLO")
+        print("═"*60)
+        for r in sorted(all_results, key=lambda x: x.net_pnl(), reverse=True):
+            print(f"  {r.symbol:25s} WR:{r.wr():.1f}% PF:{r.profit_factor():.2f} "
+                  f"PnL:${r.net_pnl():+.2f} DD:{r.max_dd_pct:.1f}%")
+    elif args.wf:
+        walk_forward(bt, args.symbol, args.tf, args.days * 2, args.days)
     else:
-        cands=[s for s,m in ex.markets.items() if m.get("swap") and m.get("quote")=="USDT" and m.get("active",True)]
-        try:
-            tickers=ex.fetch_tickers(cands)
-            ranked=sorted([(s,float(tickers.get(s,{}).get("quoteVolume",0) or 0)) for s in cands],key=lambda x:-x[1])
-            symbols=[s for s,v in ranked if v>0][:args.top]
-        except Exception: symbols=cands[:args.top]
+        r = bt.run(args.symbol, args.tf, args.days)
+        print_report(r)
+        save_report(r)
+        if args.plot:
+            plot_equity(r)
 
-    log.info(f"Backtesting {len(symbols)} pares: {symbols[:5]} ...")
-    all_trades=[]
-    for sym in symbols:
-        try:
-            ts=bt_symbol(ex,sym,args.tf,args.htf1,args.htf2,args.days,args.minscore,args.minmods)
-            if ts:
-                all_trades.extend(ts)
-                wins_s=sum(1 for t in ts if t.pnl>0)
-                log.info(f"  {sym}: {len(ts)}t WR:{wins_s/len(ts)*100:.1f}% PnL:${sum(t.pnl for t in ts):+.2f}")
-        except Exception as e: log.error(f"{sym}: {e}")
-
-    if not all_trades: log.warning("Sin trades."); return
-    all_trades.sort(key=lambda t:t.entry_time)
-    print_report(all_trades)
-    save_csv(all_trades)
-    if not args.no_html: save_html(all_trades)
-    if args.feedbrain: feed_brain(all_trades)
-    log.info(f"\n✅ {len(all_trades)} trades | backtest_results.csv | backtest_report.html")
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
