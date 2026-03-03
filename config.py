@@ -50,7 +50,7 @@ EMA_TREND_PERIOD  = int(os.getenv("EMA_TREND_PERIOD", "200"))
 # ── ADX: fuerza de tendencia ──────────────────────────────
 # ADX > 25 = tendencia definida. Investigacion 2025: 55-65% accuracy
 ADX_FILTER_ENABLED = os.getenv("ADX_FILTER_ENABLED", "true").lower() == "true"
-ADX_MIN            = float(os.getenv("ADX_MIN", "25"))
+ADX_MIN            = float(os.getenv("ADX_MIN", "18"))   # 18 permite mas señales, sube a 25 si hay ruido
 ADX_PERIOD         = int(os.getenv("ADX_PERIOD", "14"))
 
 # ── Stochastic RSI ────────────────────────────────────────
@@ -61,16 +61,16 @@ STOCH_RSI_PERIOD  = int(os.getenv("STOCH_RSI_PERIOD", "14"))
 STOCH_RSI_K       = int(os.getenv("STOCH_RSI_K", "3"))
 STOCH_RSI_D       = int(os.getenv("STOCH_RSI_D", "3"))
 STOCH_RSI_OB      = float(os.getenv("STOCH_RSI_OB", "80"))
-STOCH_RSI_OS      = float(os.getenv("STOCH_RSI_OS", "20"))
+STOCH_RSI_OS      = float(os.getenv("STOCH_RSI_OS", "30"))  # < 30 sobrevendido (antes 20, muy estricto)
 
 # ── Confirmacion de vela ──────────────────────────────────
 # Cuerpo de la vela de señal > 60% del rango (evita doji)
 CANDLE_CONFIRM_ENABLED  = os.getenv("CANDLE_CONFIRM_ENABLED", "true").lower() == "true"
-CANDLE_CONFIRM_MIN_BODY = float(os.getenv("CANDLE_CONFIRM_MIN_BODY", "0.6"))
+CANDLE_CONFIRM_MIN_BODY = float(os.getenv("CANDLE_CONFIRM_MIN_BODY", "0.45"))  # antes 0.6, muy estricto
 
 # ── Confirmacion de volumen ───────────────────────────────
 VOLUME_CONFIRM_ENABLED = os.getenv("VOLUME_CONFIRM_ENABLED", "true").lower() == "true"
-VOLUME_CONFIRM_MULT    = float(os.getenv("VOLUME_CONFIRM_MULT", "1.2"))
+VOLUME_CONFIRM_MULT    = float(os.getenv("VOLUME_CONFIRM_MULT", "0.9"))  # antes 1.2 bloqueaba demasiado
 
 # ── 3 niveles de TP ───────────────────────────────────────
 # TP1 = 1.2x ATR → cerrar 30%  |  TP2 = 2.0x ATR → cerrar 40%
@@ -100,26 +100,26 @@ TRAILING_VOL_THRESHOLD   = float(os.getenv("TRAILING_VOL_THRESHOLD", "0.015"))  
 # ── NUEVO: Sentimiento de noticias (CryptoPanic API - gratis) ─
 # Bloquea entradas en pares con noticias muy negativas recientes
 # Requiere CRYPTOPANIC_API_KEY en .env (gratis en cryptopanic.com)
-SENTIMENT_ENABLED     = os.getenv("SENTIMENT_ENABLED", "true").lower() == "true"
+# Sentimiento — OFF por defecto hasta configurar CRYPTOPANIC_API_KEY en .env
+SENTIMENT_ENABLED     = os.getenv("SENTIMENT_ENABLED", "false").lower() == "true"
 CRYPTOPANIC_API_KEY   = os.getenv("CRYPTOPANIC_API_KEY", "")
-SENTIMENT_BLOCK_PANIC = os.getenv("SENTIMENT_BLOCK_PANIC", "true").lower() == "true"  # bloquear noticias panic
-SENTIMENT_CACHE_MIN   = int(os.getenv("SENTIMENT_CACHE_MIN", "30"))  # cachear 30 min
+SENTIMENT_BLOCK_PANIC = os.getenv("SENTIMENT_BLOCK_PANIC", "true").lower() == "true"
+SENTIMENT_CACHE_MIN   = int(os.getenv("SENTIMENT_CACHE_MIN", "30"))
 
-# ── NUEVO: Fear & Greed Index ─────────────────────────────
-# Evitar abrir nuevas posiciones en Extreme Fear (< 20) o Extreme Greed (> 80)
-# API gratuita: api.alternative.me/fng/
+# Fear & Greed — ON por defecto (API gratuita, no requiere clave)
 FEAR_GREED_ENABLED    = os.getenv("FEAR_GREED_ENABLED", "true").lower() == "true"
-FEAR_GREED_MIN        = int(os.getenv("FEAR_GREED_MIN", "20"))   # no operar si FGI < 20
-FEAR_GREED_MAX        = int(os.getenv("FEAR_GREED_MAX", "80"))   # no operar si FGI > 80
+FEAR_GREED_MIN        = int(os.getenv("FEAR_GREED_MIN", "15"))   # relajado de 20 a 15
+FEAR_GREED_MAX        = int(os.getenv("FEAR_GREED_MAX", "85"))   # relajado de 80 a 85
 FEAR_GREED_CACHE_MIN  = int(os.getenv("FEAR_GREED_CACHE_MIN", "60"))
 
 # ── Filtro horario ────────────────────────────────────────
-TIME_FILTER_ENABLED   = os.getenv("TIME_FILTER_ENABLED", "true").lower() == "true"
-TIME_FILTER_OFF_START = int(os.getenv("TIME_FILTER_OFF_START", "1"))
-TIME_FILTER_OFF_END   = int(os.getenv("TIME_FILTER_OFF_END",   "6"))
+# Filtro horario — por defecto OFF para no bloquear señales (activa si el bot opera de noche)
+TIME_FILTER_ENABLED   = os.getenv("TIME_FILTER_ENABLED", "false").lower() == "true"
+TIME_FILTER_OFF_START = int(os.getenv("TIME_FILTER_OFF_START", "2"))
+TIME_FILTER_OFF_END   = int(os.getenv("TIME_FILTER_OFF_END",   "5"))
 
 # ── R:R minimo ────────────────────────────────────────────
-MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "1.5"))
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "1.2"))  # antes 1.5, muy estricto para BB signals
 
 # ── Gestion de capital ────────────────────────────────────
 RISK_PCT      = float(os.getenv("RISK_PCT", "0.015"))
