@@ -1,180 +1,258 @@
 """
-learner.py — Aprendizaje automatico basado en historial de trades.
-
-Logica:
-  Despues de cada N trades analiza los resultados y ajusta
-  BB_SIGMA, RSI_OB y SL_ATR para maximizar el win rate futuro.
-
-  Reglas de ajuste:
-  ┌─ Win rate < 45%  → endurecer filtros (subir RSI_OB, subir BB_SIGMA)
-  ├─ Win rate > 70%  → relajar filtros para mas señales
-  ├─ Muchos SL       → ampliar stop loss (subir SL_ATR)
-  ├─ Perdidas en RSI alto (>55) → bajar umbral RSI
-  └─ Ganancias en RSI bajo (<40) → confirmar ese rango
+learner.py — Motor de aprendizaje automatico Elite v5
+Analiza cada trade cerrado y ajusta parametros en tiempo real.
+Aprende de errores: detecta patrones de perdida y los evita.
+Reinvierte ganancias: escala el riesgo segun el crecimiento del balance.
 """
-
 import logging
-from dataclasses import dataclass
-from typing import Optional
-import database as db
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from collections import defaultdict
 import config as cfg
 
 log = logging.getLogger("learner")
 
-# Cada cuantos trades cerrados hacer una revision
-REVIEW_EVERY  = 10
-# Limites de los parametros (no salirse de estos rangos)
-LIMITS = {
-    "bb_sigma": (1.4, 2.5),
-    "rsi_ob":   (45.0, 75.0),
-    "sl_atr":   (1.0, 3.5),
-}
-
-@dataclass
-class ParamUpdate:
-    param:    str
-    old_val:  float
-    new_val:  float
-    reason:   str
+REVIEW_EVERY   = 10   # revisar cada N trades
+MIN_TRADES     = 5    # minimo de trades para ajustar
+DB_PATH        = "trades.db"
 
 
-def _clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
+# ═══════════════════════════════════════════════════════════
+# REINVERSION DE GANANCIAS — Compound Interest
+# ═══════════════════════════════════════════════════════════
 
-
-def analyze_and_adjust() -> list[ParamUpdate]:
+def update_compound(current_balance: float, initial_balance: float):
     """
-    Analiza los ultimos trades y propone ajustes de parametros.
-    Retorna lista de cambios aplicados.
+    Reinvierte ganancias automaticamente escalando RISK_PCT.
+    Cuanto mayor es el balance vs el inicial, mas arriesga.
+    Nunca supera MAX_RISK ni baja de MIN_RISK.
+
+    Escala:
+      balance x1.0 → riesgo base (1.5%)
+      balance x1.5 → riesgo x1.2 (1.8%)
+      balance x2.0 → riesgo x1.4 (2.1%)
+      balance x3.0 → riesgo x1.6 (2.4%)
     """
-    trades = db.get_recent_trades(30)
-    if len(trades) < REVIEW_EVERY:
-        log.debug(f"Learner: solo {len(trades)} trades, esperando {REVIEW_EVERY} para revisar")
+    if initial_balance <= 0 or current_balance <= 0:
+        return
+
+    BASE_RISK = 0.015
+    MIN_RISK  = 0.005
+    MAX_RISK  = 0.03
+
+    growth = current_balance / initial_balance
+    if growth <= 1.0:
+        # En drawdown: reducir riesgo
+        new_risk = max(BASE_RISK * growth, MIN_RISK)
+    else:
+        # En ganancia: escalar riesgo gradualmente
+        scale    = 1.0 + (growth - 1.0) * 0.4
+        new_risk = min(BASE_RISK * scale, MAX_RISK)
+
+    old_risk = cfg.RISK_PCT
+    if abs(new_risk - old_risk) > 0.001:
+        cfg.RISK_PCT = round(new_risk, 4)
+        log.info(
+            f"Compound: balance ${current_balance:.2f} "
+            f"(x{growth:.2f}) → RISK_PCT {old_risk:.3f} → {cfg.RISK_PCT:.3f}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+# KELLY CRITERION — position sizing optimo
+# ═══════════════════════════════════════════════════════════
+
+def calc_kelly_risk(win_rate: float, avg_win: float, avg_loss: float) -> float:
+    """
+    Calcula el riesgo optimo por trade usando Kelly Criterion.
+    Usa Quarter-Kelly (25%) para mayor seguridad.
+    """
+    if avg_loss <= 0 or win_rate <= 0:
+        return cfg.RISK_PCT
+    reward_risk = avg_win / avg_loss
+    kelly = win_rate - (1 - win_rate) / reward_risk
+    kelly = max(0.0, kelly)
+    quarter_kelly = kelly * 0.25
+    # Clamp entre 0.5% y 3%
+    return round(max(0.005, min(0.03, quarter_kelly)), 4)
+
+
+# ═══════════════════════════════════════════════════════════
+# ANALISIS DE ERRORES — aprende que NO hacer
+# ═══════════════════════════════════════════════════════════
+
+def analyze_losing_patterns(trades: list) -> dict:
+    """
+    Analiza trades perdedores y detecta patrones comunes.
+    Retorna ajustes recomendados.
+    """
+    if not trades:
+        return {}
+
+    losing = [t for t in trades if t.get("pnl", 0) < 0]
+    winning = [t for t in trades if t.get("pnl", 0) > 0]
+
+    if not losing:
+        return {}
+
+    adjustments = {}
+    patterns    = []
+
+    # ── Patron 1: RSI demasiado alto en entradas perdedoras ──
+    losing_rsi  = [t.get("rsi_entry", 50) for t in losing  if t.get("rsi_entry")]
+    winning_rsi = [t.get("rsi_entry", 50) for t in winning if t.get("rsi_entry")]
+    if losing_rsi and winning_rsi:
+        avg_loss_rsi = sum(losing_rsi)  / len(losing_rsi)
+        avg_win_rsi  = sum(winning_rsi) / len(winning_rsi)
+        if avg_loss_rsi > avg_win_rsi + 5:
+            # Las perdidas entran con RSI mas alto → endurecer filtro
+            new_rsi_ob = max(30, cfg.RSI_OB - 3)
+            if new_rsi_ob != cfg.RSI_OB:
+                adjustments["RSI_OB"] = new_rsi_ob
+                patterns.append(f"RSI alto en perdidas ({avg_loss_rsi:.1f} vs {avg_win_rsi:.1f})")
+
+    # ── Patron 2: SL demasiado ajustado ──────────────────────
+    sl_hits  = [t for t in losing if t.get("reason", "") == "SL"]
+    tp_hits  = [t for t in winning if t.get("reason", "") in ("TP", "TP_PARCIAL")]
+    sl_ratio = len(sl_hits) / len(losing) if losing else 0
+    if sl_ratio > 0.7:
+        # Mas del 70% de perdidas son SL → ampliar stop
+        new_sl = min(cfg.SL_ATR + 0.3, 4.0)
+        if new_sl != cfg.SL_ATR:
+            adjustments["SL_ATR"] = round(new_sl, 1)
+            patterns.append(f"SL muy ajustado ({sl_ratio*100:.0f}% de perdidas son SL)")
+
+    # ── Patron 3: BB Sigma demasiado bajo ────────────────────
+    if len(losing) > len(winning) and cfg.BB_SIGMA < 2.2:
+        new_sigma = round(min(cfg.BB_SIGMA + 0.1, 2.5), 1)
+        adjustments["BB_SIGMA"] = new_sigma
+        patterns.append("Muchas perdidas: endurecer BB_SIGMA")
+
+    # ── Patron 4: Tendencia 4h ignorada en perdidas ──────────
+    bear_losses = [t for t in losing if t.get("trend_4h") == "bear" and
+                   t.get("side") == "long"]
+    if len(bear_losses) > 2:
+        patterns.append("Longs contra tendencia bajista 4h — SHORT_ENABLED recomendado")
+
+    if patterns:
+        log.info(f"Patrones de error detectados: {' | '.join(patterns)}")
+
+    return adjustments
+
+
+# ═══════════════════════════════════════════════════════════
+# ANALISIS Y AJUSTE PRINCIPAL
+# ═══════════════════════════════════════════════════════════
+
+def should_review(trades_closed: int) -> bool:
+    return trades_closed >= REVIEW_EVERY and trades_closed % REVIEW_EVERY == 0
+
+
+def _load_recent_trades(limit=50) -> list:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT * FROM trades
+            WHERE closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT ?
+        """, (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        log.error(f"Error cargando trades: {e}")
         return []
 
-    updates: list[ParamUpdate] = []
 
+def analyze_and_adjust() -> dict:
+    """
+    Analiza los ultimos trades y ajusta parametros automaticamente.
+    Retorna dict con los cambios realizados.
+    """
+    trades = _load_recent_trades(50)
+    if len(trades) < MIN_TRADES:
+        log.info(f"Learner: solo {len(trades)} trades, necesita {MIN_TRADES}")
+        return {}
+
+    wins   = [t for t in trades if t.get("pnl", 0) >= 0]
+    losses = [t for t in trades if t.get("pnl", 0) <  0]
     total  = len(trades)
-    wins   = [t for t in trades if t["result"] == "WIN"]
-    losses = [t for t in trades if t["result"] == "LOSS"]
-    wr     = len(wins) / total
 
-    log.info(f"Learner: revisando {total} trades | WR={wr*100:.1f}%")
+    win_rate = len(wins) / total if total > 0 else 0
+    avg_win  = sum(t["pnl"] for t in wins)   / len(wins)   if wins   else 0
+    avg_loss = abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else 0.001
+    total_pnl = sum(t.get("pnl", 0) for t in trades)
 
-    # ── Analisis de RSI en entrada ───────────────────────────
-    rsi_wins   = [t["rsi_at_entry"] for t in wins   if t["rsi_at_entry"] is not None]
-    rsi_losses = [t["rsi_at_entry"] for t in losses if t["rsi_at_entry"] is not None]
+    log.info(
+        f"Learner analisis: {total} trades | "
+        f"WR={win_rate*100:.1f}% | "
+        f"AvgWin=${avg_win:.2f} | AvgLoss=${avg_loss:.2f} | "
+        f"PnL=${total_pnl:.2f}"
+    )
 
-    avg_rsi_win  = sum(rsi_wins)   / len(rsi_wins)   if rsi_wins   else cfg.RSI_OB
-    avg_rsi_loss = sum(rsi_losses) / len(rsi_losses) if rsi_losses else cfg.RSI_OB
+    changes = {}
 
-    # ── Ajuste 1: Win Rate bajo → endurecer ─────────────────
-    if wr < 0.45:
-        new_sigma = _clamp(cfg.BB_SIGMA + 0.1, *LIMITS["bb_sigma"])
-        new_rsi   = _clamp(cfg.RSI_OB   - 3.0, *LIMITS["rsi_ob"])
-        reason    = f"WR bajo ({wr*100:.1f}%) — endureciendo filtros"
+    # ── Ajuste por Kelly Criterion ────────────────────────────
+    kelly_risk = calc_kelly_risk(win_rate, avg_win, avg_loss)
+    if abs(kelly_risk - cfg.RISK_PCT) > 0.002:
+        changes["RISK_PCT"] = kelly_risk
+        cfg.RISK_PCT = kelly_risk
+        log.info(f"Kelly → RISK_PCT={kelly_risk:.3f} (WR={win_rate:.2f}, R:R={avg_win/avg_loss:.2f})")
 
-        if new_sigma != cfg.BB_SIGMA:
-            updates.append(ParamUpdate("bb_sigma", cfg.BB_SIGMA, new_sigma,
-                                        reason + f" | BB_SIGMA {cfg.BB_SIGMA}→{new_sigma}"))
-            cfg.BB_SIGMA = new_sigma
+    # ── Ajuste por patrones de error ──────────────────────────
+    pattern_adj = analyze_losing_patterns(trades)
+    for param, val in pattern_adj.items():
+        changes[param] = val
+        setattr(cfg, param, val)
+        log.info(f"Patron error → {param}={val}")
 
-        if new_rsi != cfg.RSI_OB:
-            updates.append(ParamUpdate("rsi_ob", cfg.RSI_OB, new_rsi,
-                                        reason + f" | RSI_OB {cfg.RSI_OB}→{new_rsi}"))
-            cfg.RSI_OB = new_rsi
+    # ── Ajuste automatico de BB_SIGMA por win rate ────────────
+    if win_rate < 0.40 and cfg.BB_SIGMA < 2.3:
+        cfg.BB_SIGMA = round(cfg.BB_SIGMA + 0.1, 1)
+        changes["BB_SIGMA"] = cfg.BB_SIGMA
+        log.info(f"WR bajo → BB_SIGMA subido a {cfg.BB_SIGMA}")
+    elif win_rate > 0.65 and cfg.BB_SIGMA > 1.7:
+        cfg.BB_SIGMA = round(cfg.BB_SIGMA - 0.05, 2)
+        changes["BB_SIGMA"] = cfg.BB_SIGMA
+        log.info(f"WR alto → BB_SIGMA bajado a {cfg.BB_SIGMA}")
 
-    # ── Ajuste 2: Win Rate alto → relajar para mas señales ───
-    elif wr > 0.72 and total >= 20:
-        new_sigma = _clamp(cfg.BB_SIGMA - 0.05, *LIMITS["bb_sigma"])
-        new_rsi   = _clamp(cfg.RSI_OB   + 2.0,  *LIMITS["rsi_ob"])
-        reason    = f"WR excelente ({wr*100:.1f}%) — relajando para mas señales"
+    # ── Guardar estado del learner ────────────────────────────
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS learner_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, win_rate REAL, avg_win REAL, avg_loss REAL,
+                total_pnl REAL, changes TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO learner_log VALUES (NULL,?,?,?,?,?,?)",
+            (datetime.now().isoformat(), win_rate, avg_win,
+             avg_loss, total_pnl, json.dumps(changes))
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"Error guardando learner log: {e}")
 
-        if new_sigma != cfg.BB_SIGMA:
-            updates.append(ParamUpdate("bb_sigma", cfg.BB_SIGMA, new_sigma, reason))
-            cfg.BB_SIGMA = new_sigma
-
-        if new_rsi != cfg.RSI_OB:
-            updates.append(ParamUpdate("rsi_ob", cfg.RSI_OB, new_rsi, reason))
-            cfg.RSI_OB = new_rsi
-
-    # ── Ajuste 3: RSI medio de perdidas > RSI medio de ganancias ─
-    if rsi_losses and rsi_wins and avg_rsi_loss > avg_rsi_win + 5:
-        # Las perdidas ocurren con RSI mas alto → bajar umbral
-        new_rsi = _clamp(cfg.RSI_OB - 2.0, *LIMITS["rsi_ob"])
-        reason  = (f"Perdidas con RSI alto (avg={avg_rsi_loss:.1f}) "
-                   f"vs ganancias (avg={avg_rsi_win:.1f}) → bajando RSI_OB")
-        if new_rsi != cfg.RSI_OB:
-            updates.append(ParamUpdate("rsi_ob", cfg.RSI_OB, new_rsi, reason))
-            cfg.RSI_OB = new_rsi
-
-    # ── Ajuste 4: Muchos SL → ampliar stop ───────────────────
-    sl_hits  = [t for t in losses if t.get("close_reason") == "SL"]
-    sl_ratio = len(sl_hits) / max(len(losses), 1)
-    if sl_ratio > 0.85 and cfg.SL_ATR < LIMITS["sl_atr"][1]:
-        new_sl = _clamp(cfg.SL_ATR + 0.2, *LIMITS["sl_atr"])
-        reason = f"{sl_ratio*100:.0f}% de perdidas son SL → ampliando SL_ATR"
-        updates.append(ParamUpdate("sl_atr", cfg.SL_ATR, new_sl, reason))
-        cfg.SL_ATR = new_sl
-
-    # ── Guardar cambios en DB ─────────────────────────────────
-    if updates:
-        db.log_params(cfg.BB_PERIOD, cfg.BB_SIGMA, cfg.RSI_OB, cfg.SL_ATR,
-                      " | ".join(u.reason for u in updates))
-        for u in updates:
-            log.info(f"Learner: {u.param} {u.old_val} → {u.new_val} | {u.reason}")
-    else:
-        log.info("Learner: sin cambios necesarios")
-
-    return updates
+    return changes
 
 
-def should_review(trades_since_last: int) -> bool:
-    return trades_since_last >= REVIEW_EVERY
-
-
-def get_performance_report() -> dict:
-    """Resumen de rendimiento para Telegram."""
-    stats    = db.get_stats_summary()
-    trades   = db.get_recent_trades(50)
-    by_sym: dict[str, dict] = {}
-
-    for t in trades:
-        s = t["symbol"]
-        if s not in by_sym:
-            by_sym[s] = {"wins": 0, "losses": 0, "pnl": 0}
-        if t["result"] == "WIN":
-            by_sym[s]["wins"] += 1
-        else:
-            by_sym[s]["losses"] += 1
-        by_sym[s]["pnl"] += t.get("pnl") or 0
-
-    best_sym  = max(by_sym, key=lambda s: by_sym[s]["pnl"], default="N/A") if by_sym else "N/A"
-    worst_sym = min(by_sym, key=lambda s: by_sym[s]["pnl"], default="N/A") if by_sym else "N/A"
-
-    total = stats.get("total", 0)
-    wins  = stats.get("wins",  0)
-    wr    = (wins / total * 100) if total else 0
-
-    avg_win  = stats.get("avg_win")  or 0
-    avg_loss = stats.get("avg_loss") or 0
-    exp      = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss) if total else 0
-
-    return {
-        "total":         total,
-        "wins":          wins,
-        "losses":        stats.get("losses", 0),
-        "win_rate":      round(wr, 1),
-        "total_pnl":     stats.get("total_pnl", 0),
-        "avg_win":       round(avg_win, 2),
-        "avg_loss":      round(avg_loss, 2),
-        "expectancy":    round(exp, 2),
-        "best_symbol":   best_sym,
-        "worst_symbol":  worst_sym,
-        "by_symbol":     by_sym,
-        "current_params": {
-            "bb_sigma": cfg.BB_SIGMA,
-            "rsi_ob":   cfg.RSI_OB,
-            "sl_atr":   cfg.SL_ATR,
-        }
-    }
+def get_performance_report() -> str:
+    trades = _load_recent_trades(20)
+    if not trades:
+        return "Sin datos suficientes"
+    wins      = sum(1 for t in trades if t.get("pnl", 0) >= 0)
+    total_pnl = sum(t.get("pnl", 0) for t in trades)
+    wr        = wins / len(trades) * 100
+    return (
+        f"WR={wr:.1f}% | "
+        f"PnL=${total_pnl:.2f} | "
+        f"Risk={cfg.RISK_PCT*100:.2f}% | "
+        f"BB_σ={cfg.BB_SIGMA}"
+    )

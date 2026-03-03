@@ -1,139 +1,131 @@
 """
-notifier.py — Notificaciones por Telegram
+notifier.py — Notificaciones Telegram Elite v4
+Incluye: señales manuales, score, estado del bot, errores.
 """
-import requests
 import logging
-from datetime import datetime
+import requests
 import config as cfg
 
 log = logging.getLogger("notifier")
-BASE_URL = f"https://api.telegram.org/bot{cfg.TG_TOKEN}"
 
-
-def _send(text: str, parse_mode: str = "HTML") -> bool:
-    if not cfg.TG_TOKEN or not cfg.TG_CHAT_ID:
-        log.warning("Telegram no configurado")
-        return False
+def _send(text: str, parse_mode="Markdown"):
+    """Funcion base para enviar mensajes."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        log.warning("Telegram no configurado (TG_TOKEN / TG_CHAT_ID)")
+        return
     try:
-        r = requests.post(
-            f"{BASE_URL}/sendMessage",
-            json={"chat_id": cfg.TG_CHAT_ID, "text": text, "parse_mode": parse_mode},
-            timeout=10
-        )
-        return r.status_code == 200
+        url = f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id":    cfg.TELEGRAM_CHAT_ID,
+            "text":       text,
+            "parse_mode": parse_mode,
+        }, timeout=10)
+        if not resp.ok:
+            log.warning(f"Telegram error {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
-        log.error(f"Telegram error: {e}")
-        return False
+        log.error(f"Error enviando Telegram: {e}")
 
 
-def send_startup(symbols_info: str = ""):
+def send_raw(message: str):
+    """Mensaje libre en Markdown."""
+    _send(message)
+
+
+def send_startup(symbol_stats: str):
     _send(
-        "🤖 <b>BB+RSI DCA Bot iniciado</b>\n"
-        f"📊 Pares: {', '.join(cfg.SYMBOLS)}\n"
-        f"⚙️ Riesgo: {cfg.RISK_PCT*100:.0f}% | Leverage: {cfg.LEVERAGE}x\n"
-        f"🧠 Aprendizaje: activo (cada 10 trades)\n"
-        f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        f"🤖 *BB+RSI Bot Elite v4 arrancado*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 {symbol_stats}\n"
+        f"⚙️ RSI_OB: `{cfg.RSI_OB}` | BB_σ: `{cfg.BB_SIGMA}` | "
+        f"SL: `{cfg.SL_ATR}x ATR` | Lev: `{cfg.LEVERAGE}x`\n"
+        f"🔁 Ciclo: cada `{cfg.LOOP_SECONDS}s` | "
+        f"Max pos: `{cfg.MAX_POSITIONS}`\n"
+        f"🛡️ Circuit Breaker: `-{cfg.CB_MAX_DAILY_LOSS_PCT*100:.0f}%` dia | "
+        f"`{cfg.CB_MAX_CONSECUTIVE_LOSS}` perdidas"
     )
 
 
-def send_buy_signal(symbol: str, signal: dict, balance: float, executed: bool):
-    status = "✅ <b>ORDEN EJECUTADA</b>" if executed else "⚠️ <b>SEÑAL MANUAL</b> (sin fondos)"
+def send_buy_signal(symbol: str, sig: dict, balance: float, executed: bool):
+    side = "🟢 LONG" if sig["action"] == "buy" else "🔴 SHORT"
+    ex   = "✅ Ejecutado" if executed else "⚠️ No ejecutado"
+    score_line = f"Score   : `{sig.get('score','N/A')}/100`\n" if sig.get("score") else ""
     _send(
-        f"📈 {status}\n"
+        f"{side} — `{symbol}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Par:     <code>{symbol}</code>\n"
-        f"💰 Entrada: <code>${signal['entry']:,.4f}</code>\n"
-        f"🛑 Stop:    <code>${signal['sl']:,.4f}</code>\n"
-        f"🎯 Target:  <code>${signal['tp']:,.4f}</code>\n"
-        f"📉 RSI:     <code>{signal['rsi']}</code>\n"
-        f"💵 Balance: <code>${balance:.2f} USDT</code>\n"
-        + ("" if executed else
-           f"━━━━━━━━━━━━━━━━━━━━\n"
-           f"👆 <b>Entra manualmente:\n"
-           f"BingX → Futuros → {symbol}\n"
-           f"LONG mercado | SL={signal['sl']}</b>\n")
-        + f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        f"Entrada : `{sig['entry']}`\n"
+        f"🛑 SL   : `{sig['sl']}`\n"
+        f"🎯 TP   : `{sig['tp']}`\n"
+        f"TP 50%  : `{sig.get('tp_partial','N/A')}`\n"
+        f"RSI     : `{sig.get('rsi','N/A')}`\n"
+        f"{score_line}"
+        f"4h      : `{sig.get('trend_4h','N/A')}`\n"
+        f"Balance : `${balance:.2f}`\n"
+        f"Razon   : _{sig.get('reason','')}_\n"
+        f"{ex}"
     )
 
 
 def send_close_signal(symbol: str, entry: float, exit_price: float,
                       pnl: float, reason: str, executed: bool):
-    emoji  = "🟢" if pnl >= 0 else "🔴"
-    status = "✅ <b>CIERRE EJECUTADO</b>" if executed else "⚠️ <b>CIERRE MANUAL</b>"
+    emoji  = "✅" if pnl >= 0 else "❌"
+    ex_txt = "Ejecutado" if executed else "Simulado"
     _send(
-        f"{emoji} {status}\n"
+        f"{emoji} *CIERRE* — `{symbol}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Par:    <code>{symbol}</code>\n"
-        f"📥 Entrada:<code>${entry:,.4f}</code>\n"
-        f"📤 Salida: <code>${exit_price:,.4f}</code>\n"
-        f"💵 PnL:    <code>${pnl:+.2f}</code>\n"
-        f"📝 Razon:  {reason}\n"
-        + ("" if executed else
-           f"👆 <b>Cierra en BingX → Futuros → {symbol} → Cerrar</b>\n")
-        + f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        f"Entrada : `{entry}`\n"
+        f"Salida  : `{exit_price}`\n"
+        f"PnL est : `${pnl:+.2f}`\n"
+        f"Razon   : `{reason}`\n"
+        f"Estado  : {ex_txt}"
     )
 
 
-def send_status(positions: list, balance: float, stats: dict, perf: dict = None):
-    pos_text = ""
-    if positions:
-        for p in positions:
-            pnl_pct = (p["current"] - p["entry"]) / p["entry"] * 100 if p["entry"] else 0
-            e = "🟢" if pnl_pct >= 0 else "🔴"
-            pos_text += f"  {e} {p['symbol']}: ${p['entry']:.4f} ({pnl_pct:+.1f}%)\n"
-    else:
-        pos_text = "  Sin posiciones abiertas\n"
+def send_status(positions: list, balance: float, stats: dict, perf: str):
+    pos_lines = ""
+    for p in positions:
+        side_e = "🟢" if p.get("side") == "long" else "🔴"
+        diff   = p.get("current", p["entry"]) - p["entry"]
+        pos_lines += f"  {side_e} `{p['symbol']}` e:{p['entry']} c:{p.get('current',p['entry'])} ({diff:+.4f})\n"
+    if not pos_lines:
+        pos_lines = "  _(sin posiciones abiertas)_\n"
 
-    perf_text = ""
-    if perf and perf.get("total", 0) > 0:
-        perf_text = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 <b>Historico total</b>\n"
-            f"  Trades: {perf['total']}  |  WR: {perf['win_rate']}%\n"
-            f"  PnL acumulado: <code>${perf['total_pnl']:+.2f}</code>\n"
-            f"  Expectativa: <code>${perf['expectancy']:+.4f}</code>/trade\n"
-            f"  Mejor par: {perf['best_symbol']}\n"
-            f"  Params actuales: σ={perf['current_params']['bb_sigma']} "
-            f"RSI&lt;{perf['current_params']['rsi_ob']} "
-            f"SL={perf['current_params']['sl_atr']}x\n"
-        )
+    wins   = stats.get("wins", 0)
+    losses = stats.get("losses", 0)
+    total  = wins + losses
+    wr     = f"{wins/total*100:.1f}%" if total > 0 else "N/A"
 
     _send(
-        f"📊 <b>Reporte horario</b>\n"
+        f"📊 *Reporte horario*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Balance: <code>${balance:.2f} USDT</code>\n"
-        f"📈 Hoy: {stats.get('trades_today',0)} trades | "
-        f"✅{stats.get('wins',0)} ❌{stats.get('losses',0)} | "
-        f"<code>${stats.get('pnl_today',0):+.2f}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Posiciones:</b>\n{pos_text}"
-        f"{perf_text}"
-        f"🕐 {datetime.now().strftime('%d/%m %H:%M')}"
+        f"💰 Balance: `${balance:.2f} USDT`\n"
+        f"📈 Hoy: `{wins}W / {losses}L` | WR: `{wr}` | PnL: `${stats.get('pnl_today',0):+.2f}`\n"
+        f"📋 Posiciones abiertas:\n{pos_lines}"
+        f"🤖 Learner: _{perf}_"
     )
 
 
-def send_param_update(updates: list, perf: dict):
-    lines = "\n".join(
-        f"  • {u.param}: {u.old_val} → <b>{u.new_val}</b>"
-        for u in updates
-    )
-    reasons = updates[0].reason[:100] if updates else ""
-    _send(
-        f"🧠 <b>LEARNER — Parametros ajustados</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{lines}\n"
-        f"📝 {reasons}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Basado en {perf.get('total',0)} trades\n"
-        f"WR: {perf.get('win_rate',0)}%  |  "
-        f"PnL: ${perf.get('total_pnl',0):+.2f}\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-    )
+def send_no_funds(symbol: str, sig: dict, balance: float):
+    """Deprecado — ahora se usa send_raw con señal completa desde main.py"""
+    pass
 
 
 def send_error(msg: str):
-    _send(f"❗ <b>ERROR</b>\n{msg}\n🕐 {datetime.now().strftime('%H:%M:%S')}")
+    _send(f"🚨 *ERROR BOT*\n`{msg}`")
 
 
-def send_no_funds(symbol: str, signal: dict, balance: float):
-    send_buy_signal(symbol, signal, balance, executed=False)
+def send_param_update(updates: dict, perf: str):
+    lines = "\n".join([f"  `{k}`: {v}" for k, v in updates.items()])
+    _send(
+        f"🔧 *Learner — Ajuste de parametros*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{lines}\n"
+        f"📊 {perf}"
+    )
+
+
+def send_symbols_update(symbols: list):
+    _send(
+        f"🔄 *Pares actualizados*\n"
+        f"Total: `{len(symbols)}`\n"
+        f"Top 5: `{', '.join(symbols[:5])}`"
+    )

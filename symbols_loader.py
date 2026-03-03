@@ -1,8 +1,8 @@
 """
-symbols_loader.py — Carga todos los pares de futuros USDT de BingX.
-Usa BingX directamente para evitar bloqueos de IP (Railway).
+symbols_loader.py v2 — Filtros inteligentes de volumen, spread y blacklist.
+Cuando no hay fondos, el bot sigue escaneando y enviando señales a Telegram
+para que las ejecutes manualmente.
 """
-
 import logging
 import time
 import ccxt
@@ -12,6 +12,17 @@ log = logging.getLogger("symbols")
 
 REFRESH_HOURS = 6
 _last_refresh = 0.0
+
+# Tokens de baja liquidez/calidad detectados en tu historial — siempre excluidos
+BLACKLIST_KEYWORDS = [
+    "MAXXING", "PUNCH", "NAORIS", "CRTR", "NEET", "ROBO",
+    "EPIC", "ARC", "OPN", "PEPE2", "TURBO", "MEME",
+]
+
+
+def _is_blacklisted(symbol: str) -> bool:
+    base = symbol.split("/")[0].upper()
+    return any(kw in base for kw in BLACKLIST_KEYWORDS)
 
 
 def load_symbols(force: bool = False) -> list:
@@ -29,23 +40,24 @@ def load_symbols(force: bool = False) -> list:
         return cfg.SYMBOLS
 
     log.info("Cargando pares de futuros USDT desde BingX...")
-
     try:
         ex = ccxt.bingx({
             "apiKey":  cfg.BINGX_API_KEY,
             "secret":  cfg.BINGX_SECRET,
             "options": {"defaultType": "swap"},
         })
-
         markets = ex.load_markets()
 
-        # Obtener tickers para volumen (en lotes para no saturar)
         try:
             tickers = ex.fetch_tickers()
         except Exception:
             tickers = {}
 
-        candidates = []
+        candidates     = []
+        excluded_vol   = 0
+        excluded_black = 0
+        excluded_spread = 0
+
         for symbol, market in markets.items():
             if not market.get("active"):
                 continue
@@ -56,35 +68,55 @@ def load_symbols(force: bool = False) -> list:
             if symbol in cfg.EXCLUDE_SYMBOLS:
                 continue
 
+            # ── Blacklist tokens de baja calidad ──────────────
+            if _is_blacklisted(symbol):
+                excluded_black += 1
+                continue
+
             ticker   = tickers.get(symbol, {})
             vol_usdt = float(ticker.get("quoteVolume") or ticker.get("baseVolume") or 0)
 
-            # Solo filtrar por volumen si MIN_VOLUME_USDT > 0 (0 = TODOS los pares)
+            # ── Filtro volumen mínimo ──────────────────────────
             if cfg.MIN_VOLUME_USDT > 0 and vol_usdt > 0 and vol_usdt < cfg.MIN_VOLUME_USDT:
+                excluded_vol += 1
                 continue
+
+            # ── Filtro spread: descarta pares ilíquidos ────────
+            ask = float(ticker.get("ask") or 0)
+            bid = float(ticker.get("bid") or 0)
+            if ask > 0 and bid > 0:
+                spread_pct = (ask - bid) / bid * 100
+                if spread_pct > 1.5:   # spread > 1.5% = ilíquido
+                    excluded_spread += 1
+                    continue
 
             candidates.append((symbol, vol_usdt))
 
-        # Ordenar: con volumen primero (descendente), sin volumen al final
+        # Ordenar por volumen descendente (más líquidos primero)
         candidates.sort(key=lambda x: x[1], reverse=True)
         symbols = [s for s, _ in candidates]
 
         if cfg.MAX_SYMBOLS and cfg.MAX_SYMBOLS > 0:
             symbols = symbols[:cfg.MAX_SYMBOLS]
 
-        cfg.SYMBOLS = symbols
+        cfg.SYMBOLS   = symbols
         _last_refresh = now
 
-        log.info(f"Pares encontrados: {len(symbols)}")
-        log.info(f"Top 10: {', '.join(symbols[:10])}")
+        log.info(f"Pares cargados    : {len(symbols)}")
+        log.info(f"Excl. vol<min     : {excluded_vol}")
+        log.info(f"Excl. blacklist   : {excluded_black}")
+        log.info(f"Excl. spread>1.5% : {excluded_spread}")
+        log.info(f"Top 10            : {', '.join(symbols[:10])}")
         return symbols
 
     except Exception as e:
         log.error(f"Error cargando simbolos: {e}")
         if not cfg.SYMBOLS:
             fallback = [
-                "BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT",
-                "DOGE/USDT","ADA/USDT","AVAX/USDT","DOT/USDT","MATIC/USDT",
+                "BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT",
+                "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+                "ADA/USDT:USDT", "AVAX/USDT:USDT", "DOT/USDT:USDT",
+                "MATIC/USDT:USDT",
             ]
             cfg.SYMBOLS = fallback
             log.warning(f"Usando fallback de {len(fallback)} pares")
@@ -97,5 +129,6 @@ def needs_refresh() -> bool:
 
 def get_symbol_stats() -> str:
     if cfg.MIN_VOLUME_USDT > 0:
-        return f"{len(cfg.SYMBOLS)} pares activos (vol > ${cfg.MIN_VOLUME_USDT/1e6:.0f}M USDT)"
+        return (f"{len(cfg.SYMBOLS)} pares activos "
+                f"(vol>${cfg.MIN_VOLUME_USDT/1e6:.1f}M | spread<1.5%)")
     return f"{len(cfg.SYMBOLS)} pares activos (TODOS los pares BingX)"
