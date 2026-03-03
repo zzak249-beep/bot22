@@ -26,13 +26,26 @@ def _send(text: str, parse_mode: str = "HTML") -> bool:
         return False
 
 
-def send_startup():
+def send_startup(symbols_info: str = ""):
     _send(
         "🤖 <b>BB+RSI DCA Bot iniciado</b>\n"
-        f"📊 Pares: {', '.join(cfg.SYMBOLS)}\n"
+        f"📊 Escaneando: <b>{symbols_info}</b>\n"
         f"⚙️ Riesgo: {cfg.RISK_PCT*100:.0f}% | Leverage: {cfg.LEVERAGE}x\n"
+        f"🔄 Pares se actualizan cada 6h\n"
         f"🧠 Aprendizaje: activo (cada 10 trades)\n"
         f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    )
+
+
+def send_symbols_update(symbols: list):
+    total = len(symbols)
+    top10 = ", ".join(symbols[:10])
+    _send(
+        f"🔄 <b>Pares actualizados</b>\n"
+        f"📊 Total: <b>{total} pares</b> activos\n"
+        f"🏆 Top 10 por volumen:\n"
+        f"<code>{top10}</code>\n"
+        f"🕐 {datetime.now().strftime('%d/%m %H:%M')}"
     )
 
 
@@ -84,29 +97,27 @@ def send_status(positions: list, balance: float, stats: dict, perf: dict = None)
     else:
         pos_text = "  Sin posiciones abiertas\n"
 
+    import config as cfg2
     perf_text = ""
     if perf and perf.get("total", 0) > 0:
         perf_text = (
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 <b>Historico total</b>\n"
-            f"  Trades: {perf['total']}  |  WR: {perf['win_rate']}%\n"
-            f"  PnL acumulado: <code>${perf['total_pnl']:+.2f}</code>\n"
-            f"  Expectativa: <code>${perf['expectancy']:+.4f}</code>/trade\n"
-            f"  Mejor par: {perf['best_symbol']}\n"
-            f"  Params actuales: σ={perf['current_params']['bb_sigma']} "
-            f"RSI&lt;{perf['current_params']['rsi_ob']} "
-            f"SL={perf['current_params']['sl_atr']}x\n"
+            f"📈 <b>Historico</b>: {perf['total']} trades | WR: {perf['win_rate']}%\n"
+            f"💰 PnL acumulado: <code>${perf['total_pnl']:+.2f}</code>\n"
+            f"⚙️ Params: σ={perf['current_params']['bb_sigma']} "
+            f"RSI&lt;{perf['current_params']['rsi_ob']}\n"
         )
 
     _send(
         f"📊 <b>Reporte horario</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 Balance: <code>${balance:.2f} USDT</code>\n"
+        f"🔍 Escaneando: <b>{len(cfg2.SYMBOLS)} pares</b>\n"
         f"📈 Hoy: {stats.get('trades_today',0)} trades | "
         f"✅{stats.get('wins',0)} ❌{stats.get('losses',0)} | "
         f"<code>${stats.get('pnl_today',0):+.2f}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Posiciones:</b>\n{pos_text}"
+        f"<b>Posiciones abiertas:</b>\n{pos_text}"
         f"{perf_text}"
         f"🕐 {datetime.now().strftime('%d/%m %H:%M')}"
     )
@@ -117,16 +128,12 @@ def send_param_update(updates: list, perf: dict):
         f"  • {u.param}: {u.old_val} → <b>{u.new_val}</b>"
         for u in updates
     )
-    reasons = updates[0].reason[:100] if updates else ""
     _send(
         f"🧠 <b>LEARNER — Parametros ajustados</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{lines}\n"
-        f"📝 {reasons}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Basado en {perf.get('total',0)} trades\n"
-        f"WR: {perf.get('win_rate',0)}%  |  "
-        f"PnL: ${perf.get('total_pnl',0):+.2f}\n"
+        f"📝 {updates[0].reason[:100] if updates else ''}\n"
+        f"📊 Basado en {perf.get('total',0)} trades | WR: {perf.get('win_rate',0)}%\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
     )
 
