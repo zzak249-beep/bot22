@@ -1,141 +1,145 @@
 """
-exchange.py — Wrapper para BingX Futuros (USDT-M Perpetuos)
+exchange.py — BingX Futuros con soporte LONG y SHORT
 """
 import logging
 import ccxt
 import config as cfg
 
 log = logging.getLogger("exchange")
+_exchange = None
 
-_exchange: ccxt.Exchange | None = None
 
-
-def get_exchange() -> ccxt.Exchange:
+def get_exchange():
     global _exchange
     if _exchange is None:
         _exchange = ccxt.bingx({
             "apiKey":  cfg.BINGX_API_KEY,
             "secret":  cfg.BINGX_SECRET,
-            "options": {"defaultType": "swap"},  # futuros perpetuos
+            "options": {"defaultType": "swap"},
         })
     return _exchange
 
 
-def get_balance() -> float:
-    """Retorna el balance libre en USDT."""
+def get_balance():
     try:
-        ex  = get_exchange()
-        bal = ex.fetch_balance({"type": "swap"})
+        bal = get_exchange().fetch_balance({"type": "swap"})
         return float(bal.get("USDT", {}).get("free", 0))
     except Exception as e:
-        log.error(f"Error obteniendo balance: {e}")
+        log.error(f"Error balance: {e}")
         return 0.0
 
 
-def has_enough_balance(min_usdt: float = None) -> bool:
+def has_enough_balance(min_usdt=None):
     if min_usdt is None:
         min_usdt = cfg.MIN_USDT_BALANCE
     return get_balance() >= min_usdt
 
 
-def set_leverage(symbol: str) -> bool:
+def set_leverage(symbol):
     try:
         get_exchange().set_leverage(cfg.LEVERAGE, symbol)
         return True
     except Exception as e:
-        log.warning(f"No se pudo fijar leverage {symbol}: {e}")
+        log.warning(f"Leverage no aplicado {symbol}: {e}")
         return False
 
 
-def get_open_positions() -> list:
-    """Retorna lista de posiciones abiertas."""
+def get_open_positions():
     try:
         ex        = get_exchange()
-        positions = ex.fetch_positions()  # BingX devuelve todas las posiciones abiertas
+        positions = ex.fetch_positions()
         open_pos  = []
         for p in positions:
             if float(p.get("contracts", 0)) != 0:
                 open_pos.append({
-                    "symbol":   p["symbol"],
-                    "side":     p["side"],
-                    "entry":    float(p.get("entryPrice", 0)),
-                    "current":  float(p.get("markPrice", 0)),
-                    "qty":      float(p.get("contracts", 0)),
-                    "pnl":      float(p.get("unrealizedPnl", 0)),
-                    "sl":       float(p.get("stopLossPrice", 0)),
+                    "symbol":  p["symbol"],
+                    "side":    p["side"],
+                    "entry":   float(p.get("entryPrice", 0)),
+                    "current": float(p.get("markPrice", 0)),
+                    "qty":     float(p.get("contracts", 0)),
+                    "pnl":     float(p.get("unrealizedPnl", 0)),
+                    "sl":      float(p.get("stopLossPrice", 0)),
                 })
         return open_pos
     except Exception as e:
-        log.error(f"Error obteniendo posiciones: {e}")
+        log.error(f"Error posiciones: {e}")
         return []
 
 
-def open_long(symbol: str, signal: dict) -> dict | None:
-    """
-    Abre una posicion LONG con orden de mercado + stop loss.
-    Calcula el tamanio basado en RISK_PCT del balance actual.
-    """
+def open_long(symbol, signal):
     try:
         ex      = get_exchange()
         balance = get_balance()
         price   = signal["entry"]
         sl      = signal["sl"]
-        sl_dist = price - sl
-
-        if sl_dist <= 0:
-            log.error(f"SL inválido para {symbol}: price={price} sl={sl}")
+        if price - sl <= 0:
+            log.error(f"SL invalido {symbol}")
             return None
-
-        risk_usdt = balance * cfg.RISK_PCT
-        qty       = round((risk_usdt * cfg.LEVERAGE) / price, 4)
-
+        qty = round((balance * cfg.RISK_PCT * cfg.LEVERAGE) / price, 4)
         if qty <= 0:
-            log.error(f"Cantidad calculada 0 para {symbol} (balance=${balance:.2f})")
+            log.error(f"Qty=0 {symbol} balance=${balance:.2f}")
             return None
-
         set_leverage(symbol)
-
-        # Orden principal LONG
-        order = ex.create_order(
-            symbol=symbol,
-            type="market",
-            side="buy",
-            amount=qty,
-        )
+        ex.create_order(symbol=symbol, type="market", side="buy", amount=qty)
         log.info(f"LONG abierto: {symbol} qty={qty} @ ~{price}")
-
-        # Stop Loss
         try:
-            ex.create_order(
-                symbol=symbol,
-                type="stop_market",
-                side="sell",
-                amount=qty,
-                params={"stopPrice": sl, "reduceOnly": True}
-            )
-            log.info(f"Stop loss fijado: {sl}")
+            ex.create_order(symbol=symbol, type="stop_market", side="sell",
+                            amount=qty, params={"stopPrice": sl, "reduceOnly": True})
+            log.info(f"SL fijado: {sl}")
         except Exception as e:
-            log.warning(f"Stop loss no aplicado (fijalo manualmente en {sl}): {e}")
-
-        return {"symbol": symbol, "qty": qty, "entry": price, "sl": sl, "tp": signal["tp"]}
-
+            log.warning(f"SL no aplicado (fijalo manual en {sl}): {e}")
+        return {"symbol": symbol, "qty": qty, "entry": price, "sl": sl,
+                "tp": signal["tp"], "tp_partial": signal.get("tp_partial"), "side": "long"}
     except Exception as e:
-        log.error(f"Error abriendo LONG {symbol}: {e}")
+        log.error(f"Error LONG {symbol}: {e}")
         return None
 
 
-def close_long(symbol: str, qty: float) -> bool:
-    """Cierra una posicion LONG existente."""
+def open_short(symbol, signal):
     try:
-        get_exchange().create_order(
-            symbol=symbol,
-            type="market",
-            side="sell",
-            amount=qty,
-            params={"reduceOnly": True}
-        )
-        log.info(f"Posicion cerrada: {symbol}")
+        ex      = get_exchange()
+        balance = get_balance()
+        price   = signal["entry"]
+        sl      = signal["sl"]
+        if sl - price <= 0:
+            log.error(f"SL invalido SHORT {symbol}")
+            return None
+        qty = round((balance * cfg.RISK_PCT * cfg.LEVERAGE) / price, 4)
+        if qty <= 0:
+            return None
+        set_leverage(symbol)
+        ex.create_order(symbol=symbol, type="market", side="sell", amount=qty)
+        log.info(f"SHORT abierto: {symbol} qty={qty} @ ~{price}")
+        try:
+            ex.create_order(symbol=symbol, type="stop_market", side="buy",
+                            amount=qty, params={"stopPrice": sl, "reduceOnly": True})
+            log.info(f"SL SHORT fijado: {sl}")
+        except Exception as e:
+            log.warning(f"SL SHORT no aplicado: {e}")
+        return {"symbol": symbol, "qty": qty, "entry": price, "sl": sl,
+                "tp": signal["tp"], "tp_partial": signal.get("tp_partial"), "side": "short"}
+    except Exception as e:
+        log.error(f"Error SHORT {symbol}: {e}")
+        return None
+
+
+def close_long(symbol, qty):
+    try:
+        get_exchange().create_order(symbol=symbol, type="market", side="sell",
+                                    amount=qty, params={"reduceOnly": True})
+        log.info(f"LONG cerrado: {symbol}")
         return True
     except Exception as e:
-        log.error(f"Error cerrando {symbol}: {e}")
+        log.error(f"Error cerrando LONG {symbol}: {e}")
+        return False
+
+
+def close_short(symbol, qty):
+    try:
+        get_exchange().create_order(symbol=symbol, type="market", side="buy",
+                                    amount=qty, params={"reduceOnly": True})
+        log.info(f"SHORT cerrado: {symbol}")
+        return True
+    except Exception as e:
+        log.error(f"Error cerrando SHORT {symbol}: {e}")
         return False
