@@ -51,7 +51,7 @@ def get_open_positions() -> list:
     """Retorna lista de posiciones abiertas."""
     try:
         ex        = get_exchange()
-        positions = ex.fetch_positions(cfg.SYMBOLS)
+        positions = ex.fetch_positions()  # BingX devuelve todas las posiciones abiertas
         open_pos  = []
         for p in positions:
             if float(p.get("contracts", 0)) != 0:
