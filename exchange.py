@@ -59,15 +59,15 @@ def get_open_positions():
         positions = ex.fetch_positions()
         open_pos  = []
         for p in positions:
-            if float(p.get("contracts", 0)) != 0:
+            if float(p.get("contracts", 0) != 0:
                 open_pos.append({
                     "symbol":  p["symbol"],
                     "side":    p["side"],
-                    "entry":   float(p.get("entryPrice", 0)),
-                    "current": float(p.get("markPrice", 0)),
-                    "qty":     float(p.get("contracts", 0)),
-                    "pnl":     float(p.get("unrealizedPnl", 0)),
-                    "sl":      float(p.get("stopLossPrice", 0)),
+                    "entry":   float(p.get("entryPrice", 0),
+                    "current": float(p.get("markPrice", 0),
+                    "qty":     float(p.get("contracts", 0),
+                    "pnl":     float(p.get("unrealizedPnl", 0),
+                    "sl": float(p.get("stopLossPrice") or 0),
                 })
         return open_pos
     except Exception as e:
