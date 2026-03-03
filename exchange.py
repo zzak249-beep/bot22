@@ -28,7 +28,7 @@ def get_balance():
         return 100.0
     try:
         bal = get_exchange().fetch_balance({"type": "swap"})
-        return float(bal.get("USDT", {}).get("free", 0))
+        return float(bal.get("USDT", {}).get("free") or 0)
     except Exception as e:
         log.error(f"Error balance: {e}")
         return 0.0
@@ -59,14 +59,14 @@ def get_open_positions():
         positions = ex.fetch_positions()
         open_pos  = []
         for p in positions:
-            if float(p.get("contracts", 0)) != 0:
+            if float(p.get("contracts") or 0) != 0:
                 open_pos.append({
                     "symbol":  p["symbol"],
                     "side":    p["side"],
-                    "entry":   float(p.get("entryPrice", 0)),
-                    "current": float(p.get("markPrice", 0)),
-                    "qty":     float(p.get("contracts", 0)),
-                    "pnl":     float(p.get("unrealizedPnl", 0)),
+                    "entry":   float(p.get("entryPrice")    or 0),   # FIX: or 0 evita NoneType
+                    "current": float(p.get("markPrice")     or 0),   # FIX: or 0 evita NoneType
+                    "qty":     float(p.get("contracts")     or 0),   # FIX: or 0 evita NoneType
+                    "pnl":     float(p.get("unrealizedPnl") or 0),   # FIX: or 0 evita NoneType
                     "sl":      float(p.get("stopLossPrice") or 0),
                 })
         return open_pos
