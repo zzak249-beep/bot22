@@ -26,7 +26,7 @@ def _send(text: str, parse_mode: str = "HTML") -> bool:
         return False
 
 
-def send_startup():
+def send_startup(symbols_info: str = ""):
     _send(
         "🤖 <b>BB+RSI DCA Bot iniciado</b>\n"
         f"📊 Pares: {', '.join(cfg.SYMBOLS)}\n"
