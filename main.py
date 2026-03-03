@@ -13,7 +13,7 @@ Mejoras v6:
 import time
 import logging
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 import pandas as pd
@@ -220,7 +220,7 @@ def handle_multi_tp(symbol: str, cur_price: float, atr: float):
 def is_low_liquidity_hour() -> bool:
     if not cfg.TIME_FILTER_ENABLED:
         return False
-    hour  = datetime.utcnow().hour
+    hour  = datetime.now(timezone.utc).hour
     start = cfg.TIME_FILTER_OFF_START
     end   = cfg.TIME_FILTER_OFF_END
     if start < end:
@@ -258,13 +258,13 @@ def validate_signal(symbol: str, sig: dict, df: pd.DataFrame) -> tuple:
         if adx < cfg.ADX_MIN:
             return False, f"ADX bajo ({adx:.1f} < {cfg.ADX_MIN})"
 
-    # StochRSI
+    # StochRSI — solo bloquea en zonas extremas opuestas
     if cfg.STOCH_RSI_ENABLED and len(df) >= 40:
         k, d = calc_stoch_rsi(df["close"], cfg.STOCH_RSI_PERIOD, cfg.STOCH_RSI_K, cfg.STOCH_RSI_D)
-        if action == "buy" and k > cfg.STOCH_RSI_OS * 2:    # LONG: StochRSI debe estar bajo
-            return False, f"StochRSI alto para LONG ({k:.1f})"
-        if action == "sell_short" and k < cfg.STOCH_RSI_OB / 2:
-            return False, f"StochRSI bajo para SHORT ({k:.1f})"
+        if action == "buy" and k > cfg.STOCH_RSI_OB:        # LONG bloqueado si sobrecomprado
+            return False, f"StochRSI sobrecomprado para LONG ({k:.1f})"
+        if action == "sell_short" and k < cfg.STOCH_RSI_OS: # SHORT bloqueado si sobrevendido
+            return False, f"StochRSI sobrevendido para SHORT ({k:.1f})"
 
     # Confirmacion de vela
     if not is_solid_candle(df):
@@ -363,7 +363,7 @@ def handle_open_position(symbol, sig, balance, df=None):
     # Filtro horario
     if is_low_liquidity_hour():
         state.skip_hour += 1
-        log.info(f"Hora baja liq. ({datetime.utcnow().hour}h UTC) — {symbol}")
+        log.info(f"Hora baja liq. ({datetime.now(timezone.utc).hour}h UTC) — {symbol}")
         return False
 
     # Validacion de señal
@@ -486,7 +486,7 @@ def run_cycle():
         tg.send_symbols_update(cfg.SYMBOLS)
 
     total    = len(cfg.SYMBOLS)
-    hour_utc = datetime.utcnow().hour
+    hour_utc = datetime.now(timezone.utc).hour
     low_liq  = is_low_liquidity_hour()
     mood     = snt.get_market_mood()
 
