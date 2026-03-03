@@ -15,6 +15,8 @@
 ║  ✅ Variables de entorno limpias (strip de comillas)         ║
 ║  ✅ Señales manuales con pasos exactos para BingX           ║
 ║  ✅ Deduplicación de señales (no spam)                      ║
+║  ✅ FIX: Error 100004 → convierte a señal manual con L/S   ║
+║  ✅ FIX: Detecta permiso Futures al inicio automáticamente  ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  MÓDULOS (Pine Script → Python):                            ║
 ║  1️⃣  ConfPRO      Bollinger + Squeeze + Volumen + EMA       ║
@@ -115,12 +117,12 @@ MIN_MODULES     = _ei("MIN_MODULES",2)
 CB_DD           = _ef("MAX_DRAWDOWN",15.0)
 DAILY_LOSS_LIM  = _ef("DAILY_LOSS_LIMIT",8.0)
 COOLDOWN_MIN    = _ei("COOLDOWN_MIN",30)
-MAX_SPREAD_PCT  = _ef("MAX_SPREAD_PCT",0.5)      # v15: más estricto
-MIN_VOL_USDT    = _ef("MIN_VOLUME_USDT",30000)   # v15: más pares
-TOP_N           = _ei("TOP_N_SYMBOLS",500)        # v15: todos los pares
+MAX_SPREAD_PCT  = _ef("MAX_SPREAD_PCT",0.5)
+MIN_VOL_USDT    = _ef("MIN_VOLUME_USDT",30000)
+TOP_N           = _ei("TOP_N_SYMBOLS",500)
 BTC_FILTER      = _eb("BTC_FILTER",True)
 LEVERAGE        = _ef("LEVERAGE",10)
-MIN_RR          = _ef("MIN_RR",1.5)              # v15: R/R mínimo
+MIN_RR          = _ef("MIN_RR",1.5)
 
 # ── Indicadores ──────────────────────────────────────────
 BB_LEN=20; BB_MULT=2.0; VOL_MULT=1.5
@@ -128,7 +130,7 @@ SQZ_LEN=20; TREND_LEN=3; PIVOT_L=5; PIVOT_R=2
 SMC_LB=10; PT_LEN=200; PT_ADX_LEN=14; PT_VWMA_LEN=200
 BBPCT_LB=750; RSI_LEN=14; RSI_OB=70; RSI_OS=30
 FAST=9; SLOW=21; BIAS=48; MA200=200
-ADX_LEN=14; ADX_MIN=20; ATR_LEN=14   # v15: ADX_MIN=20 (más estricto)
+ADX_LEN=14; ADX_MIN=20; ATR_LEN=14
 
 # ── TP/SL v15: R/R mejorado ─────────────────────────────
 TP1_M=1.2; TP2_M=2.5; TP3_M=4.5; SL_M=1.0
@@ -166,8 +168,8 @@ class BotState:
     btc_bull:bool=True; btc_bear:bool=False; btc_rsi:float=50.0; btc_adx:float=0.0
     scan_n:int=0; sig_ok:int=0; sig_blk:int=0
     last_disc:List[dict]=field(default_factory=list)
-    sent_sigs:set=field(default_factory=set)  # v15: anti-spam
-    signal_only:bool=False                    # v15: modo sin fondos
+    sent_sigs:set=field(default_factory=set)
+    signal_only:bool=False
 
     def open_n(self):  return len(self.trades)
     def bases(self):   return {t.base:t.side for t in self.trades.values()}
@@ -565,11 +567,10 @@ def scan(ex,sym):
         m6l,m6s=mod_rsi_plus(df,htf1b,htf1bear)
         d,sc,mods,sigs=consensus(m1l,m1s,m2l,m2s,m3l,m3s,m4l,m4s,m5l,m5s,m6l,m6s)
         atr_v=float(at.iloc[-2]); price=float(df["close"].iloc[-2])
-        # v15: calcular R/R antes de devolver
         if d and atr_v>0:
             sl_dist=atr_v*SL_M; tp_dist=atr_v*TP3_M
             rr=tp_dist/max(sl_dist,1e-9)
-            if rr<MIN_RR: return None  # filtro R/R mínimo
+            if rr<MIN_RR: return None
         else: rr=0.0
         return {"sym":sym,"base":sym.split("/")[0],"direction":d,"score":sc,
                 "modules":mods,"signals":sigs,"rsi":rv,"adx":axv,
@@ -609,8 +610,8 @@ def tg_signal(t:TradeState,manual:bool=False):
     emoji="🟢" if t.side=="long" else "🔴"
     act="LONG ▲" if t.side=="long" else "SHORT ▼"
     sl_d=abs(t.sl-t.entry_price)
-    def pct(p): return abs(p-t.entry_price)/t.entry_price*100
-    rr=abs(t.tp3-t.entry_price)/max(sl_d,1e-9)
+    def pct(p): return abs(p-t.entry_price)/t.entry_price*100 if t.entry_price>0 else 0
+    rr=abs(t.tp3-t.entry_price)/max(sl_d,1e-9) if t.entry_price>0 else 0
     head=f"{'👆 EJECUTAR MANUAL' if manual else '🤖 AUTO-EJECUTADO'}"
     msg=(f"{emoji} <b>{act} — {t.symbol}</b>\n"
          f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -799,14 +800,58 @@ def open_trade(ex,sym,base,side,score,mods,sigs,atr_v,swing_l,swing_h,rv,axv,rr_
         log_csv("OPEN",t,entry); tg_signal(t,manual=False)
         log.info(f"[OPEN] {sym} {ts.upper()} score={score} R/R={rr_val} [{mods}]")
         return t
+
     except Exception as e:
-        log.error(f"[{sym}] open: {e}"); tg_error(f"open {sym}: {e}"); return None
+        err_str=str(e)
+        # ══════════════════════════════════════════════════
+        # FIX v15: Error 100004 (sin permiso Futures)
+        # → convertir automáticamente en señal manual
+        # ══════════════════════════════════════════════════
+        if "100004" in err_str:
+            log.warning(f"[{sym}] Sin permiso Futures (100004) → enviando señal manual")
+            try:
+                price=float(ex.fetch_ticker(sym)["last"])
+            except Exception:
+                price=0.0
+            ts_side="long" if side=="buy" else "short"
+            if price>0:
+                if side=="buy":
+                    sl_m  = min(swing_l - atr_v*0.2, price - atr_v*SL_M)
+                    tp1_m = price + atr_v*TP1_M
+                    tp2_m = price + atr_v*TP2_M
+                    tp3_m = price + atr_v*TP3_M
+                else:
+                    sl_m  = max(swing_h + atr_v*0.2, price + atr_v*SL_M)
+                    tp1_m = price - atr_v*TP1_M
+                    tp2_m = price - atr_v*TP2_M
+                    tp3_m = price - atr_v*TP3_M
+                t_manual=TradeState(
+                    symbol=sym, base=base, side=ts_side,
+                    entry_price=price,
+                    tp1=tp1_m, tp2=tp2_m, tp3=tp3_m, sl=sl_m,
+                    score=score, modules=mods, signals=sigs[:150],
+                    entry_time=utcnow(), contracts=0.0,
+                    atr=atr_v, rsi=rv, adx=axv, rr=rr_val
+                )
+                # Anti-spam: no reenviar la misma señal en 30 min
+                sig_key=f"{sym}_{ts_side}_{round(price,4)}"
+                if sig_key not in state.sent_sigs:
+                    state.sent_sigs.add(sig_key)
+                    if len(state.sent_sigs)>200:
+                        state.sent_sigs=set(list(state.sent_sigs)[-100:])
+                    tg_signal(t_manual, manual=True)
+                    log.info(f"[SEÑAL MANUAL 100004] {sym} {ts_side.upper()} score={score} R/R={rr_val}")
+            else:
+                log.warning(f"[{sym}] No se pudo obtener precio para señal manual")
+        else:
+            log.error(f"[{sym}] open: {e}")
+            tg_error(f"open {sym}: {e}")
+        return None
 
 def send_manual_signal(res,atr_v,swing_l,swing_h,balance):
     """v15: Envía señal detallada a Telegram para ejecución manual."""
     sym=res["sym"]; side=res["direction"]; price=res["price"]
     rv=res["rsi"]; axv=res["adx"]; rr_val=res.get("rr",0)
-    # Evitar señales duplicadas (anti-spam 30 min)
     sig_key=f"{sym}_{side}_{round(price,4)}"
     if sig_key in state.sent_sigs: return
     state.sent_sigs.add(sig_key)
@@ -936,17 +981,39 @@ def main():
     HEDGE_MODE=detect_hedge(ex)
     log.info(f"Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'}")
 
-    # ── Detectar balance y modo ──────────────────────────
+    # ── Detectar balance ─────────────────────────────────
     balance=0.0
     for _ in range(10):
         try: balance=get_bal(ex); break
         except: time.sleep(5)
 
-    state.signal_only = balance < MIN_BAL_AUTO
+    # ══════════════════════════════════════════════════════
+    # FIX v15: Verificar permiso Futures al arrancar
+    # Si la API no tiene permiso → forzar modo señales manuales
+    # ══════════════════════════════════════════════════════
+    futures_ok=True
+    try:
+        ex.fetch_positions()
+        log.info("✅ Permiso Perpetual Futures OK")
+    except Exception as e:
+        if "100004" in str(e):
+            futures_ok=False
+            log.warning("⚠️  API sin permiso Perpetual Futures → MODO SEÑALES MANUALES forzado")
+            tg(f"⚠️ <b>API sin permiso Perpetual Futures</b>\n"
+               f"📱 Activando <b>MODO SEÑALES MANUALES</b> automáticamente\n"
+               f"🔧 Para activar auto-trading activa el permiso en:\n"
+               f"<code>bingx.com/en/account/api</code>\n"
+               f"⏰ {utcnow()}")
+
+    state.signal_only = (balance < MIN_BAL_AUTO) or (not futures_ok)
+
     if state.signal_only:
-        log.warning(f"⚠️ Balance ${balance:.6f} < ${MIN_BAL_AUTO} → MODO SEÑALES MANUALES")
+        if not futures_ok:
+            log.warning(f"⚠️ Sin permiso Futures → MODO SEÑALES MANUALES")
+        else:
+            log.warning(f"⚠️ Balance ${balance:.6f} < ${MIN_BAL_AUTO} → MODO SEÑALES MANUALES")
     else:
-        log.info(f"✅ Balance ${balance:.2f} → MODO AUTO TRADING")
+        log.info(f"✅ Balance ${balance:.2f} + permiso Futures → MODO AUTO TRADING")
 
     state.peak_eq=max(balance,0.01); state.daily_reset=time.time(); state.last_hb=time.time()
 
@@ -975,16 +1042,25 @@ def main():
                 except Exception as e: log.warning(f"Refresh: {e}")
             if scan_n%BTC_REF==0: update_btc(ex)
 
-            # Re-evaluar balance cada 10 ciclos
+            # Re-evaluar balance y permisos cada 10 ciclos
             if scan_n%10==0:
                 try:
                     new_bal=get_bal(ex)
+                    # Recheck permisos Futures
+                    new_futures_ok=True
+                    try:
+                        ex.fetch_positions()
+                    except Exception as e2:
+                        if "100004" in str(e2):
+                            new_futures_ok=False
                     was_manual=state.signal_only
-                    state.signal_only=new_bal<MIN_BAL_AUTO
+                    state.signal_only=(new_bal<MIN_BAL_AUTO) or (not new_futures_ok)
                     if was_manual and not state.signal_only:
-                        tg(f"🎉 <b>Fondos detectados ${new_bal:.2f}!</b>\n🤖 Activando AUTO TRADING\n⏰{utcnow()}")
+                        tg(f"🎉 <b>Fondos + permiso Futures detectados!</b>\n"
+                           f"💰 ${new_bal:.2f} USDT\n🤖 Activando AUTO TRADING\n⏰{utcnow()}")
                     elif not was_manual and state.signal_only:
-                        tg(f"⚠️ <b>Sin fondos — Modo SEÑALES MANUALES</b>\n⏰{utcnow()}")
+                        tg(f"⚠️ <b>Sin fondos o sin permiso Futures</b>\n"
+                           f"📱 Modo SEÑALES MANUALES\n⏰{utcnow()}")
                 except: pass
 
             if time.time()-state.last_hb>3600:
@@ -1019,14 +1095,12 @@ def main():
 
             # Buscar nuevas entradas / señales
             new_sigs=[]; state.last_disc=[]
-            to_scan=[]
             bases_open=state.bases()
             to_scan=[s for s in symbols
                      if s not in state.trades
                      and not state.in_cd(s)
                      and s.split("/")[0] not in bases_open]
 
-            # Si modo MANUAL, escanear siempre (no hay límite de posiciones abiertas)
             if state.signal_only or state.open_n()<MAX_OPEN_TRADES:
                 log.info(f"Escaneando {len(to_scan)} pares con 6 módulos ...")
                 with ThreadPoolExecutor(max_workers=8) as pool:
