@@ -46,3 +46,15 @@ COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "3"))
 LOOP_SECONDS     = int(os.getenv("LOOP_SECONDS", "300"))
 MIN_USDT_BALANCE = float(os.getenv("MIN_USDT_BALANCE", "5"))
 SCAN_BATCH_SIZE  = int(os.getenv("SCAN_BATCH_SIZE", "20"))  # pares por lote
+# Mejoras nuevas
+TIMEFRAME_HI          = os.getenv("TIMEFRAME_HI", "4h")
+RSI_OS                = float(os.getenv("RSI_OS", "35"))
+SHORT_ENABLED         = os.getenv("SHORT_ENABLED", "false").lower() == "true"
+TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
+TRAILING_STOP_ATR     = float(os.getenv("TRAILING_STOP_ATR", "1.5"))
+TRAILING_ACTIVATE_PCT = float(os.getenv("TRAILING_ACTIVATE_PCT", "0.5"))
+PARTIAL_TP_ENABLED    = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
+PARTIAL_TP_PCT        = float(os.getenv("PARTIAL_TP_PCT", "0.5"))
+PARTIAL_TP_ATR        = float(os.getenv("PARTIAL_TP_ATR", "1.5"))
+VOLUME_SPIKE_ENABLED  = os.getenv("VOLUME_SPIKE_ENABLED", "true").lower() == "true"
+VOLUME_SPIKE_MULT     = float(os.getenv("VOLUME_SPIKE_MULT", "3.0"))
