@@ -572,7 +572,17 @@ def run_cycle():
                 continue
 
             try:
-                df    = fetch_candles(symbol, cfg.TIMEFRAME)
+                # FIX 6: reintento en timeout de API
+                df = None
+                for _attempt in range(2):
+                    try:
+                        df = fetch_candles(symbol, cfg.TIMEFRAME)
+                        break
+                    except Exception as _e:
+                        if _attempt == 0:
+                            time.sleep(2)
+                        else:
+                            raise _e
                 df_cache[symbol] = df
                 df_4h = None
                 try:
@@ -690,13 +700,21 @@ def run_cycle():
         if handle_open_position(symbol, sig, balance, df=df_s):
             open_count += 1
 
-    # Reporte horario
+    # Reporte horario con PnL total acumulado
     if datetime.now() - state.last_report >= timedelta(hours=1):
         pos_list = [
             {"symbol": s, "entry": p["entry"],
              "current": p.get("current", p["entry"]), "side": p.get("side", "long")}
             for s, p in state.positions.items()
         ]
+        # FIX 7: añadir PnL total y ROI desde inicio al reporte
+        total_stats = db.get_stats_summary()
+        total_pnl   = total_stats.get("total_pnl", 0) or 0
+        total_trades= total_stats.get("total", 0) or 0
+        roi_pct     = (total_pnl / state.initial_balance * 100) if state.initial_balance > 0 else 0
+        state.stats["pnl_total"]    = round(total_pnl, 2)
+        state.stats["roi_total"]    = round(roi_pct, 2)
+        state.stats["total_trades"] = total_trades
         tg.send_status(pos_list, balance, state.stats, learner.get_performance_report())
         state.last_report = datetime.now()
 
