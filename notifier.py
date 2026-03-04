@@ -94,11 +94,19 @@ def send_status(positions: list, balance: float, stats: dict, perf: str):
     total  = wins + losses
     wr     = f"{wins/total*100:.1f}%" if total > 0 else "N/A"
 
+    pnl_total = stats.get("pnl_total", None)
+    roi_total = stats.get("roi_total", None)
+    ttrades   = stats.get("total_trades", "")
+    total_line = (
+        f"📊 Total: `{ttrades}tr` | PnL: `${pnl_total:+.2f}` | ROI: `{roi_total:+.1f}%`\n"
+        if pnl_total is not None else ""
+    )
     _send(
         f"📊 *Reporte horario*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance: `${balance:.2f} USDT`\n"
-        f"📈 Hoy: `{wins}W / {losses}L` | WR: `{wr}` | PnL: `${stats.get('pnl_today',0):+.2f}`\n"
+        f"📈 Hoy: `{wins}W / {losses}L` | WR: `{wr}` | PnL hoy: `${stats.get('pnl_today',0):+.2f}`\n"
+        f"{total_line}"
         f"📋 Posiciones abiertas:\n{pos_lines}"
         f"🤖 Learner: _{perf}_"
     )
