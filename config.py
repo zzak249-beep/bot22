@@ -131,3 +131,5 @@ BINGX_API_KEY    = os.environ.get("BINGX_API_KEY",    "")
 BINGX_SECRET     = os.environ.get("BINGX_SECRET",     "")
 TELEGRAM_TOKEN   = os.environ.get("TG_TOKEN",         os.environ.get("TELEGRAM_TOKEN", ""))
 TELEGRAM_CHAT_ID = os.environ.get("TG_CHAT_ID",       os.environ.get("TELEGRAM_CHAT_ID", ""))
+SENTIMENT_ENABLED  = False
+FEAR_GREED_ENABLED = False
