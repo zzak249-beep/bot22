@@ -38,8 +38,8 @@ TIMEFRAME_HI = os.getenv("TIMEFRAME_HI", "4h")
 BB_PERIOD    = int(os.getenv("BB_PERIOD", "30"))
 BB_SIGMA     = float(os.getenv("BB_SIGMA", "2.0"))
 RSI_PERIOD   = int(os.getenv("RSI_PERIOD", "14"))
-RSI_OB       = float(os.getenv("RSI_OB", "40"))
-RSI_OS       = float(os.getenv("RSI_OS", "60"))
+RSI_OB       = float(os.getenv("RSI_OB", "45"))   # FIX: subido de 40 a 45 — genera más señales LONG
+RSI_OS       = float(os.getenv("RSI_OS", "55"))   # FIX: bajado de 60 a 55 — genera más señales SHORT
 SL_ATR       = float(os.getenv("SL_ATR", "2.5"))
 TP_ATR       = float(os.getenv("TP_ATR", "0"))
 
