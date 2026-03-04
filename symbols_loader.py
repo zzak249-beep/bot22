@@ -1,134 +1,99 @@
 """
-symbols_loader.py v2 — Filtros inteligentes de volumen, spread y blacklist.
-Cuando no hay fondos, el bot sigue escaneando y enviando señales a Telegram
-para que las ejecutes manualmente.
+symbols_loader.py — Carga y refresco dinámico de pares de trading
+Compatible con BB+RSI BOT ELITE v6
 """
 import logging
-import time
-import ccxt
+from datetime import datetime, timedelta
+
 import config as cfg
+import exchange as ex
 
-log = logging.getLogger("symbols")
+log = logging.getLogger("symbols_loader")
 
-REFRESH_HOURS = 6
-_last_refresh = 0.0
+_last_load:   datetime | None = None
+_symbol_stats: dict = {}
 
-# Tokens de baja liquidez/calidad detectados en tu historial — siempre excluidos
-BLACKLIST_KEYWORDS = [
-    "MAXXING", "PUNCH", "NAORIS", "CRTR", "NEET", "ROBO",
-    "EPIC", "ARC", "OPN", "PEPE2", "TURBO", "MEME",
-]
-
-
-def _is_blacklisted(symbol: str) -> bool:
-    base = symbol.split("/")[0].upper()
-    return any(kw in base for kw in BLACKLIST_KEYWORDS)
-
-
-def load_symbols(force: bool = False) -> list:
-    global _last_refresh
-
-    # Override manual desde .env
-    if cfg.SYMBOLS_OVERRIDE:
-        symbols = [s.strip() for s in cfg.SYMBOLS_OVERRIDE.split(",") if s.strip()]
-        cfg.SYMBOLS = symbols
-        log.info(f"Simbolos manuales desde .env: {len(symbols)} pares")
-        return symbols
-
-    now = time.time()
-    if not force and cfg.SYMBOLS and (now - _last_refresh) < REFRESH_HOURS * 3600:
-        return cfg.SYMBOLS
-
-    log.info("Cargando pares de futuros USDT desde BingX...")
-    try:
-        ex = ccxt.bingx({
-            "apiKey":  cfg.BINGX_API_KEY,
-            "secret":  cfg.BINGX_SECRET,
-            "options": {"defaultType": "swap"},
-        })
-        markets = ex.load_markets()
-
-        try:
-            tickers = ex.fetch_tickers()
-        except Exception:
-            tickers = {}
-
-        candidates     = []
-        excluded_vol   = 0
-        excluded_black = 0
-        excluded_spread = 0
-
-        for symbol, market in markets.items():
-            if not market.get("active"):
-                continue
-            if market.get("quote") != cfg.QUOTE_CURRENCY:
-                continue
-            if market.get("type") not in ("swap", "future"):
-                continue
-            if symbol in cfg.EXCLUDE_SYMBOLS:
-                continue
-
-            # ── Blacklist tokens de baja calidad ──────────────
-            if _is_blacklisted(symbol):
-                excluded_black += 1
-                continue
-
-            ticker   = tickers.get(symbol, {})
-            vol_usdt = float(ticker.get("quoteVolume") or ticker.get("baseVolume") or 0)
-
-            # ── Filtro volumen mínimo ──────────────────────────
-            if cfg.MIN_VOLUME_USDT > 0 and vol_usdt > 0 and vol_usdt < cfg.MIN_VOLUME_USDT:
-                excluded_vol += 1
-                continue
-
-            # ── Filtro spread: descarta pares ilíquidos ────────
-            ask = float(ticker.get("ask") or 0)
-            bid = float(ticker.get("bid") or 0)
-            if ask > 0 and bid > 0:
-                spread_pct = (ask - bid) / bid * 100
-                if spread_pct > 1.5:   # spread > 1.5% = ilíquido
-                    excluded_spread += 1
-                    continue
-
-            candidates.append((symbol, vol_usdt))
-
-        # Ordenar por volumen descendente (más líquidos primero)
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        symbols = [s for s, _ in candidates]
-
-        if cfg.MAX_SYMBOLS and cfg.MAX_SYMBOLS > 0:
-            symbols = symbols[:cfg.MAX_SYMBOLS]
-
-        cfg.SYMBOLS   = symbols
-        _last_refresh = now
-
-        log.info(f"Pares cargados    : {len(symbols)}")
-        log.info(f"Excl. vol<min     : {excluded_vol}")
-        log.info(f"Excl. blacklist   : {excluded_black}")
-        log.info(f"Excl. spread>1.5% : {excluded_spread}")
-        log.info(f"Top 10            : {', '.join(symbols[:10])}")
-        return symbols
-
-    except Exception as e:
-        log.error(f"Error cargando simbolos: {e}")
-        if not cfg.SYMBOLS:
-            fallback = [
-                "BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT",
-                "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
-                "ADA/USDT:USDT", "AVAX/USDT:USDT", "DOT/USDT:USDT",
-                "MATIC/USDT:USDT",
-            ]
-            cfg.SYMBOLS = fallback
-            log.warning(f"Usando fallback de {len(fallback)} pares")
-        return cfg.SYMBOLS
+REFRESH_HOURS = 24   # Refrescar lista de pares cada 24h
 
 
 def needs_refresh() -> bool:
-    return (time.time() - _last_refresh) >= REFRESH_HOURS * 3600
+    """True si hay que recargar la lista de símbolos."""
+    if _last_load is None:
+        return True
+    return datetime.now() - _last_load > timedelta(hours=REFRESH_HOURS)
 
 
-def get_symbol_stats() -> str:
-    if cfg.MIN_VOLUME_USDT > 0:
-        return (f"{len(cfg.SYMBOLS)} pares activos "
-                f"(vol>${cfg.MIN_VOLUME_USDT/1e6:.1f}M | spread<1.5%)")
-    return f"{len(cfg.SYMBOLS)} pares activos (TODOS los pares BingX)"
+def load_symbols(force: bool = False) -> list:
+    """
+    Carga los pares activos desde el exchange y actualiza cfg.SYMBOLS.
+    Si force=False y la lista ya está cargada, devuelve la lista actual.
+    Retorna la lista de símbolos cargados.
+    """
+    global _last_load, _symbol_stats
+
+    if not force and cfg.SYMBOLS and not needs_refresh():
+        return cfg.SYMBOLS
+
+    log.info("Cargando lista de pares desde el exchange...")
+
+    try:
+        exchange   = ex.get_exchange()
+        markets    = exchange.load_markets()
+
+        # Filtrar: futuros perpetuos USDT activos con volumen razonable
+        candidates = []
+        for sym, mkt in markets.items():
+            if not sym.endswith("/USDT"):
+                continue
+            if not mkt.get("active", False):
+                continue
+            # Algunos exchanges marcan futuros con 'swap' o 'future'
+            mkt_type = mkt.get("type", "")
+            if mkt_type not in ("swap", "future", "spot"):
+                continue
+            candidates.append(sym)
+
+        if candidates:
+            cfg.SYMBOLS = sorted(candidates)
+            log.info(f"Pares cargados: {len(cfg.SYMBOLS)}")
+        else:
+            # Fallback a lista estática si el exchange no devuelve nada útil
+            log.warning("Exchange no devolvió pares válidos — usando lista estática")
+            if not cfg.SYMBOLS:
+                cfg.SYMBOLS = _default_symbols()
+
+        # Estadísticas básicas
+        _symbol_stats = {
+            "total":    len(cfg.SYMBOLS),
+            "source":   "exchange" if candidates else "static",
+            "loaded_at": datetime.now().strftime("%d/%m %H:%M"),
+        }
+
+    except Exception as e:
+        log.error(f"Error cargando símbolos: {e}")
+        if not cfg.SYMBOLS:
+            cfg.SYMBOLS = _default_symbols()
+            log.info(f"Usando {len(cfg.SYMBOLS)} pares por defecto")
+        _symbol_stats = {
+            "total":    len(cfg.SYMBOLS),
+            "source":   "fallback",
+            "loaded_at": datetime.now().strftime("%d/%m %H:%M"),
+        }
+
+    _last_load = datetime.now()
+    return cfg.SYMBOLS
+
+
+def get_symbol_stats() -> dict:
+    """Retorna estadísticas de la última carga (para Telegram startup)."""
+    return _symbol_stats
+
+
+def _default_symbols() -> list:
+    """Lista de pares por defecto si el exchange falla."""
+    return [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+        "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "ARB/USDT", "OP/USDT",
+        "MATIC/USDT", "NEAR/USDT", "APT/USDT", "SUI/USDT", "PEPE/USDT",
+        "TON/USDT", "WIF/USDT", "FLOKI/USDT", "SHIB/USDT", "UNI/USDT",
+    ]
