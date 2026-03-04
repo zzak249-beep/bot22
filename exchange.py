@@ -40,11 +40,20 @@ def has_enough_balance(min_usdt=None):
     return get_balance() >= min_usdt
 
 
-def set_leverage(symbol):
+def set_leverage(symbol, side="BOTH"):
     if PAPER_MODE:
         return True
     try:
-        get_exchange().set_leverage(cfg.LEVERAGE, symbol)
+        # BingX requiere side: LONG, SHORT o BOTH
+        ex = get_exchange()
+        try:
+            ex.set_leverage(cfg.LEVERAGE, symbol, params={"side": side})
+        except Exception:
+            # Algunos pares solo aceptan BOTH
+            try:
+                ex.set_leverage(cfg.LEVERAGE, symbol, params={"side": "BOTH"})
+            except Exception as e2:
+                log.warning(f"Leverage no aplicado {symbol}: {e2}")
         return True
     except Exception as e:
         log.warning(f"Leverage no aplicado {symbol}: {e}")
@@ -95,7 +104,21 @@ def open_long(symbol, signal):
         if qty <= 0:
             log.error(f"Qty=0 {symbol} balance=${balance:.2f}")
             return None
-        set_leverage(symbol)
+        # Verificar cantidad mínima del par
+        try:
+            market = ex.market(symbol)
+            min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0)
+            if min_qty > 0 and qty < min_qty:
+                log.warning(f"Qty {qty} < min {min_qty} para {symbol} — aumentando")
+                qty = min_qty
+            # Verificar coste mínimo (normalmente $5-10)
+            min_cost = float(market.get("limits", {}).get("cost", {}).get("min") or 0)
+            if min_cost > 0 and qty * price < min_cost:
+                qty = round(min_cost / price * 1.05, 4)
+                log.warning(f"Coste mínimo {min_cost} → qty ajustada a {qty}")
+        except Exception as _e:
+            log.debug(f"No se pudo verificar min_qty {symbol}: {_e}")
+        set_leverage(symbol, side="LONG")
         ex.create_order(symbol=symbol, type="market", side="buy", amount=qty)
         log.info(f"LONG abierto: {symbol} qty={qty} @ ~{price}")
         try:
@@ -130,7 +153,7 @@ def open_short(symbol, signal):
         qty = round((balance * cfg.RISK_PCT * cfg.LEVERAGE) / price, 4)
         if qty <= 0:
             return None
-        set_leverage(symbol)
+        set_leverage(symbol, side="SHORT")
         ex.create_order(symbol=symbol, type="market", side="sell", amount=qty)
         log.info(f"SHORT abierto: {symbol} qty={qty} @ ~{price}")
         try:
