@@ -232,8 +232,9 @@ def get_signal(df, df_4h=None):
             score = calc_signal_score(rsi, trend, divergence, macd_bull, squeeze, True, "long")
             if score >= 45:
                 sl      = round(price - cfg.SL_ATR * atr * 0.7, 4)
-                tp      = round(bb_basis, 4)
-                tp_part = round(price + (tp - price) * 0.45, 4)
+                risk    = price - sl
+                tp      = round(max(bb_basis, price + risk * 1.8), 4)
+                tp_part = round(price + risk * 0.9, 4)
                 return {
                     "action": "buy", "entry": round(price, 4),
                     "sl": sl, "tp": tp, "tp_partial": tp_part,
@@ -246,8 +247,9 @@ def get_signal(df, df_4h=None):
             score = calc_signal_score(rsi, trend, divergence, macd_bear, squeeze, True, "short")
             if score >= 45:
                 sl      = round(price + cfg.SL_ATR * atr * 0.7, 4)
-                tp      = round(bb_basis, 4)
-                tp_part = round(price - (price - tp) * 0.45, 4)
+                risk    = sl - price
+                tp      = round(min(bb_basis, price - risk * 1.8), 4)
+                tp_part = round(price - risk * 0.9, 4)
                 return {
                     "action": "sell_short", "entry": round(price, 4),
                     "sl": sl, "tp": tp, "tp_partial": tp_part,
@@ -269,6 +271,10 @@ def get_signal(df, df_4h=None):
         if trend == "bear" and not div_long:
             return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
                     "reason": "LONG bloqueado: tendencia 4h bajista"}
+        # FIX 5: LONG_ONLY_UP — solo operar longs cuando tendencia es alcista
+        if getattr(cfg, "LONG_ONLY_UP", False) and trend not in ("bull", "up"):
+            return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
+                    "reason": f"LONG bloqueado: LONG_ONLY_UP activo (trend={trend})"}
         if cfg.REQUIRE_MOMENTUM and not has_momentum_confirmation(df, "long"):
             return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
                     "reason": "LONG bloqueado: caida libre sin desaceleracion"}
@@ -278,9 +284,12 @@ def get_signal(df, df_4h=None):
             return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
                     "reason": f"LONG descartado: score bajo ({score}/100)"}
 
-        sl      = round(price - cfg.SL_ATR * atr, 4)
-        tp_full = round(bb_basis, 4)
-        tp_part = round(price + cfg.PARTIAL_TP_ATR * atr, 4)
+        sl        = round(price - cfg.SL_ATR * atr, 4)
+        risk      = price - sl
+        # TP garantiza R:R >= 2.0 — usa el mayor entre: media BB y precio + 2x riesgo
+        tp_rr     = round(price + risk * 2.0, 4)
+        tp_full   = round(max(bb_basis, tp_rr), 4)
+        tp_part   = round(price + risk * 1.0, 4)   # TP1 a 1:1 — asegura ganancia parcial
         tag     = "DIV" if div_long else ("SQZ" if squeeze else ("TOUCH" if bb_touch_long else "BB"))
         reason  = (f"LONG {tag} | RSI={round(rsi,1)} Stoch={round(stoch_k_v,1)} "
                    f"MACD={'↑' if macd_bull else '↓'} 4h={trend} Score={score}")
@@ -315,9 +324,12 @@ def get_signal(df, df_4h=None):
                 return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
                         "reason": f"SHORT descartado: score bajo ({score}/100)"}
 
-            sl      = round(price + cfg.SL_ATR * atr, 4)
-            tp_full = round(bb_basis, 4)
-            tp_part = round(price - cfg.PARTIAL_TP_ATR * atr, 4)
+            sl        = round(price + cfg.SL_ATR * atr, 4)
+            risk      = sl - price
+            # TP garantiza R:R >= 2.0
+            tp_rr     = round(price - risk * 2.0, 4)
+            tp_full   = round(min(bb_basis, tp_rr), 4)
+            tp_part   = round(price - risk * 1.0, 4)   # TP1 a 1:1
             tag     = "DIV" if div_short else ("SQZ" if squeeze else ("TOUCH" if bb_touch_short else "BB"))
             reason  = (f"SHORT {tag} | RSI={round(rsi,1)} Stoch={round(stoch_k_v,1)} "
                        f"MACD={'↑' if macd_bull else '↓'} 4h={trend} Score={score}")
