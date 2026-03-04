@@ -1,22 +1,39 @@
 """
 notifier.py — Notificaciones Telegram Elite v4
 Incluye: señales manuales, score, estado del bot, errores.
+FIX: todos los atributos de config usan getattr para compatibilidad.
+     TELEGRAM_TOKEN/CHAT_ID leen de config.py O variables de entorno.
 """
 import logging
+import os
 import requests
 import config as cfg
 
 log = logging.getLogger("notifier")
 
+
+def _get_tg_token():
+    return (getattr(cfg, "TELEGRAM_TOKEN", None)
+            or os.environ.get("TELEGRAM_TOKEN")
+            or os.environ.get("TG_TOKEN"))
+
+
+def _get_tg_chat():
+    return (getattr(cfg, "TELEGRAM_CHAT_ID", None)
+            or os.environ.get("TELEGRAM_CHAT_ID")
+            or os.environ.get("TG_CHAT_ID"))
+
+
 def _send(text: str, parse_mode="Markdown"):
-    """Funcion base para enviar mensajes."""
-    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
-        log.warning("Telegram no configurado (TG_TOKEN / TG_CHAT_ID)")
+    token   = _get_tg_token()
+    chat_id = _get_tg_chat()
+    if not token or not chat_id:
+        log.warning("Telegram no configurado (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)")
         return
     try:
-        url = f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         resp = requests.post(url, json={
-            "chat_id":    cfg.TELEGRAM_CHAT_ID,
+            "chat_id":    chat_id,
             "text":       text,
             "parse_mode": parse_mode,
         }, timeout=10)
@@ -27,31 +44,27 @@ def _send(text: str, parse_mode="Markdown"):
 
 
 def send_raw(message: str):
-    """Mensaje libre en Markdown."""
     _send(message)
 
 
 def send_startup(symbol_stats: str):
-    # getattr con fallback para compatibilidad entre versiones de config.py
-    rsi_l    = getattr(cfg, "RSI_LONG",               getattr(cfg, "RSI_OB", "N/A"))
-    rsi_s    = getattr(cfg, "RSI_SHORT",              getattr(cfg, "RSI_OB", "N/A"))
-    cb_loss  = getattr(cfg, "CB_MAX_DAILY_LOSS_PCT",  getattr(cfg, "MAX_DAILY_LOSS_PCT", 0.05))
-    cb_cons  = getattr(cfg, "CB_MAX_CONSECUTIVE_LOSS",getattr(cfg, "MAX_CONSECUTIVE_LOSS", 5))
-    loop_s   = getattr(cfg, "LOOP_SECONDS", "N/A")
-    max_pos  = getattr(cfg, "MAX_POSITIONS", "N/A")
-    sl_atr   = getattr(cfg, "SL_ATR", "N/A")
-    bb_sigma = getattr(cfg, "BB_SIGMA", "N/A")
-    leverage = getattr(cfg, "LEVERAGE", "N/A")
+    rsi_l    = getattr(cfg, "RSI_LONG",                getattr(cfg, "RSI_OB", "N/A"))
+    rsi_s    = getattr(cfg, "RSI_SHORT",               getattr(cfg, "RSI_OB", "N/A"))
+    cb_loss  = getattr(cfg, "CB_MAX_DAILY_LOSS_PCT",   getattr(cfg, "MAX_DAILY_LOSS_PCT", 0.05))
+    cb_cons  = getattr(cfg, "CB_MAX_CONSECUTIVE_LOSS", getattr(cfg, "MAX_CONSECUTIVE_LOSS", 5))
+    loop_s   = getattr(cfg, "LOOP_SECONDS",   "N/A")
+    max_pos  = getattr(cfg, "MAX_POSITIONS",  "N/A")
+    sl_atr   = getattr(cfg, "SL_ATR",         "N/A")
+    bb_sigma = getattr(cfg, "BB_SIGMA",       "N/A")
+    leverage = getattr(cfg, "LEVERAGE",       "N/A")
     _send(
         f"🤖 *BB+RSI Bot Elite v4 arrancado*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 {symbol_stats}\n"
         f"⚙️ RSI_L: `{rsi_l}` | RSI_S: `{rsi_s}` | BB_σ: `{bb_sigma}` | "
         f"SL: `{sl_atr}x ATR` | Lev: `{leverage}x`\n"
-        f"🔁 Ciclo: cada `{loop_s}s` | "
-        f"Max pos: `{max_pos}`\n"
-        f"🛡️ Circuit Breaker: `-{cb_loss*100:.0f}%` dia | "
-        f"`{cb_cons}` perdidas"
+        f"🔁 Ciclo: cada `{loop_s}s` | Max pos: `{max_pos}`\n"
+        f"🛡️ Circuit Breaker: `-{cb_loss*100:.0f}%` dia | `{cb_cons}` perdidas"
     )
 
 
