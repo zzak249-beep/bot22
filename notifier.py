@@ -32,11 +32,14 @@ def send_raw(message: str):
 
 
 def send_startup(symbol_stats: str):
+    # FIX: RSI_OB reemplazado por RSI_LONG / RSI_SHORT
+    rsi_l = getattr(cfg, "RSI_LONG",  getattr(cfg, "RSI_OB", "N/A"))
+    rsi_s = getattr(cfg, "RSI_SHORT", getattr(cfg, "RSI_OB", "N/A"))
     _send(
         f"🤖 *BB+RSI Bot Elite v4 arrancado*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 {symbol_stats}\n"
-        f"⚙️ RSI_OB: `{cfg.RSI_OB}` | BB_σ: `{cfg.BB_SIGMA}` | "
+        f"⚙️ RSI_L: `{rsi_l}` | RSI_S: `{rsi_s}` | BB_σ: `{cfg.BB_SIGMA}` | "
         f"SL: `{cfg.SL_ATR}x ATR` | Lev: `{cfg.LEVERAGE}x`\n"
         f"🔁 Ciclo: cada `{cfg.LOOP_SECONDS}s` | "
         f"Max pos: `{cfg.MAX_POSITIONS}`\n"
