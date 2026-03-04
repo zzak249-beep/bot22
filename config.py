@@ -56,7 +56,7 @@ SCORE_MIN      = 48
 MIN_RR         = 1.5     # usado en strategy.py (backtest)
 MIN_RR_RATIO   = 1.5     # usado en main.py (validación live)
 COOLDOWN_BARS  = 3
-SHORT_ENABLED  = True    # permitir operaciones SHORT
+SHORT_ENABLED  = False   # FIX: shorts no validados por scanner — reactivar tras backtest
 
 # ── ADX ───────────────────────────────────────────────────
 ADX_FILTER_ENABLED = False  # True = requiere ADX > ADX_MIN para entrar
