@@ -170,11 +170,14 @@ EXCLUDE_SYMBOLS  = [           # siempre excluidos
 ]
 
 # Fallback manual — solo se usa si symbols_loader no puede conectar con BingX
+# IMPORTANTE: formato ccxt para BingX futuros = "XXX/USDT:USDT"
 SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT",
-    "XRP-USDT", "DOGE-USDT", "ADA-USDT", "AVAX-USDT",
-    "LINK-USDT", "DOT-USDT", "NEAR-USDT", "ATOM-USDT",
-    "LTC-USDT", "OP-USDT", "FTM-USDT", "MATIC-USDT",
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+    "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
+    "LINK/USDT:USDT", "DOT/USDT:USDT", "NEAR/USDT:USDT", "ATOM/USDT:USDT",
+    "LTC/USDT:USDT", "OP/USDT:USDT", "SOL/USDT:USDT", "MATIC/USDT:USDT",
+    # Pares validados por scanner con PF >= 2.0
+    "RSR/USDT:USDT", "SUSHI/USDT:USDT", "INJ/USDT:USDT", "CRO/USDT:USDT",
 ]
 
 VERSION = "v15"
