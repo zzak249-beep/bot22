@@ -152,7 +152,7 @@ FEAR_GREED_CACHE_MIN  = 60    # minutos de cache
 LOOP_SECONDS    = 300    # escanear cada 5 minutos
 TIMEFRAME       = "1h"
 TIMEFRAME_HI    = "4h"
-MAX_POSITIONS   = 5      # hasta 5 trades simultáneos (era 3)
+MAX_POSITIONS   = 4      # 4 simultáneos — conservador con 18 pares validados
 SCAN_BATCH_SIZE = 15     # lotes más grandes para cubrir más pares
 
 # ══════════════════════════════════════════════════════════════
@@ -164,23 +164,39 @@ SCAN_BATCH_SIZE = 15     # lotes más grandes para cubrir más pares
 SYMBOLS_OVERRIDE = os.getenv("SYMBOLS_OVERRIDE", "")  # CSV en .env para forzar pares concretos
 QUOTE_CURRENCY   = "USDT"
 MIN_VOLUME_USDT  = 1_000_000   # volumen mínimo 24h: 1M USDT — captura ~80-120 pares en BingX
-MAX_SYMBOLS      = 0           # 0 = sin límite — analizar TODOS los que pasen el filtro
+MAX_SYMBOLS      = 0           # 0 = usar lista SYMBOLS de arriba (scanner desactivado)
 EXCLUDE_SYMBOLS  = [           # siempre excluidos
     "USDC-USDT", "BUSD-USDT", "TUSD-USDT", "USDP-USDT",  # stablecoins
 ]
 
-# Fallback manual — solo se usa si symbols_loader no puede conectar con BingX
-# IMPORTANTE: formato ccxt para BingX futuros = "XXX/USDT:USDT"
+# ── Pares validados por scanner_pares.py sobre 626 pares BingX ──
+# Criterio: WR >= 50% Y PF >= 1.5  (backtest 2026-01 a 2026-03)
+# NCSKGME2USD excluido — es acción tokenizada, no cripto pura
+# IMPORTANTE: formato ccxt BingX futuros = "XXX/USDT:USDT"
 SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
-    "LINK/USDT:USDT", "DOT/USDT:USDT", "NEAR/USDT:USDT", "ATOM/USDT:USDT",
-    "LTC/USDT:USDT", "OP/USDT:USDT", "SOL/USDT:USDT", "MATIC/USDT:USDT",
-    # Pares validados por scanner con PF >= 2.0
-    "RSR/USDT:USDT", "SUSHI/USDT:USDT", "INJ/USDT:USDT", "CRO/USDT:USDT",
+    # ★ Elite — WR 67-100%, PF >= 4.0
+    "RSR/USDT:USDT",     # WR:100% PF:999  $+0.83 — mejor par del scanner
+    "LINK/USDT:USDT",    # WR: 67% PF:16.1 $+0.36
+    "DEEP/USDT:USDT",    # WR: 67% PF: 8.6 $+0.33
+    "BLESS/USDT:USDT",   # WR: 67% PF: 8.5 $+0.29
+    "ZEC/USDT:USDT",     # WR: 67% PF: 7.3 $+0.37
+    "VANRY/USDT:USDT",   # WR: 67% PF: 4.7 $+0.25
+    # ★ Sólidos — WR 50-67%, PF 2.0-4.1
+    "PROVE/USDT:USDT",   # WR: 50% PF: 4.1 $+0.19
+    "AKE/USDT:USDT",     # WR: 50% PF: 3.8 $+0.43
+    "BOME/USDT:USDT",    # WR: 50% PF: 3.6 $+0.20
+    "BMT/USDT:USDT",     # WR: 60% PF: 3.6 $+0.17
+    "ZEN/USDT:USDT",     # WR: 50% PF: 2.7 $+0.25
+    "SUSHI/USDT:USDT",   # WR: 67% PF: 2.6 $+0.11
+    "SQD/USDT:USDT",     # WR: 50% PF: 2.3 $+0.11
+    "CRO/USDT:USDT",     # WR: 67% PF: 2.2 $+0.07
+    "SOL/USDT:USDT",     # WR: 67% PF: 2.0 $+0.12
+    "W/USDT:USDT",       # WR: 50% PF: 1.8 $+0.11
+    "PUFFER/USDT:USDT",  # WR: 67% PF: 1.6 $+0.07
+    "LTC/USDT:USDT",     # WR: 50% PF: 1.6 $+0.09
 ]
 
-VERSION = "v15"
+VERSION = "v15-scanner"
 
 # ── Alias de compatibilidad ────────────────────────────────
 TP = PARTIAL_TP_ATR   # por si algún módulo referencia cfg.TP directamente
