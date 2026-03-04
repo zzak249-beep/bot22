@@ -32,19 +32,26 @@ def send_raw(message: str):
 
 
 def send_startup(symbol_stats: str):
-    # FIX: RSI_OB reemplazado por RSI_LONG / RSI_SHORT
-    rsi_l = getattr(cfg, "RSI_LONG",  getattr(cfg, "RSI_OB", "N/A"))
-    rsi_s = getattr(cfg, "RSI_SHORT", getattr(cfg, "RSI_OB", "N/A"))
+    # getattr con fallback para compatibilidad entre versiones de config.py
+    rsi_l    = getattr(cfg, "RSI_LONG",               getattr(cfg, "RSI_OB", "N/A"))
+    rsi_s    = getattr(cfg, "RSI_SHORT",              getattr(cfg, "RSI_OB", "N/A"))
+    cb_loss  = getattr(cfg, "CB_MAX_DAILY_LOSS_PCT",  getattr(cfg, "MAX_DAILY_LOSS_PCT", 0.05))
+    cb_cons  = getattr(cfg, "CB_MAX_CONSECUTIVE_LOSS",getattr(cfg, "MAX_CONSECUTIVE_LOSS", 5))
+    loop_s   = getattr(cfg, "LOOP_SECONDS", "N/A")
+    max_pos  = getattr(cfg, "MAX_POSITIONS", "N/A")
+    sl_atr   = getattr(cfg, "SL_ATR", "N/A")
+    bb_sigma = getattr(cfg, "BB_SIGMA", "N/A")
+    leverage = getattr(cfg, "LEVERAGE", "N/A")
     _send(
         f"🤖 *BB+RSI Bot Elite v4 arrancado*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 {symbol_stats}\n"
-        f"⚙️ RSI_L: `{rsi_l}` | RSI_S: `{rsi_s}` | BB_σ: `{cfg.BB_SIGMA}` | "
-        f"SL: `{cfg.SL_ATR}x ATR` | Lev: `{cfg.LEVERAGE}x`\n"
-        f"🔁 Ciclo: cada `{cfg.LOOP_SECONDS}s` | "
-        f"Max pos: `{cfg.MAX_POSITIONS}`\n"
-        f"🛡️ Circuit Breaker: `-{cfg.CB_MAX_DAILY_LOSS_PCT*100:.0f}%` dia | "
-        f"`{cfg.CB_MAX_CONSECUTIVE_LOSS}` perdidas"
+        f"⚙️ RSI_L: `{rsi_l}` | RSI_S: `{rsi_s}` | BB_σ: `{bb_sigma}` | "
+        f"SL: `{sl_atr}x ATR` | Lev: `{leverage}x`\n"
+        f"🔁 Ciclo: cada `{loop_s}s` | "
+        f"Max pos: `{max_pos}`\n"
+        f"🛡️ Circuit Breaker: `-{cb_loss*100:.0f}%` dia | "
+        f"`{cb_cons}` perdidas"
     )
 
 
