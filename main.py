@@ -377,25 +377,60 @@ def handle_open_position(symbol, sig, balance, df=None):
             elif "entim" in reason: state.skip_sent += 1
             return False
 
-    # Sin fondos: señal manual
+    # Sin fondos: señal manual completa a Telegram
     if balance < cfg.MIN_USDT_BALANCE:
         db.log_signal(symbol, sig, executed=False)
-        side_txt  = "🟢 LONG" if sig["action"] == "buy" else "🔴 SHORT"
-        score_txt = f"Score: `{sig.get('score','N/A')}/100`\n" if sig.get("score") else ""
+        action     = sig.get("action", "buy")
+        side_txt   = "🟢 LONG" if action == "buy" else "🔴 SHORT"
+        side_bingx = "BUY / LONG" if action == "buy" else "SELL / SHORT"
+        entry      = sig["entry"]
+        sl         = sig["sl"]
+        tp         = sig["tp"]
+        tp1        = sig.get("tp_partial", "")
+        rsi        = sig.get("rsi", "N/A")
+        atr        = sig.get("atr", 0)
+        score      = sig.get("score", 0)
+        reason     = sig.get("reason", "")
+        trend_4h   = sig.get("trend_4h", "N/A")
+
+        # Calcular R:R y distancias
+        risk       = abs(entry - sl) if sl else 0
+        reward     = abs(tp - entry) if tp else 0
+        rr         = round(reward / risk, 2) if risk > 0 else 0
+        sl_pct     = round(risk / entry * 100, 2) if entry > 0 else 0
+        tp_pct     = round(reward / entry * 100, 2) if entry > 0 else 0
+
+        # Nombre limpio del par para BingX
+        base       = symbol.split("/")[0]
+        pair_clean = f"{base}/USDT"
+
+        mood = snt.get_market_mood()
+
         tg.send_raw(
-            f"📡 *SEÑAL MANUAL* — Bot sin fondos\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Par     : `{symbol}`\n"
-            f"Lado    : {side_txt}\n"
-            f"Entrada : `{sig['entry']}`\n"
-            f"🛑 SL   : `{sig['sl']}`\n"
-            f"🎯 TP   : `{sig['tp']}`\n"
-            f"RSI     : `{sig.get('rsi','N/A')}`\n"
-            f"{score_txt}"
-            f"Mercado : _{snt.get_market_mood()}_\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ Ejecutar manualmente en BingX\n"
-            f"💰 Balance: ${balance:.4f} USDT"
+            f"{'🟢' if action == 'buy' else '🔴'} *SEÑAL {side_txt}* — `{pair_clean}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 *Entrada*  : `{entry}`\n"
+            f"🛑 *Stop Loss*: `{sl}` _(-{sl_pct}%)_\n"
+            f"🎯 *TP final* : `{tp}` _(+{tp_pct}%)_\n"
+            + (f"🎯 *TP1 (50%)*: `{tp1}`\n" if tp1 else "") +
+            f"📊 *R:R*      : `{rr}x`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 RSI        : `{rsi}`\n"
+            f"📉 ATR        : `{round(atr,4) if atr else 'N/A'}`\n"
+            f"🕐 Tendencia 4h: `{trend_4h}`\n"
+            f"⭐ Score      : `{score}/100`\n"
+            f"💬 Razón      : _{reason}_\n"
+            f"🌡 Mercado    : _{mood}_\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📱 *PASOS EN BINGX FUTUROS:*\n"
+            f"1️⃣ Buscar `{pair_clean}` → Futuros\n"
+            f"2️⃣ Lado: *{side_bingx}*\n"
+            f"3️⃣ Apalancamiento: *{cfg.LEVERAGE}x*\n"
+            f"4️⃣ Tipo: *Mercado* al precio ~`{entry}`\n"
+            f"5️⃣ Stop Loss: `{sl}`\n"
+            f"6️⃣ Take Profit: `{tp}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ _Señal válida ~15min — actúa rápido_"
         )
         return False
 
