@@ -271,8 +271,8 @@ def get_signal(df, df_4h=None):
         if trend == "bear" and not div_long:
             return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
                     "reason": "LONG bloqueado: tendencia 4h bajista"}
-        # FIX 5: LONG_ONLY_UP — solo operar longs cuando tendencia es alcista
-        if getattr(cfg, "LONG_ONLY_UP", False) and trend not in ("bull", "up"):
+        # FIX 5: LONG_ONLY_UP — strategy usa "bull", permitir también neutral con RSI muy bajo
+        if getattr(cfg, "LONG_ONLY_UP", False) and trend == "bear":
             return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
                     "reason": f"LONG bloqueado: LONG_ONLY_UP activo (trend={trend})"}
         if cfg.REQUIRE_MOMENTUM and not has_momentum_confirmation(df, "long"):
