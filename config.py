@@ -46,7 +46,7 @@ LONG_ONLY_UP   = True   # v15: solo longs cuando trend="up" (WR 62-75%)
 LEVERAGE        = 2
 RISK_PCT        = 0.02   # 2% del balance por trade
 INITIAL_BAL     = 100.0
-MIN_USDT_BALANCE = 5.0   # balance mínimo para ejecutar (si < → señal manual)
+MIN_USDT_BALANCE = 1.0   # balance mínimo para ejecutar (si < → señal manual)
 BALANCE_SNAPSHOT = 0.0   # se actualiza en main.py al arrancar
 
 # ══════════════════════════════════════════════════════════════
