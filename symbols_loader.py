@@ -1,99 +1,70 @@
-"""
-symbols_loader.py — Carga y refresco dinámico de pares de trading
-Compatible con BB+RSI BOT ELITE v6
-"""
+# symbols_loader.py
+import time
 import logging
-from datetime import datetime, timedelta
-
-import config as cfg
-import exchange as ex
+import requests
 
 log = logging.getLogger("symbols_loader")
 
-_last_load:   datetime | None = None
-_symbol_stats: dict = {}
+try:
+    import config as cfg
+except Exception:
+    cfg = None
 
-REFRESH_HOURS = 24   # Refrescar lista de pares cada 24h
+_last_load     = 0
+_REFRESH_HOURS = 24
+_symbol_stats  = {}
 
 
 def needs_refresh() -> bool:
-    """True si hay que recargar la lista de símbolos."""
-    if _last_load is None:
-        return True
-    return datetime.now() - _last_load > timedelta(hours=REFRESH_HOURS)
+    return (time.time() - _last_load) > _REFRESH_HOURS * 3600
 
 
-def load_symbols(force: bool = False) -> list:
-    """
-    Carga los pares activos desde el exchange y actualiza cfg.SYMBOLS.
-    Si force=False y la lista ya está cargada, devuelve la lista actual.
-    Retorna la lista de símbolos cargados.
-    """
+def load_symbols(force=False) -> list:
     global _last_load, _symbol_stats
 
-    if not force and cfg.SYMBOLS and not needs_refresh():
+    if not force and not needs_refresh():
+        return getattr(cfg, "SYMBOLS", [])
+
+    # Si config tiene SYMBOLS definidos, usarlos siempre
+    if cfg and hasattr(cfg, "SYMBOLS") and cfg.SYMBOLS:
+        log.info(f"Usando {len(cfg.SYMBOLS)} pares de config.py")
+        _last_load = time.time()
         return cfg.SYMBOLS
 
-    log.info("Cargando lista de pares desde el exchange...")
-
+    log.info("Cargando pares desde BingX...")
+    symbols = []
     try:
-        exchange   = ex.get_exchange()
-        markets    = exchange.load_markets()
-
-        # Filtrar: futuros perpetuos USDT activos con volumen razonable
-        candidates = []
-        for sym, mkt in markets.items():
-            if not sym.endswith("/USDT"):
+        urls = [
+            "https://open-api.bingx.com/openApi/swap/v2/quote/contracts",
+            "https://open-api.bingx.com/openApi/contract/v1/allContracts",
+        ]
+        for url in urls:
+            r = requests.get(url, timeout=10).json()
+            data = r if isinstance(r, list) else r.get("data", [])
+            if not data:
                 continue
-            if not mkt.get("active", False):
-                continue
-            # Algunos exchanges marcan futuros con 'swap' o 'future'
-            mkt_type = mkt.get("type", "")
-            if mkt_type not in ("swap", "future", "spot"):
-                continue
-            candidates.append(sym)
-
-        if candidates:
-            cfg.SYMBOLS = sorted(candidates)
-            log.info(f"Pares cargados: {len(cfg.SYMBOLS)}")
-        else:
-            # Fallback a lista estática si el exchange no devuelve nada útil
-            log.warning("Exchange no devolvió pares válidos — usando lista estática")
-            if not cfg.SYMBOLS:
-                cfg.SYMBOLS = _default_symbols()
-
-        # Estadísticas básicas
-        _symbol_stats = {
-            "total":    len(cfg.SYMBOLS),
-            "source":   "exchange" if candidates else "static",
-            "loaded_at": datetime.now().strftime("%d/%m %H:%M"),
-        }
-
+            for item in data:
+                sym = item.get("symbol") or item.get("contractId", "")
+                if sym and sym.endswith("-USDT"):
+                    vol = float(item.get("volume24h") or item.get("quoteVolume24h") or 0)
+                    _symbol_stats[sym] = {"volume24h": vol}
+                    symbols.append(sym)
+            if symbols:
+                break
     except Exception as e:
-        log.error(f"Error cargando símbolos: {e}")
-        if not cfg.SYMBOLS:
-            cfg.SYMBOLS = _default_symbols()
-            log.info(f"Usando {len(cfg.SYMBOLS)} pares por defecto")
-        _symbol_stats = {
-            "total":    len(cfg.SYMBOLS),
-            "source":   "fallback",
-            "loaded_at": datetime.now().strftime("%d/%m %H:%M"),
-        }
+        log.warning(f"Error cargando pares: {e}")
 
-    _last_load = datetime.now()
-    return cfg.SYMBOLS
+    if not symbols:
+        symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "LINK-USDT"]
+
+    symbols = sorted(list(set(symbols)))
+    if cfg:
+        cfg.SYMBOLS = symbols
+
+    _last_load = time.time()
+    log.info(f"Cargados {len(symbols)} pares")
+    return symbols
 
 
 def get_symbol_stats() -> dict:
-    """Retorna estadísticas de la última carga (para Telegram startup)."""
     return _symbol_stats
-
-
-def _default_symbols() -> list:
-    """Lista de pares por defecto si el exchange falla."""
-    return [
-        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
-        "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "ARB/USDT", "OP/USDT",
-        "MATIC/USDT", "NEAR/USDT", "APT/USDT", "SUI/USDT", "PEPE/USDT",
-        "TON/USDT", "WIF/USDT", "FLOKI/USDT", "SHIB/USDT", "UNI/USDT",
-    ]
