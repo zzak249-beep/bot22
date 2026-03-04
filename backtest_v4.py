@@ -2,38 +2,35 @@ import requests, pandas as pd, numpy as np, time
 from datetime import datetime
 
 # ══════════════════════════════════════════════════════════
-# BACKTEST v4 — Fixes críticos aplicados:
+# BACKTEST v4.1 — Fix EMA filter demasiado agresivo
 #
-# PROBLEMA v3: 0 trades — conflicto matemático
-#   RSI_ENTRY=45 + SCORE_MIN=45 + MIN_RR=1.8 = imposible entrar
+# PROBLEMA v4: 0 trades
+#   El filtro EMA50 (price >= ema*0.97) bloqueaba TODO
+#   porque en Ene-Mar 2026 crypto estaba en bajada fuerte
+#   y el precio estaba consistentemente >3% bajo EMA50
 #
-# PROBLEMA v6.1: 108 SL = -$31.86
-#   Entraba en tendencias bajistas sin filtro de tendencia
-#
-# SOLUCIONES v4:
-#   ✅ RSI_ENTRY = 50      → más señales capturadas
-#   ✅ SCORE_MIN = 42      → coherente con puntuación real
-#   ✅ MIN_RR = 1.5        → filtra sin bloquear
-#   ✅ SL_ATR = 2.5        → evita SL prematuro
-#   ✅ calc_score mejorado → rango 40-50 valorado correctamente
-#   ✅ Filtro EMA50        → no entrar en tendencia bajista fuerte
-#   ✅ Filtro volumen      → evitar entradas con volumen débil
+# FIXES v4.1:
+#   ✅ EMA filter relajado: ema*0.93 (7% margen)
+#   ✅ VOL_FACTOR = 0.5 (más permisivo)
+#   ✅ MIN_RR = 1.3 (menos restrictivo)
+#   ✅ Resto igual que v4
 # ══════════════════════════════════════════════════════════
 
 BB_PERIOD      = 20
 BB_SIGMA       = 2.0
 RSI_PERIOD     = 14
-RSI_ENTRY      = 50       # FIX: era 45 → ahora 50
-SL_ATR         = 2.5      # FIX: era 2.0 → ahora 2.5
+RSI_ENTRY      = 50
+SL_ATR         = 2.5
 PARTIAL_TP_ATR = 2.5
 LEVERAGE       = 2
 RISK_PCT       = 0.02
 INITIAL_BAL    = 100.0
-SCORE_MIN      = 42       # FIX: era 45 → ahora 42
+SCORE_MIN      = 42
 COOLDOWN_BARS  = 3
-MIN_RR         = 1.5      # FIX: era 1.8 → ahora 1.5
-EMA_TREND      = 50       # NUEVO: filtro de tendencia
-VOL_FACTOR     = 0.8      # NUEVO: volumen mínimo vs media
+MIN_RR         = 1.3      # FIX: era 1.5 → 1.3
+EMA_TREND      = 50
+VOL_FACTOR     = 0.5      # FIX: era 0.8 → 0.5
+EMA_MARGIN     = 0.93     # FIX: era 0.97 → 0.93 (7% margen)
 
 SYMBOLS = [
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
@@ -123,9 +120,6 @@ def divergence(cls, rsi_s, lb=6):
     return None
 
 
-# ── FIX CLAVE: tabla de puntos corregida ───────────────────
-# v3: RSI 40-44 = +3pts → score=43 < SCORE_MIN=45 → nunca entraba
-# v4: RSI 40-44 = +5pts → score=45 > SCORE_MIN=42 → funciona
 def calc_score(r, dv, mb, stv):
     s = 40
     if   r < 20: s += 30
@@ -133,8 +127,8 @@ def calc_score(r, dv, mb, stv):
     elif r < 30: s += 15
     elif r < 35: s += 10
     elif r < 40: s += 7
-    elif r < 45: s += 5   # FIX: era 3 → ahora 5
-    elif r < 50: s += 2   # NUEVO: cubre RSI_ENTRY=50
+    elif r < 45: s += 5
+    elif r < 50: s += 2
     if dv == "bull": s += 18
     if mb: s += 7
     if stv is not None and not np.isnan(stv):
@@ -158,10 +152,7 @@ def backtest(df, sym, balance):
     df["atr"]    = atr_calc(df)
     df["macd"]   = macd_calc(df["close"])
     df["stoch"]  = stoch_rsi_calc(df["close"])
-
-    # NUEVO: EMA50 filtro de tendencia
     df["ema50"]  = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
-    # NUEVO: media de volumen 20 velas
     df["vol_ma"] = df["volume"].rolling(20).mean()
 
     trades = []; pos = None; cool = 0
@@ -187,16 +178,14 @@ def backtest(df, sym, balance):
             side  = pos["side"]
             entry = pos["entry"]
 
-            # ── TP Parcial ──────────────────────────────
             if not pos.get("pd"):
                 hp = (side == "long"  and price >= pos["tp_p"]) or \
                      (side == "short" and price <= pos["tp_p"])
                 if hp:
                     pos["qty"] *= 0.5
                     pos["pd"]   = True
-                    pos["sl"]   = entry  # SL a breakeven
+                    pos["sl"]   = entry
 
-            # ── Trailing stop tras parcial ──────────────
             if pos.get("pd") and side == "long":
                 trail = price - a * 1.2
                 if trail > pos["sl"]: pos["sl"] = trail
@@ -204,12 +193,10 @@ def backtest(df, sym, balance):
                 trail = price + a * 1.2
                 if trail < pos["sl"]: pos["sl"] = trail
 
-            # ── Verificar SL / TP / Salida señal ───────
             sl_hit = (side == "long"  and price <= pos["sl"]) or \
                      (side == "short" and price >= pos["sl"])
             tp_hit = (side == "long"  and price >= pos["tp"]) or \
                      (side == "short" and price <= pos["tp"])
-
             sig_exit = (side == "long" and
                         float(prev["close"]) <= float(prev["basis"]) and
                         price > bmid and pos.get("pd"))
@@ -238,7 +225,6 @@ def backtest(df, sym, balance):
 
         if cool > 0: cool -= 1; continue
 
-        # ── Buscar señal de entrada ─────────────────────
         dv    = divergence(df["close"].iloc[max(0,i-8):i+1],
                            df["rsi"].iloc[max(0,i-8):i+1])
         touch = (price <= blo * 1.003) or \
@@ -246,12 +232,10 @@ def backtest(df, sym, balance):
 
         if touch and r < RSI_ENTRY and balance > 0:
 
-            # NUEVO FILTRO 1: Tendencia EMA50
-            # No entrar si precio cae más de 3% bajo EMA50 (cuchillo cayendo)
-            trend_ok = price >= ema * 0.97
+            # Filtro EMA: máx 7% bajo EMA50 (antes era 3% → bloqueaba todo)
+            trend_ok = price >= ema * EMA_MARGIN
 
-            # NUEVO FILTRO 2: Volumen mínimo
-            # Solo entrar si hay volumen real (evita velas fantasma)
+            # Filtro volumen: 50% de media (antes era 80%)
             vol_ok = vol >= vol_ma * VOL_FACTOR
 
             if not trend_ok or not vol_ok:
@@ -279,8 +263,7 @@ def backtest(df, sym, balance):
 
 def report(all_trades, final_bal):
     if not all_trades:
-        print(f"\n  ⚠️  Sin trades.")
-        print(f"      RSI_ENTRY={RSI_ENTRY} | SCORE_MIN={SCORE_MIN} | MIN_RR={MIN_RR}")
+        print(f"\n  Sin trades generados.")
         return
     wins   = [t for t in all_trades if t["result"] == "WIN"]
     losses = [t for t in all_trades if t["result"] == "LOSS"]
@@ -299,9 +282,9 @@ def report(all_trades, final_bal):
     sep = "=" * 60
     lines = [
         sep,
-        "  BB+RSI ELITE v4 — BACKTEST CORREGIDO",
+        "  BB+RSI ELITE v4.1 — BACKTEST CORREGIDO",
         f"  SL={SL_ATR}xATR | RSI<{RSI_ENTRY} | Score≥{SCORE_MIN} | R:R≥{MIN_RR}",
-        f"  Filtros: EMA{EMA_TREND} tendencia | Volumen≥{int(VOL_FACTOR*100)}% media",
+        f"  EMA{EMA_TREND} margen={int((1-EMA_MARGIN)*100)}% | Vol≥{int(VOL_FACTOR*100)}% media",
         sep,
         f"  Balance inicial  : ${INITIAL_BAL:.2f}",
         f"  Balance final    : ${final_bal:.2f}   ROI: {roi:+.1f}%",
@@ -369,9 +352,9 @@ def report(all_trades, final_bal):
 
 def main():
     print("=" * 60)
-    print("  BACKTEST v4 — BingX 1h (~83 días)")
+    print("  BACKTEST v4.1 — BingX 1h (~83 días)")
     print(f"  SL={SL_ATR}xATR | RSI<{RSI_ENTRY} | Score≥{SCORE_MIN} | R:R≥{MIN_RR}")
-    print(f"  Filtros nuevos: EMA{EMA_TREND} tendencia + Volumen≥{int(VOL_FACTOR*100)}%")
+    print(f"  EMA{EMA_TREND} margen={int((1-EMA_MARGIN)*100)}% | Vol≥{int(VOL_FACTOR*100)}%")
     print("=" * 60)
     all_trades = []; balance = INITIAL_BAL
     for sym in SYMBOLS:
