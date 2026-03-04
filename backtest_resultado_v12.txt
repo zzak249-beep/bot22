@@ -1,0 +1,63 @@
+================================================================
+  BB+RSI ELITE v12 — LONG ONLY | VOL FILTRO DURO
+  SL=1.8xATR | RSI<34 | Score>=47 | R:R>=1.5
+  Tendencia: 8v ±0.25% | Vol>=1.0xMA | BBw>=1.5xATR
+================================================================
+  Balance inicial  : $100.00
+  Balance final    : $100.05   ROI: +0.0%
+  Total trades     : 34 (solo longs)
+  Ganados/Perdidos : 20/14   WR: 58.8%
+  PnL total        : $+0.05
+  Ganancia media   : $+0.1356
+  Perdida media    : $-0.1905
+  Profit Factor    : 1.02
+  Expectativa/trade: $+0.0014
+  RSI medio entrada: 28.0
+  BB Width medio   : 3.65x ATR
+  Duración media   : 23.5 velas
+
+  POR PAR:
+  + ATOM-USDT       2tr  WR:100%  $+0.3911
+  + OP-USDT         2tr  WR:100%  $+0.2606
+  + ETH-USDT        2tr  WR:100%  $+0.2248
+  + LINK-USDT       3tr  WR:67%  $+0.1980
+  + BTC-USDT        2tr  WR:100%  $+0.1869
+  + SOL-USDT        5tr  WR:60%  $+0.1603
+  + LTC-USDT        5tr  WR:60%  $+0.0451
+  - TIA-USDT        4tr  WR:50%  $-0.1532
+  - NEAR-USDT       1tr  WR:0%  $-0.2001
+  - BNB-USDT        3tr  WR:33%  $-0.2316
+  - SUI-USDT        1tr  WR:0%  $-0.2632
+  - UNI-USDT        4tr  WR:25%  $-0.5728
+
+  POR RAZON CIERRE:
+  SL         18tr  WR:22%  $-2.3121
+  SIGNAL     10tr  WR:100%  $+1.1545
+  TP          6tr  WR:100%  $+1.2035
+
+  TENDENCIA 4H CONFIRMA vs NO confirma:
+  + 4H ok :  26tr  WR:62%  $+0.1070
+  - 4H no :   8tr  WR:50%  $-0.0611
+  (Diferencia +12pp → ACTIVAR como filtro duro en v13)
+
+  CURVA MENSUAL:
+  - 2026-01  $-0.3323  Balance:$99.67
+  - 2026-02  $-1.0351  Balance:$98.63
+  + 2026-03  $+1.4133  Balance:$100.05
+  Meses positivos/negativos: 1/2
+
+  COMPARATIVA v7→v8→v9→v10→v11→v12:
+  WR    : 31.7%→41.4%→33.3%→46.3%→68.2%→ 58.8%
+  PF    :  0.36→ 0.79→ 0.63→ 0.78→ 1.83→ 1.02
+  ROI   : -8.5%→-1.7%→-0.1%→-0.8%→+1.0%→ +0.0%
+  Trades:  123 → 111 →   3 →  41 →  22 → 34
+
+  NOTA PARA v13:
+  → SL rate: 53% (objetivo <60%)
+  → Trades generados: 34 (objetivo 40-60)
+  → Frecuencia óptima ✓
+
+  [XX] NO RENTABLE — PF=1.02  WR=58.8%  ROI=+0.0%
+================================================================
+
+Generado: 2026-03-04 11:56:39.615047

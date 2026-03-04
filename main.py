@@ -377,25 +377,60 @@ def handle_open_position(symbol, sig, balance, df=None):
             elif "entim" in reason: state.skip_sent += 1
             return False
 
-    # Sin fondos: señal manual
+    # Sin fondos: señal manual completa a Telegram
     if balance < cfg.MIN_USDT_BALANCE:
         db.log_signal(symbol, sig, executed=False)
-        side_txt  = "🟢 LONG" if sig["action"] == "buy" else "🔴 SHORT"
-        score_txt = f"Score: `{sig.get('score','N/A')}/100`\n" if sig.get("score") else ""
+        action     = sig.get("action", "buy")
+        side_txt   = "🟢 LONG" if action == "buy" else "🔴 SHORT"
+        side_bingx = "BUY / LONG" if action == "buy" else "SELL / SHORT"
+        entry      = sig["entry"]
+        sl         = sig["sl"]
+        tp         = sig["tp"]
+        tp1        = sig.get("tp_partial", "")
+        rsi        = sig.get("rsi", "N/A")
+        atr        = sig.get("atr", 0)
+        score      = sig.get("score", 0)
+        reason     = sig.get("reason", "")
+        trend_4h   = sig.get("trend_4h", "N/A")
+
+        # Calcular R:R y distancias
+        risk       = abs(entry - sl) if sl else 0
+        reward     = abs(tp - entry) if tp else 0
+        rr         = round(reward / risk, 2) if risk > 0 else 0
+        sl_pct     = round(risk / entry * 100, 2) if entry > 0 else 0
+        tp_pct     = round(reward / entry * 100, 2) if entry > 0 else 0
+
+        # Nombre limpio del par para BingX
+        base       = symbol.split("/")[0]
+        pair_clean = f"{base}/USDT"
+
+        mood = snt.get_market_mood()
+
         tg.send_raw(
-            f"📡 *SEÑAL MANUAL* — Bot sin fondos\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Par     : `{symbol}`\n"
-            f"Lado    : {side_txt}\n"
-            f"Entrada : `{sig['entry']}`\n"
-            f"🛑 SL   : `{sig['sl']}`\n"
-            f"🎯 TP   : `{sig['tp']}`\n"
-            f"RSI     : `{sig.get('rsi','N/A')}`\n"
-            f"{score_txt}"
-            f"Mercado : _{snt.get_market_mood()}_\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ Ejecutar manualmente en BingX\n"
-            f"💰 Balance: ${balance:.4f} USDT"
+            f"{'🟢' if action == 'buy' else '🔴'} *SEÑAL {side_txt}* — `{pair_clean}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 *Entrada*  : `{entry}`\n"
+            f"🛑 *Stop Loss*: `{sl}` _(-{sl_pct}%)_\n"
+            f"🎯 *TP final* : `{tp}` _(+{tp_pct}%)_\n"
+            + (f"🎯 *TP1 (50%)*: `{tp1}`\n" if tp1 else "") +
+            f"📊 *R:R*      : `{rr}x`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 RSI        : `{rsi}`\n"
+            f"📉 ATR        : `{round(atr,4) if atr else 'N/A'}`\n"
+            f"🕐 Tendencia 4h: `{trend_4h}`\n"
+            f"⭐ Score      : `{score}/100`\n"
+            f"💬 Razón      : _{reason}_\n"
+            f"🌡 Mercado    : _{mood}_\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📱 *PASOS EN BINGX FUTUROS:*\n"
+            f"1️⃣ Buscar `{pair_clean}` → Futuros\n"
+            f"2️⃣ Lado: *{side_bingx}*\n"
+            f"3️⃣ Apalancamiento: *{cfg.LEVERAGE}x*\n"
+            f"4️⃣ Tipo: *Mercado* al precio ~`{entry}`\n"
+            f"5️⃣ Stop Loss: `{sl}`\n"
+            f"6️⃣ Take Profit: `{tp}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ _Señal válida ~15min — actúa rápido_"
         )
         return False
 
@@ -537,7 +572,17 @@ def run_cycle():
                 continue
 
             try:
-                df    = fetch_candles(symbol, cfg.TIMEFRAME)
+                # FIX 6: reintento en timeout de API
+                df = None
+                for _attempt in range(2):
+                    try:
+                        df = fetch_candles(symbol, cfg.TIMEFRAME)
+                        break
+                    except Exception as _e:
+                        if _attempt == 0:
+                            time.sleep(2)
+                        else:
+                            raise _e
                 df_cache[symbol] = df
                 df_4h = None
                 try:
@@ -655,13 +700,21 @@ def run_cycle():
         if handle_open_position(symbol, sig, balance, df=df_s):
             open_count += 1
 
-    # Reporte horario
+    # Reporte horario con PnL total acumulado
     if datetime.now() - state.last_report >= timedelta(hours=1):
         pos_list = [
             {"symbol": s, "entry": p["entry"],
              "current": p.get("current", p["entry"]), "side": p.get("side", "long")}
             for s, p in state.positions.items()
         ]
+        # FIX 7: añadir PnL total y ROI desde inicio al reporte
+        total_stats = db.get_stats_summary()
+        total_pnl   = total_stats.get("total_pnl", 0) or 0
+        total_trades= total_stats.get("total", 0) or 0
+        roi_pct     = (total_pnl / state.initial_balance * 100) if state.initial_balance > 0 else 0
+        state.stats["pnl_total"]    = round(total_pnl, 2)
+        state.stats["roi_total"]    = round(roi_pct, 2)
+        state.stats["total_trades"] = total_trades
         tg.send_status(pos_list, balance, state.stats, learner.get_performance_report())
         state.last_report = datetime.now()
 

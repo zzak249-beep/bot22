@@ -19,7 +19,7 @@ log = logging.getLogger("learner")
 
 REVIEW_EVERY = 10
 MIN_TRADES   = 5
-DB_PATH      = "trades.db"
+DB_PATH      = "bot_data.db"  # FIX: era trades.db — database.py usa bot_data.db
 
 _symbol_blacklist: set = set()
 
@@ -175,8 +175,8 @@ def detect_market_regime(trades: list) -> str:
 
     recent    = trades[:8]
     pnls      = [t.get("pnl", 0) for t in recent]
-    tp_closes = sum(1 for t in recent if t.get("reason", "") in ("TP", "TP_PARCIAL", "TP1", "TP2", "TP3"))
-    sl_closes = sum(1 for t in recent if t.get("reason", "") == "SL")
+    tp_closes = sum(1 for t in recent if t.get("close_reason", "") in ("TP", "TP1_30%", "TP2_40%", "TP3", "SIGNAL"))
+    sl_closes = sum(1 for t in recent if t.get("close_reason", "") == "SL")
     avg_pnl   = sum(pnls) / len(pnls)
     pnl_var   = sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls)
 
@@ -221,8 +221,8 @@ def analyze_losing_patterns(trades: list) -> dict:
     patterns    = []
 
     # Patron 1: RSI alto en perdidas
-    l_rsi = [t.get("rsi_entry", 50) for t in losing  if t.get("rsi_entry")]
-    w_rsi = [t.get("rsi_entry", 50) for t in winning if t.get("rsi_entry")]
+    l_rsi = [t.get("rsi_at_entry", 50) for t in losing  if t.get("rsi_at_entry")]
+    w_rsi = [t.get("rsi_at_entry", 50) for t in winning if t.get("rsi_at_entry")]
     if l_rsi and w_rsi:
         avg_lr = sum(l_rsi) / len(l_rsi)
         avg_wr = sum(w_rsi) / len(w_rsi)
@@ -233,7 +233,7 @@ def analyze_losing_patterns(trades: list) -> dict:
                 patterns.append(f"RSI alto en perdidas ({avg_lr:.1f} vs {avg_wr:.1f})")
 
     # Patron 2: SL muy ajustado
-    sl_hits  = [t for t in losing if t.get("reason", "") == "SL"]
+    sl_hits  = [t for t in losing if t.get("close_reason", "") == "SL"]
     sl_ratio = len(sl_hits) / len(losing) if losing else 0
     if sl_ratio > 0.7:
         new_sl = min(cfg.SL_ATR + 0.3, 4.0)
@@ -256,8 +256,8 @@ def analyze_losing_patterns(trades: list) -> dict:
     short_trades = []
     for t in losing:
         try:
-            opened = datetime.fromisoformat(str(t.get("opened_at") or t.get("entry_time", "")))
-            closed = datetime.fromisoformat(str(t.get("closed_at") or t.get("exit_time",  "")))
+            opened = datetime.fromisoformat(str(t.get("entry_time", "")))
+            closed = datetime.fromisoformat(str(t.get("exit_time", "")))
             if (closed - opened).total_seconds() / 60 < 30:
                 short_trades.append(t)
         except Exception:
@@ -294,7 +294,7 @@ def _load_recent_trades(limit=50) -> list:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT ?",
+            "SELECT * FROM trades WHERE exit_time IS NOT NULL ORDER BY exit_time DESC LIMIT ?",
             (limit,)
         ).fetchall()
         conn.close()

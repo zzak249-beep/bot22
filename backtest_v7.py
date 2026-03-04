@@ -2,35 +2,37 @@ import requests, pandas as pd, numpy as np, time
 from datetime import datetime
 
 # ══════════════════════════════════════════════════════════
-# BACKTEST v4.1 — Fix EMA filter demasiado agresivo
+# BACKTEST v7 — FILTRO DE TENDENCIA POR PENDIENTE BB
 #
-# PROBLEMA v4: 0 trades
-#   El filtro EMA50 (price >= ema*0.97) bloqueaba TODO
-#   porque en Ene-Mar 2026 crypto estaba en bajada fuerte
-#   y el precio estaba consistentemente >3% bajo EMA50
+# DIAGNOSTICO v6:
+#   136/163 trades terminan en SL
+#   LONG WR:33% → comprando en caída libre (bear market)
+#   SHORT WR:48% → mejor pero SL demasiado amplio
 #
-# FIXES v4.1:
-#   ✅ EMA filter relajado: ema*0.93 (7% margen)
-#   ✅ VOL_FACTOR = 0.5 (más permisivo)
-#   ✅ MIN_RR = 1.3 (menos restrictivo)
-#   ✅ Resto igual que v4
+# SOLUCION v7:
+#   ✅ Filtro pendiente basis BB:
+#      - basis bajando → SOLO shorts, bloquear longs
+#      - basis subiendo → SOLO longs, bloquear shorts
+#      - basis plano   → ambos permitidos
+#   ✅ SL_ATR = 2.0 (equilibrio entre v5 y v6)
+#   ✅ RSI_LONG = 35, RSI_SHORT = 65 (señales más limpias)
+#   ✅ SCORE_MIN = 45
 # ══════════════════════════════════════════════════════════
 
 BB_PERIOD      = 20
 BB_SIGMA       = 2.0
 RSI_PERIOD     = 14
-RSI_ENTRY      = 50
-SL_ATR         = 2.5
+RSI_LONG       = 35
+RSI_SHORT      = 65
+SL_ATR         = 2.0
 PARTIAL_TP_ATR = 2.5
 LEVERAGE       = 2
 RISK_PCT       = 0.02
 INITIAL_BAL    = 100.0
-SCORE_MIN      = 42
+SCORE_MIN      = 45
 COOLDOWN_BARS  = 3
-MIN_RR         = 1.3      # FIX: era 1.5 → 1.3
-EMA_TREND      = 50
-VOL_FACTOR     = 0.5      # FIX: era 0.8 → 0.5
-EMA_MARGIN     = 0.93     # FIX: era 0.97 → 0.93 (7% margen)
+MIN_RR         = 1.3
+TREND_LOOKBACK = 5    # velas para medir pendiente basis
 
 SYMBOLS = [
     "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
@@ -55,24 +57,41 @@ def fetch(sym):
                 c = r if isinstance(r, list) else r.get("data", [])
                 if not c: break
                 all_c = c + all_c
-                first_ts = c[0][0] if isinstance(c[0], list) else c[0].get("t", c[0].get("time", 0))
+                if isinstance(c[0], list):
+                    first_ts = c[0][0]
+                else:
+                    first_ts = c[0].get("time") or c[0].get("t", 0)
                 end = int(first_ts) - 1
                 time.sleep(0.3); success = True
             except Exception as e:
                 print(f" ERR:{e}", end=""); break
         if success and all_c: break
+
     if not all_c: print(" sin datos"); return pd.DataFrame()
+
     rows = []
     for c in all_c:
-        if isinstance(c, list): rows.append(c[:6])
-        else: rows.append([c.get("t") or c.get("time",0), c.get("o",0),
-                           c.get("h",0), c.get("l",0), c.get("c",0), c.get("v",0)])
+        if isinstance(c, list):
+            rows.append(c[:6])
+        else:
+            rows.append([
+                c.get("time")   or c.get("t",   0),
+                c.get("open")   or c.get("o",   0),
+                c.get("high")   or c.get("h",   0),
+                c.get("low")    or c.get("l",   0),
+                c.get("close")  or c.get("c",   0),
+                c.get("volume") or c.get("v",   0),
+            ])
+
     df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["ts"] = pd.to_datetime(pd.to_numeric(df["ts"], errors="coerce"), unit="ms")
     df = df.dropna().sort_values("ts").drop_duplicates("ts").reset_index(drop=True)
-    if df.empty: print(" sin datos válidos"); return pd.DataFrame()
+
+    if df.empty or df["close"].max() == 0:
+        print(" sin datos validos"); return pd.DataFrame()
+
     print(f" {len(df)} velas ({str(df['ts'].iloc[0])[:10]} -> {str(df['ts'].iloc[-1])[:10]})")
     return df
 
@@ -120,17 +139,31 @@ def divergence(cls, rsi_s, lb=6):
     return None
 
 
-def calc_score(r, dv, mb, stv):
+def trend_direction(basis_series, i, lb=5):
+    """
+    Devuelve la tendencia basada en pendiente de la BB media:
+      'up'   → basis subiendo → solo longs
+      'down' → basis bajando  → solo shorts
+      'flat' → ambos permitidos
+    """
+    if i < lb: return "flat"
+    now  = float(basis_series.iloc[i])
+    prev = float(basis_series.iloc[i - lb])
+    if now == 0 or prev == 0: return "flat"
+    change_pct = (now - prev) / prev * 100
+    if   change_pct >  0.3: return "up"
+    elif change_pct < -0.3: return "down"
+    else:                    return "flat"
+
+
+def calc_score_long(r, dv, mb, stv):
     s = 40
     if   r < 20: s += 30
     elif r < 25: s += 22
     elif r < 30: s += 15
     elif r < 35: s += 10
-    elif r < 40: s += 7
-    elif r < 45: s += 5
-    elif r < 50: s += 2
     if dv == "bull": s += 18
-    if mb: s += 7
+    if mb: s += 5
     if stv is not None and not np.isnan(stv):
         if   stv < 10: s += 15
         elif stv < 20: s += 10
@@ -138,11 +171,26 @@ def calc_score(r, dv, mb, stv):
     return min(s, 100)
 
 
-def backtest(df, sym, balance):
-    if len(df) < max(BB_PERIOD, EMA_TREND) + 30:
-        return [], balance
-    df = df.copy()
+def calc_score_short(r, dv, mb, stv):
+    s = 40
+    if   r > 80: s += 30
+    elif r > 75: s += 22
+    elif r > 70: s += 15
+    elif r > 65: s += 10
+    if dv == "bear": s += 18
+    if not mb: s += 5
+    if stv is not None and not np.isnan(stv):
+        if   stv > 90: s += 15
+        elif stv > 80: s += 10
+        elif stv > 70: s += 5
+    return min(s, 100)
 
+
+def backtest(df, sym, balance):
+    if len(df) < BB_PERIOD + 30:
+        return [], balance
+
+    df = df.copy()
     basis = df["close"].rolling(BB_PERIOD).mean()
     std   = df["close"].rolling(BB_PERIOD).std()
     df["upper"]  = basis + BB_SIGMA * std
@@ -152,28 +200,27 @@ def backtest(df, sym, balance):
     df["atr"]    = atr_calc(df)
     df["macd"]   = macd_calc(df["close"])
     df["stoch"]  = stoch_rsi_calc(df["close"])
-    df["ema50"]  = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
-    df["vol_ma"] = df["volume"].rolling(20).mean()
 
     trades = []; pos = None; cool = 0
 
-    for i in range(max(BB_PERIOD, EMA_TREND) + 30, len(df)):
-        cur  = df.iloc[i]
-        prev = df.iloc[i-1]
+    for i in range(BB_PERIOD + 30, len(df)):
+        cur   = df.iloc[i]
+        prev  = df.iloc[i-1]
         price = float(cur["close"])
-        r   = float(cur["rsi"])   if not np.isnan(cur["rsi"])   else 50.0
-        a   = float(cur["atr"])   if not np.isnan(cur["atr"])   else 0.0
-        mb  = float(cur["macd"]) > 0 if not np.isnan(cur["macd"]) else True
-        stv = float(cur["stoch"]) if not np.isnan(cur["stoch"]) else 50.0
+        r     = float(cur["rsi"])   if not np.isnan(cur["rsi"])   else 50.0
+        a     = float(cur["atr"])   if not np.isnan(cur["atr"])   else 0.0
+        mb    = float(cur["macd"]) > 0 if not np.isnan(cur["macd"]) else True
+        stv   = float(cur["stoch"]) if not np.isnan(cur["stoch"]) else 50.0
         if a <= 0: continue
 
         blo  = float(cur["lower"])
         bhi  = float(cur["upper"])
         bmid = float(cur["basis"])
-        ema  = float(cur["ema50"])  if not np.isnan(cur["ema50"])  else price
-        vol  = float(cur["volume"])
-        vol_ma = float(cur["vol_ma"]) if not np.isnan(cur["vol_ma"]) else vol
 
+        # Dirección de tendencia por pendiente del basis
+        trend = trend_direction(df["basis"], i, TREND_LOOKBACK)
+
+        # ── Gestión posición abierta ────────────────────
         if pos:
             side  = pos["side"]
             entry = pos["entry"]
@@ -187,24 +234,27 @@ def backtest(df, sym, balance):
                     pos["sl"]   = entry
 
             if pos.get("pd") and side == "long":
-                trail = price - a * 1.2
+                trail = price - a * 1.5
                 if trail > pos["sl"]: pos["sl"] = trail
             elif pos.get("pd") and side == "short":
-                trail = price + a * 1.2
+                trail = price + a * 1.5
                 if trail < pos["sl"]: pos["sl"] = trail
 
             sl_hit = (side == "long"  and price <= pos["sl"]) or \
                      (side == "short" and price >= pos["sl"])
             tp_hit = (side == "long"  and price >= pos["tp"]) or \
                      (side == "short" and price <= pos["tp"])
-            sig_exit = (side == "long" and
-                        float(prev["close"]) <= float(prev["basis"]) and
-                        price > bmid and pos.get("pd"))
+            sig_exit_long  = (side == "long"  and
+                              float(prev["close"]) <= float(prev["basis"]) and
+                              price > bmid and pos.get("pd"))
+            sig_exit_short = (side == "short" and
+                              float(prev["close"]) >= float(prev["basis"]) and
+                              price < bmid and pos.get("pd"))
 
             reason = None; exit_p = price
-            if   sl_hit:   exit_p = pos["sl"]; reason = "SL"
-            elif tp_hit:   exit_p = pos["tp"]; reason = "TP"
-            elif sig_exit: reason = "SIGNAL"
+            if   sl_hit:                            exit_p = pos["sl"]; reason = "SL"
+            elif tp_hit:                            exit_p = pos["tp"]; reason = "TP"
+            elif sig_exit_long or sig_exit_short:   reason = "SIGNAL"
 
             if reason:
                 pct = (exit_p - entry) / entry if side == "long" \
@@ -217,7 +267,8 @@ def backtest(df, sym, balance):
                     "result": "WIN" if pnl > 0 else "LOSS",
                     "reason": reason, "sc": pos["sc"],
                     "date": str(cur["ts"])[:10],
-                    "bars": i - pos["oi"], "rsi_e": pos["rsi_e"]
+                    "bars": i - pos["oi"], "rsi_e": pos["rsi_e"],
+                    "trend": pos["trend"]
                 })
                 pos  = None
                 cool = COOLDOWN_BARS
@@ -225,48 +276,61 @@ def backtest(df, sym, balance):
 
         if cool > 0: cool -= 1; continue
 
-        dv    = divergence(df["close"].iloc[max(0,i-8):i+1],
-                           df["rsi"].iloc[max(0,i-8):i+1])
-        touch = (price <= blo * 1.003) or \
-                (dv == "bull" and r < 50 and price <= blo * 1.012)
+        dv = divergence(df["close"].iloc[max(0,i-8):i+1],
+                        df["rsi"].iloc[max(0,i-8):i+1])
 
-        if touch and r < RSI_ENTRY and balance > 0:
+        # ══ SEÑAL LONG — solo si tendencia no es bajista ═
+        if trend != "down":
+            touch_long = (price <= blo * 1.002) or \
+                         (dv == "bull" and r < RSI_LONG and price <= blo * 1.01)
+            if touch_long and r < RSI_LONG and balance > 0:
+                sc = calc_score_long(r, dv, mb, stv)
+                if sc >= SCORE_MIN:
+                    sl   = price - SL_ATR * a
+                    tp   = bhi
+                    tp_p = price + PARTIAL_TP_ATR * a
+                    if sl > 0 and tp > price and (price - sl) > 0:
+                        rr_val = (tp - price) / (price - sl)
+                        if rr_val >= MIN_RR:
+                            qty = (balance * RISK_PCT * LEVERAGE) / price
+                            pos = {"side": "long", "entry": price,
+                                   "sl": sl, "tp": tp, "tp_p": tp_p,
+                                   "qty": qty, "sc": sc, "oi": i,
+                                   "pd": False, "rsi_e": round(r, 1),
+                                   "trend": trend}
+                            continue
 
-            # Filtro EMA: máx 7% bajo EMA50 (antes era 3% → bloqueaba todo)
-            trend_ok = price >= ema * EMA_MARGIN
-
-            # Filtro volumen: 50% de media (antes era 80%)
-            vol_ok = vol >= vol_ma * VOL_FACTOR
-
-            if not trend_ok or not vol_ok:
-                continue
-
-            sc = calc_score(r, dv, mb, stv)
-            if sc >= SCORE_MIN:
-                sl   = price - SL_ATR * a
-                tp   = bhi
-                tp_p = price + PARTIAL_TP_ATR * a
-
-                if sl > 0 and tp > price and (price - sl) > 0:
-                    rr_val = (tp - price) / (price - sl)
-                    if rr_val >= MIN_RR:
-                        qty = (balance * RISK_PCT * LEVERAGE) / price
-                        pos = {
-                            "side": "long", "entry": price,
-                            "sl": sl, "tp": tp, "tp_p": tp_p,
-                            "qty": qty, "sc": sc, "oi": i,
-                            "pd": False, "rsi_e": round(r, 1)
-                        }
+        # ══ SEÑAL SHORT — solo si tendencia no es alcista =
+        if trend != "up":
+            touch_short = (price >= bhi * 0.998) or \
+                          (dv == "bear" and r > RSI_SHORT and price >= bhi * 0.99)
+            if touch_short and r > RSI_SHORT and balance > 0:
+                sc = calc_score_short(r, dv, mb, stv)
+                if sc >= SCORE_MIN:
+                    sl   = price + SL_ATR * a
+                    tp   = blo
+                    tp_p = price - PARTIAL_TP_ATR * a
+                    if sl > price and tp < price and (sl - price) > 0:
+                        rr_val = (price - tp) / (sl - price)
+                        if rr_val >= MIN_RR:
+                            qty = (balance * RISK_PCT * LEVERAGE) / price
+                            pos = {"side": "short", "entry": price,
+                                   "sl": sl, "tp": tp, "tp_p": tp_p,
+                                   "qty": qty, "sc": sc, "oi": i,
+                                   "pd": False, "rsi_e": round(r, 1),
+                                   "trend": trend}
 
     return trades, balance
 
 
 def report(all_trades, final_bal):
     if not all_trades:
-        print(f"\n  Sin trades generados.")
+        print("\n  Sin trades generados.")
         return
     wins   = [t for t in all_trades if t["result"] == "WIN"]
     losses = [t for t in all_trades if t["result"] == "LOSS"]
+    longs  = [t for t in all_trades if t["side"]   == "long"]
+    shorts = [t for t in all_trades if t["side"]   == "short"]
     total  = len(all_trades)
     wr     = len(wins) / total * 100
     tp_sum = sum(t["pnl"] for t in all_trades)
@@ -279,20 +343,31 @@ def report(all_trades, final_bal):
     exp    = wr / 100 * aw + (1 - wr / 100) * al
     rsi_avg = sum(t.get("rsi_e", 0) for t in all_trades) / len(all_trades)
 
-    sep = "=" * 60
+    wl = sum(1 for t in longs  if t["result"] == "WIN")
+    ws = sum(1 for t in shorts if t["result"] == "WIN")
+    pl = sum(t["pnl"] for t in longs)
+    ps = sum(t["pnl"] for t in shorts)
+
+    sep = "=" * 62
     lines = [
         sep,
-        "  BB+RSI ELITE v4.1 — BACKTEST CORREGIDO",
-        f"  SL={SL_ATR}xATR | RSI<{RSI_ENTRY} | Score≥{SCORE_MIN} | R:R≥{MIN_RR}",
-        f"  EMA{EMA_TREND} margen={int((1-EMA_MARGIN)*100)}% | Vol≥{int(VOL_FACTOR*100)}% media",
+        "  BB+RSI ELITE v7 — LONG + SHORT + FILTRO TENDENCIA",
+        f"  SL={SL_ATR}xATR | RSI_L<{RSI_LONG} RSI_S>{RSI_SHORT} | Score>={SCORE_MIN} | R:R>={MIN_RR}",
+        f"  Tendencia: basis slope {TREND_LOOKBACK}v | down=solo short | up=solo long",
         sep,
         f"  Balance inicial  : ${INITIAL_BAL:.2f}",
         f"  Balance final    : ${final_bal:.2f}   ROI: {roi:+.1f}%",
-        f"  Total trades     : {total}",
+        f"  Total trades     : {total}  ({len(longs)} longs / {len(shorts)} shorts)",
         f"  Ganados/Perdidos : {len(wins)}/{len(losses)}   WR: {wr:.1f}%",
+    ]
+    if longs:
+        lines.append(f"  LONG  : {len(longs):3d}tr  {wl}G {len(longs)-wl}P  WR:{wl/len(longs)*100:.0f}%  PnL:${pl:+.4f}")
+    if shorts:
+        lines.append(f"  SHORT : {len(shorts):3d}tr  {ws}G {len(shorts)-ws}P  WR:{ws/len(shorts)*100:.0f}%  PnL:${ps:+.4f}")
+    lines += [
         f"  PnL total        : ${tp_sum:+.2f}",
         f"  Ganancia media   : ${aw:+.4f}",
-        f"  Pérdida media    : ${al:+.4f}",
+        f"  Perdida media    : ${al:+.4f}",
         f"  Profit Factor    : {pf:.2f}",
         f"  Expectativa/trade: ${exp:+.4f}",
         f"  RSI medio entrada: {rsi_avg:.1f}",
@@ -318,10 +393,24 @@ def report(all_trades, final_bal):
         if r2 not in by_r: by_r[r2] = {"n": 0, "w": 0, "pnl": 0}
         by_r[r2]["n"] += 1; by_r[r2]["pnl"] += t["pnl"]
         if t["result"] == "WIN": by_r[r2]["w"] += 1
-    lines.append("  POR RAZÓN CIERRE:")
+    lines.append("  POR RAZON CIERRE:")
     for r2, v in sorted(by_r.items(), key=lambda x: -x[1]["n"]):
         wr_r = v["w"] / v["n"] * 100 if v["n"] else 0
         lines.append(f"  {r2:8s}  {v['n']:3d}tr  WR:{wr_r:.0f}%  ${v['pnl']:+.4f}")
+    lines.append("")
+
+    # Breakdown por tendencia
+    by_trend = {}
+    for t in all_trades:
+        tr = t.get("trend","?")
+        if tr not in by_trend: by_trend[tr] = {"n":0,"w":0,"pnl":0}
+        by_trend[tr]["n"] += 1; by_trend[tr]["pnl"] += t["pnl"]
+        if t["result"] == "WIN": by_trend[tr]["w"] += 1
+    lines.append("  POR TENDENCIA AL ENTRAR:")
+    for tr, v in sorted(by_trend.items()):
+        wr_t = v["w"]/v["n"]*100 if v["n"] else 0
+        e = "+" if v["pnl"] >= 0 else "-"
+        lines.append(f"  {e} {tr:6s}  {v['n']:3d}tr  WR:{wr_t:.0f}%  ${v['pnl']:+.4f}")
     lines.append("")
 
     monthly = {}
@@ -337,34 +426,36 @@ def report(all_trades, final_bal):
         lines.append(f"  {e} {m}  ${pnl:>+7.4f}  Balance:${bal2:.2f}")
     lines.append("")
 
-    if pf >= 1.5 and wr >= 50:   verdict = "RENTABLE ✓";    tag = "OK"
-    elif pf >= 1.2 and wr >= 45: verdict = "MARGINAL ~";    tag = "!!"
-    else:                         verdict = "NO RENTABLE ✗"; tag = "XX"
+    if pf >= 1.5 and wr >= 50:   verdict = "RENTABLE"; tag = "OK"
+    elif pf >= 1.2 and wr >= 45: verdict = "MARGINAL"; tag = "!!"
+    else:                         verdict = "NO RENTABLE"; tag = "XX"
     lines.append(f"  [{tag}] {verdict} — PF={pf:.2f}  WR={wr:.1f}%  ROI={roi:+.1f}%")
     lines.append(sep)
 
     out = "\n".join(lines)
     print(out)
-    with open("backtest_resultado_v4.txt", "w", encoding="utf-8") as f:
+    with open("backtest_resultado_v7.txt", "w", encoding="utf-8") as f:
         f.write(out + f"\n\nGenerado: {datetime.now()}\n")
-    print("\n  ✅ Guardado en: backtest_resultado_v4.txt")
+    print("\n  Guardado en: backtest_resultado_v7.txt")
 
 
 def main():
-    print("=" * 60)
-    print("  BACKTEST v4.1 — BingX 1h (~83 días)")
-    print(f"  SL={SL_ATR}xATR | RSI<{RSI_ENTRY} | Score≥{SCORE_MIN} | R:R≥{MIN_RR}")
-    print(f"  EMA{EMA_TREND} margen={int((1-EMA_MARGIN)*100)}% | Vol≥{int(VOL_FACTOR*100)}%")
-    print("=" * 60)
+    print("=" * 62)
+    print("  BACKTEST v7 — LONG + SHORT + FILTRO TENDENCIA")
+    print(f"  SL={SL_ATR}xATR | RSI_L<{RSI_LONG} RSI_S>{RSI_SHORT} | Score>={SCORE_MIN} | R:R>={MIN_RR}")
+    print(f"  Filtro: pendiente basis {TREND_LOOKBACK}v → down=solo short, up=solo long")
+    print("=" * 62)
     all_trades = []; balance = INITIAL_BAL
     for sym in SYMBOLS:
         df = fetch(sym)
         if df.empty: continue
         trades, balance = backtest(df, sym, balance)
         all_trades.extend(trades)
-        w = sum(1 for t in trades if t["result"] == "WIN")
-        p = sum(t["pnl"] for t in trades)
-        print(f"  -> {len(trades)} trades  {w}G {len(trades)-w}P  PnL:${p:+.4f}")
+        w  = sum(1 for t in trades if t["result"] == "WIN")
+        nl = sum(1 for t in trades if t["side"]   == "long")
+        ns = sum(1 for t in trades if t["side"]   == "short")
+        p  = sum(t["pnl"] for t in trades)
+        print(f"  -> {len(trades)} trades ({nl}L/{ns}S)  {w}G {len(trades)-w}P  PnL:${p:+.4f}")
         time.sleep(0.5)
     print(f"\n  Total: {len(all_trades)} trades")
     report(all_trades, balance)

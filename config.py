@@ -38,7 +38,12 @@ PARTIAL_TP_ATR = 2.0    # multiplicador ATR para TP parcial
 TREND_LOOKBACK = 8
 TREND_THRESH   = 0.25
 SMA_PERIOD     = 50
+<<<<<<< HEAD
 LONG_ONLY_UP   = True   # v15: solo longs cuando trend="up" (WR 62-75%)
+=======
+LONG_ONLY_UP   = False  # Desactivado: strategy usa "bull/neutral/bear" no "up"
+                            # Con True bloqueaba TODAS las señales en mercado neutral
+>>>>>>> 38d7e5fdf3731b99861532b857aae38551dc1305
 
 # ══════════════════════════════════════════════════════════════
 # GESTIÓN DE CAPITAL
@@ -71,16 +76,28 @@ STOCH_RSI_ENABLED = True
 STOCH_RSI_PERIOD  = 14
 STOCH_RSI_K       = 3
 STOCH_RSI_D       = 3
+<<<<<<< HEAD
 STOCH_RSI_OB      = 80   # sobrecomprado — bloquea LONGs
 STOCH_RSI_OS      = 20   # sobrevendido  — bloquea SHORTs
 
 # ── Confirmación de vela ──────────────────────────────────
 CANDLE_CONFIRM_ENABLED  = True
+=======
+STOCH_RSI_OB      = 85   # sobrecomprado — bloquea LONGs (era 80, muy restrictivo)
+STOCH_RSI_OS      = 20   # sobrevendido  — bloquea SHORTs
+
+# ── Confirmación de vela ──────────────────────────────────
+CANDLE_CONFIRM_ENABLED  = False  # Desactivado: rechazaba señales válidas
+>>>>>>> 38d7e5fdf3731b99861532b857aae38551dc1305
 CANDLE_CONFIRM_MIN_BODY = 0.4   # cuerpo > 40% del rango
 
 # ── Volumen ───────────────────────────────────────────────
 VOLUME_CONFIRM_ENABLED = True
+<<<<<<< HEAD
 VOLUME_CONFIRM_MULT    = 0.8    # volumen actual >= 80% de la media
+=======
+VOLUME_CONFIRM_MULT    = 0.6    # volumen actual >= 60% de la media (era 0.8)
+>>>>>>> 38d7e5fdf3731b99861532b857aae38551dc1305
 VOLUME_SPIKE_ENABLED   = True
 VOLUME_SPIKE_MULT      = 1.5    # spike de volumen para señal fuerte
 

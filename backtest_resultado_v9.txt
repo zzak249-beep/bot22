@@ -1,0 +1,45 @@
+================================================================
+  BB+RSI ELITE v9 — SOLO OPERAR CON TENDENCIA (sin flat)
+  SL=1.3xATR | RSI_L<28 RSI_S>72
+  ScoreL>=60 ScoreS>=52 | R:R>=1.8
+  Tendencia dual: 5v+15v ±0.4% | EMA50 confirm | BBw>=1.5xATR
+================================================================
+  Balance inicial  : $100.00
+  Balance final    : $99.89   ROI: -0.1%
+  Total trades     : 3  (1 longs / 2 shorts)
+  Ganados/Perdidos : 1/2   WR: 33.3%
+  LONG  :   1tr  0G 1P  WR:0%  PnL:$-0.0840
+  SHORT :   2tr  1G 1P  WR:50%  PnL:$-0.0253
+  PnL total        : $-0.11
+  Ganancia media   : $+0.1874
+  Perdida media    : $-0.1484
+  Profit Factor    : 0.63
+  Expectativa/trade: $-0.0364
+  RSI medio entrada: 59.3
+  BB Width medio   : 3.92x ATR
+
+  POR PAR:
+  + OP-USDT         1tr  WR:100%  $+0.1874
+  - BNB-USDT        1tr  WR:0%  $-0.0840
+  - LTC-USDT        1tr  WR:0%  $-0.2127
+
+  POR RAZON CIERRE:
+  SL          3tr  WR:33%  $-0.1093
+
+  POR TENDENCIA AL ENTRAR:
+  - down      2tr  WR:50%  $-0.0253
+  - up        1tr  WR:0%  $-0.0840
+
+  CURVA MENSUAL:
+  - 2026-02  $-0.1093  Balance:$99.89
+
+  COMPARATIVA v7 → v8 → v9:
+  WR   : 31.7% → 41.4% → 33.3%
+  PF   :  0.36 → 0.79  → 0.63
+  ROI  :  -8.5% → -1.7% → -0.1%
+  Trades: 123 → 111 → 3
+
+  [XX] NO RENTABLE — PF=0.63  WR=33.3%  ROI=-0.1%
+================================================================
+
+Generado: 2026-03-04 11:39:00.726819

@@ -1,0 +1,54 @@
+================================================================
+  BB+RSI ELITE v13 — v11 CORE + 4H DURO + PARES CURADOS
+  SL=1.8xATR | RSI<30 | Score>=48 | R:R>=1.5
+  Tendencia: 8v ±0.25% | 4H EWM40 DURO | Vol>=1.0xMA | BBw>=1.5xATR
+================================================================
+  Balance inicial  : $100.00
+  Balance final    : $101.13   ROI: +1.1%
+  Total trades     : 16 (solo longs)
+  Ganados/Perdidos : 12/4   WR: 75.0%
+  PnL total        : $+1.13
+  Ganancia media   : $+0.1612
+  Perdida media    : $-0.2000
+  Profit Factor    : 2.42
+  Expectativa/trade: $+0.0709
+  RSI medio entrada: 24.0
+  BB Width medio   : 4.09x ATR
+  Duración media   : 23.2 velas
+
+  POR PAR:
+  + ATOM-USDT       2tr  WR:100%  $+0.3885
+  + OP-USDT         1tr  WR:100%  $+0.2081
+  + BTC-USDT        2tr  WR:100%  $+0.2010
+  + LINK-USDT       3tr  WR:67%  $+0.1990
+  + SOL-USDT        1tr  WR:100%  $+0.1490
+  + ETH-USDT        1tr  WR:100%  $+0.1223
+  + LTC-USDT        3tr  WR:67%  $+0.0910
+  - AAVE-USDT       2tr  WR:50%  $-0.0049
+  - DOT-USDT        1tr  WR:0%  $-0.2194
+
+  POR RAZON CIERRE:
+  SL          6tr  WR:33%  $-0.4500
+  TP          5tr  WR:100%  $+0.9683
+  SIGNAL      5tr  WR:100%  $+0.6163
+
+  CURVA MENSUAL:
+  - 2026-02  $-0.0044  Balance:$100.00
+  + 2026-03  $+1.1390  Balance:$101.13
+  Meses positivos/negativos: 1/1
+
+  COMPARATIVA v7→...→v11→v12→v13:
+  WR    : 31.7%→...→68.2%→58.8%→ 75.0%
+  PF    :  0.36→...→ 1.83→ 1.02→ 2.42
+  ROI   : -8.5%→...→+1.0%→+0.0%→ +1.1%
+  Trades:  123 →...→  22 →  34 → 16
+
+  NOTA PARA v14:
+  → SL rate: 38% (óptimo 40-55%)
+  → Trades: 16 (objetivo 35-55)
+  → Pares negativos (≥2tr): AAVE-USDT → evaluar eliminar
+
+  [OK] RENTABLE — PF=2.42  WR=75.0%  ROI=+1.1%
+================================================================
+
+Generado: 2026-03-04 12:06:19.427503

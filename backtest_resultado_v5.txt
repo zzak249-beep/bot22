@@ -1,0 +1,43 @@
+==============================================================
+  BB+RSI ELITE v5.2 — LONG + SHORT
+  SL=1.5xATR | RSI_L<50 RSI_S>55 | Score>=35 | R:R>=1.0
+==============================================================
+  Balance inicial  : $100.00
+  Balance final    : $86.84   ROI: -13.2%
+  Total trades     : 418  (264 longs / 154 shorts)
+  Ganados/Perdidos : 164/254   WR: 39.2%
+  LONG  : 264tr  93G 171P  WR:35%  PnL:$-10.4863
+  SHORT : 154tr  71G 83P  WR:46%  PnL:$-2.6789
+  PnL total        : $-13.17
+  Ganancia media   : $+0.1160
+  Perdida media    : $-0.1268
+  Profit Factor    : 0.59
+  Expectativa/trade: $-0.0315
+  RSI medio entrada: 43.8
+
+  POR PAR:
+  + BNB-USDT       45tr  WR:49%  $+0.1836
+  - ADA-USDT       39tr  WR:38%  $-0.6987
+  - DOGE-USDT      41tr  WR:37%  $-1.1423
+  - SOL-USDT       45tr  WR:42%  $-1.1436
+  - BTC-USDT       46tr  WR:43%  $-1.4152
+  - LINK-USDT      38tr  WR:37%  $-1.4753
+  - DOT-USDT       39tr  WR:38%  $-1.6029
+  - XRP-USDT       42tr  WR:36%  $-1.7425
+  - ETH-USDT       41tr  WR:39%  $-1.9519
+  - AVAX-USDT      42tr  WR:31%  $-2.1764
+
+  POR RAZON CIERRE:
+  SL        303tr  WR:16%  $-27.6282
+  TP         60tr  WR:100%  $+8.1572
+  SIGNAL     55tr  WR:100%  $+6.3058
+
+  CURVA MENSUAL:
+  - 2026-01  $-4.3355  Balance:$95.66
+  - 2026-02  $-10.5535  Balance:$85.11
+  + 2026-03  $+1.7238  Balance:$86.83
+
+  [XX] NO RENTABLE — PF=0.59  WR=39.2%  ROI=-13.2%
+==============================================================
+
+Generado: 2026-03-04 11:12:48.860876
