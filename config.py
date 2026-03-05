@@ -140,5 +140,8 @@ BINGX_API_KEY    = os.environ.get("BINGX_API_KEY",    "")
 BINGX_SECRET     = os.environ.get("BINGX_SECRET",     "")
 TELEGRAM_TOKEN   = os.environ.get("TG_TOKEN",         os.environ.get("TELEGRAM_TOKEN", ""))
 TELEGRAM_CHAT_ID = os.environ.get("TG_CHAT_ID",       os.environ.get("TELEGRAM_CHAT_ID", ""))
+<<<<<<< HEAD
 CB_MAX_DAILY_LOSS_PCT   = 0.05
 CB_MAX_CONSECUTIVE_LOSS = 5
+=======
+>>>>>>> c02cc637994de8190a6ef457a9f559b30ef4d425
