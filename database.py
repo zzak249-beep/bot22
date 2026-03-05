@@ -1,181 +1,323 @@
 """
-database.py — Capa de persistencia SQLite
-Tablas: trades, signals, params, learner_log
+database.py — Memoria persistente del bot v6
+Nuevos campos: parcial_cerrado, trailing_activado, sl_original
 """
+
 import sqlite3
-import logging
+import os
 from datetime import datetime
 
-log     = logging.getLogger("database")
-DB_PATH = "bot_data.db"
+DB_PATH = os.environ.get("DB_PATH", "bot22.db")
 
 
-def _conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    with _conn() as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol      TEXT,
-                side        TEXT,
-                entry_price REAL,
-                exit_price  REAL,
-                qty         REAL,
-                pnl         REAL,
-                close_reason TEXT,
-                entry_time  TEXT,
-                exit_time   TEXT,
-                balance_at_entry REAL,
-                leverage    INTEGER,
-                bb_sigma    REAL,
-                bb_period   INTEGER,
-                rsi_ob      REAL,
-                score       INTEGER,
-                trend_4h    TEXT,
-                rsi_at_entry REAL
-            );
+    conn = get_conn()
+    c = conn.cursor()
 
-            CREATE TABLE IF NOT EXISTS signals (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts          TEXT,
-                symbol      TEXT,
-                action      TEXT,
-                entry       REAL,
-                sl          REAL,
-                tp          REAL,
-                rsi         REAL,
-                score       INTEGER,
-                reason      TEXT,
-                executed    INTEGER,
-                trade_id    INTEGER
-            );
+    # Tabla principal de trades
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            par               TEXT NOT NULL,
+            lado              TEXT NOT NULL DEFAULT 'LONG',
+            precio_entrada    REAL,
+            precio_salida     REAL,
+            cantidad          REAL,
+            cantidad_inicial  REAL,
+            pnl_usd           REAL,
+            pnl_pct           REAL,
+            pnl_parcial_usd   REAL DEFAULT 0,
+            rsi_entrada       REAL,
+            bb_posicion       REAL,
+            atr_entrada       REAL,
+            sl_precio         REAL,
+            sl_original       REAL,
+            tp_precio         REAL,
+            resultado         TEXT,        -- WIN / LOSS / BE
+            motivo_cierre     TEXT,        -- SL / TP / TRAILING / MANUAL
+            parcial_cerrado   INTEGER DEFAULT 0,
+            trailing_activado INTEGER DEFAULT 0,
+            divergencia       INTEGER DEFAULT 0,
+            vol_relativo      REAL DEFAULT 1.0,
+            mtf_rsi           REAL DEFAULT 50.0,
+            score_entrada     INTEGER DEFAULT 0,
+            balance_antes     REAL,
+            balance_despues   REAL,
+            timestamp_entrada TEXT,
+            timestamp_salida  TEXT,
+            order_id_entrada  TEXT,
+            order_id_salida   TEXT
+        )
+    """)
 
-            CREATE TABLE IF NOT EXISTS params (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts          TEXT,
-                bb_period   INTEGER,
-                bb_sigma    REAL,
-                rsi_ob      REAL,
-                sl_atr      REAL,
-                note        TEXT
-            );
+    # Métricas acumuladas por par (para el learner)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metricas_par (
+            par              TEXT PRIMARY KEY,
+            total_trades     INTEGER DEFAULT 0,
+            wins             INTEGER DEFAULT 0,
+            losses           INTEGER DEFAULT 0,
+            pnl_total        REAL DEFAULT 0,
+            pf               REAL DEFAULT 0,
+            wr               REAL DEFAULT 0,
+            avg_score        REAL DEFAULT 0,
+            ultimo_trade     TEXT,
+            activo           INTEGER DEFAULT 1,
+            penalizado_hasta TEXT
+        )
+    """)
 
-            CREATE TABLE IF NOT EXISTS learner_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts          TEXT,
-                win_rate    REAL,
-                avg_win     REAL,
-                avg_loss    REAL,
-                total_pnl   REAL,
-                changes     TEXT
-            );
-        """)
-    log.info("Base de datos inicializada")
+    # Log de ajustes del learner
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS learner_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT,
+            par           TEXT,
+            accion        TEXT,
+            motivo        TEXT,
+            valor_antes   TEXT,
+            valor_despues TEXT
+        )
+    """)
+
+    # Historial de balance para compound y drawdown
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS balance_history (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            balance   REAL,
+            equity    REAL,
+            pnl_dia   REAL
+        )
+    """)
+
+    # Intentar añadir columnas nuevas a tablas existentes (migración)
+    columnas_nuevas = [
+        ("trades", "cantidad_inicial",  "REAL"),
+        ("trades", "pnl_parcial_usd",   "REAL DEFAULT 0"),
+        ("trades", "sl_original",       "REAL"),
+        ("trades", "parcial_cerrado",   "INTEGER DEFAULT 0"),
+        ("trades", "trailing_activado", "INTEGER DEFAULT 0"),
+        ("trades", "divergencia",       "INTEGER DEFAULT 0"),
+        ("trades", "vol_relativo",      "REAL DEFAULT 1.0"),
+        ("trades", "mtf_rsi",           "REAL DEFAULT 50.0"),
+        ("trades", "score_entrada",     "INTEGER DEFAULT 0"),
+        ("metricas_par", "avg_score",   "REAL DEFAULT 0"),
+    ]
+    for tabla, col, tipo in columnas_nuevas:
+        try:
+            c.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+        except sqlite3.OperationalError:
+            pass  # Columna ya existe
+
+    conn.commit()
+    conn.close()
+    print("[DB] Base de datos inicializada ✓")
 
 
-def open_trade(symbol, signal, qty, balance, leverage,
-               bb_sigma, bb_period, rsi_ob):
-    try:
-        with _conn() as c:
-            cur = c.execute(
-                """INSERT INTO trades
-                   (symbol, side, entry_price, qty, entry_time,
-                    balance_at_entry, leverage, bb_sigma, bb_period, rsi_ob,
-                    score, trend_4h, rsi_at_entry)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    symbol,
-                    signal.get("action", "buy"),
-                    signal.get("entry", 0),
-                    qty,
-                    datetime.now().isoformat(),
-                    balance,
-                    leverage,
-                    bb_sigma,
-                    bb_period,
-                    rsi_ob,
-                    signal.get("score", 0),
-                    signal.get("trend_4h", ""),
-                    signal.get("rsi", 0),
-                )
-            )
-            return cur.lastrowid
-    except Exception as e:
-        log.error(f"open_trade error: {e}")
-        return None
+def guardar_trade(data: dict):
+    conn = get_conn()
+    c = conn.cursor()
+
+    campos = [
+        "par", "lado", "precio_entrada", "precio_salida", "cantidad",
+        "cantidad_inicial", "pnl_usd", "pnl_pct", "pnl_parcial_usd",
+        "rsi_entrada", "bb_posicion", "atr_entrada",
+        "sl_precio", "sl_original", "tp_precio",
+        "resultado", "motivo_cierre",
+        "parcial_cerrado", "trailing_activado", "divergencia",
+        "vol_relativo", "mtf_rsi", "score_entrada",
+        "balance_antes", "balance_despues",
+        "timestamp_entrada", "timestamp_salida",
+        "order_id_entrada", "order_id_salida"
+    ]
+
+    placeholders = ", ".join(f":{c}" for c in campos)
+    cols_sql     = ", ".join(campos)
+
+    # Valores por defecto para campos opcionales
+    defaults = {
+        "cantidad_inicial":  data.get("cantidad", 0),
+        "pnl_parcial_usd":   0.0,
+        "sl_original":       data.get("sl_precio", 0),
+        "parcial_cerrado":   0,
+        "trailing_activado": 0,
+        "divergencia":       0,
+        "vol_relativo":      1.0,
+        "mtf_rsi":           50.0,
+        "score_entrada":     0,
+    }
+    row = {**defaults, **data}
+
+    c.execute(f"INSERT INTO trades ({cols_sql}) VALUES ({placeholders})", row)
+    conn.commit()
+    conn.close()
+    _actualizar_metricas(data["par"])
 
 
-def close_trade(trade_id, exit_price, pnl, reason):
-    if not trade_id:
+def _actualizar_metricas(par: str):
+    conn = get_conn()
+    c = conn.cursor()
+
+    rows = c.execute(
+        "SELECT resultado, pnl_usd, score_entrada FROM trades WHERE par=? ORDER BY id DESC LIMIT 50",
+        (par,)
+    ).fetchall()
+
+    if not rows:
+        conn.close()
         return
-    try:
-        with _conn() as c:
-            c.execute(
-                """UPDATE trades
-                   SET exit_price=?, pnl=?, close_reason=?, exit_time=?
-                   WHERE id=?""",
-                (exit_price, pnl, reason, datetime.now().isoformat(), trade_id)
-            )
-    except Exception as e:
-        log.error(f"close_trade error: {e}")
+
+    total    = len(rows)
+    wins     = sum(1 for r in rows if r["resultado"] == "WIN")
+    losses   = sum(1 for r in rows if r["resultado"] == "LOSS")
+    pnl      = sum(r["pnl_usd"] for r in rows)
+    scores   = [r["score_entrada"] for r in rows if r["score_entrada"]]
+    avg_score = sum(scores) / len(scores) if scores else 0
+
+    ganancias = sum(r["pnl_usd"] for r in rows if r["pnl_usd"] > 0)
+    perdidas  = abs(sum(r["pnl_usd"] for r in rows if r["pnl_usd"] < 0))
+    pf  = ganancias / perdidas if perdidas > 0 else 999.0
+    wr  = (wins / total * 100) if total > 0 else 0
+
+    c.execute("""
+        INSERT INTO metricas_par (par, total_trades, wins, losses, pnl_total, pf, wr, avg_score, ultimo_trade)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(par) DO UPDATE SET
+            total_trades=excluded.total_trades,
+            wins=excluded.wins,
+            losses=excluded.losses,
+            pnl_total=excluded.pnl_total,
+            pf=excluded.pf,
+            wr=excluded.wr,
+            avg_score=excluded.avg_score,
+            ultimo_trade=excluded.ultimo_trade
+    """, (par, total, wins, losses, pnl, pf, wr, avg_score, datetime.now().isoformat()))
+
+    conn.commit()
+    conn.close()
 
 
-def log_signal(symbol, signal, executed=False, trade_id=None):
-    try:
-        with _conn() as c:
-            c.execute(
-                """INSERT INTO signals
-                   (ts, symbol, action, entry, sl, tp, rsi, score, reason, executed, trade_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    datetime.now().isoformat(),
-                    symbol,
-                    signal.get("action", ""),
-                    signal.get("entry", 0),
-                    signal.get("sl", 0),
-                    signal.get("tp", 0),
-                    signal.get("rsi", 0),
-                    signal.get("score", 0),
-                    signal.get("reason", ""),
-                    1 if executed else 0,
-                    trade_id,
-                )
-            )
-    except Exception as e:
-        log.error(f"log_signal error: {e}")
+def get_metricas_par(par: str) -> dict:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM metricas_par WHERE par=?", (par,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
 
 
-def log_params(bb_period, bb_sigma, rsi_ob, sl_atr, note=""):
-    try:
-        with _conn() as c:
-            c.execute(
-                "INSERT INTO params (ts,bb_period,bb_sigma,rsi_ob,sl_atr,note) VALUES (?,?,?,?,?,?)",
-                (datetime.now().isoformat(), bb_period, bb_sigma, rsi_ob, sl_atr, note)
-            )
-    except Exception as e:
-        log.error(f"log_params error: {e}")
+def get_todos_pares_activos() -> list:
+    conn = get_conn()
+    rows = conn.execute("SELECT par FROM metricas_par WHERE activo=1").fetchall()
+    conn.close()
+    return [r["par"] for r in rows]
 
 
-def get_stats_summary():
-    """Devuelve estadísticas globales de todos los trades cerrados."""
-    try:
-        with _conn() as c:
-            row = c.execute("""
-                SELECT
-                    COUNT(*)                          AS total,
-                    SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END) AS wins,
-                    SUM(CASE WHEN pnl <  0 THEN 1 ELSE 0 END) AS losses,
-                    COALESCE(SUM(pnl), 0)             AS total_pnl
-                FROM trades
-                WHERE exit_time IS NOT NULL
-            """).fetchone()
-            if row:
-                return dict(row)
-    except Exception as e:
-        log.error(f"get_stats_summary error: {e}")
-    return {"total": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
+def penalizar_par(par: str, hasta: str, motivo: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE metricas_par SET activo=0, penalizado_hasta=? WHERE par=?",
+        (hasta, par)
+    )
+    conn.execute(
+        "INSERT INTO learner_log (timestamp, par, accion, motivo) VALUES (?,?,?,?)",
+        (datetime.now().isoformat(), par, "PENALIZAR", motivo)
+    )
+    conn.commit()
+    conn.close()
+
+
+def rehabilitar_par(par: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE metricas_par SET activo=1, penalizado_hasta=NULL WHERE par=?", (par,)
+    )
+    conn.execute(
+        "INSERT INTO learner_log (timestamp, par, accion, motivo) VALUES (?,?,?,?)",
+        (datetime.now().isoformat(), par, "REHABILITAR", "penalización expirada")
+    )
+    conn.commit()
+    conn.close()
+
+
+def guardar_balance(balance: float, equity: float, pnl_dia: float):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO balance_history (timestamp, balance, equity, pnl_dia) VALUES (?,?,?,?)",
+        (datetime.now().isoformat(), balance, equity, pnl_dia)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pnl_hoy() -> float:
+    conn = get_conn()
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    row = conn.execute(
+        "SELECT SUM(pnl_usd) + SUM(COALESCE(pnl_parcial_usd,0)) as total "
+        "FROM trades WHERE timestamp_salida LIKE ?",
+        (f"{hoy}%",)
+    ).fetchone()
+    conn.close()
+    return row["total"] or 0.0
+
+
+def get_ultimos_trades(n: int = 20) -> list:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_racha_perdidas_hoy() -> int:
+    conn = get_conn()
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    rows = conn.execute(
+        "SELECT resultado FROM trades WHERE timestamp_salida LIKE ? ORDER BY id DESC",
+        (f"{hoy}%",)
+    ).fetchall()
+    conn.close()
+
+    racha = 0
+    for r in rows:
+        if r["resultado"] == "LOSS":
+            racha += 1
+        else:
+            break
+    return racha
+
+
+def get_stats_resumen() -> dict:
+    """Estadísticas globales para el reporte periódico."""
+    conn = get_conn()
+    hoy  = datetime.now().strftime("%Y-%m-%d")
+
+    total  = conn.execute("SELECT COUNT(*) as n FROM trades").fetchone()["n"]
+    wins   = conn.execute("SELECT COUNT(*) as n FROM trades WHERE resultado='WIN'").fetchone()["n"]
+    losses = conn.execute("SELECT COUNT(*) as n FROM trades WHERE resultado='LOSS'").fetchone()["n"]
+    pnl_t  = conn.execute("SELECT SUM(pnl_usd) as s FROM trades").fetchone()["s"] or 0
+    pnl_h  = conn.execute(
+        "SELECT SUM(pnl_usd)+SUM(COALESCE(pnl_parcial_usd,0)) as s FROM trades WHERE timestamp_salida LIKE ?",
+        (f"{hoy}%",)
+    ).fetchone()["s"] or 0
+
+    conn.close()
+    wr = (wins / total * 100) if total > 0 else 0
+    return {
+        "total_trades": total,
+        "wins":         wins,
+        "losses":       losses,
+        "wr":           wr,
+        "pnl_total":    pnl_t,
+        "pnl_today":    pnl_h,
+    }
+
+
+if __name__ == "__main__":
+    init_db()
+    print("[DB] Tablas creadas correctamente")
