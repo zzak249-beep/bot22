@@ -1,362 +1,416 @@
 """
-exchange.py — BingX Futuros ELITE v2
-Mejoras v2:
-- API keys leídas desde variables de entorno (Railway) con fallback a config.py
-- Validación explícita de keys al arrancar
-- Retry automático (3 intentos) en errores de red
-- Verificación de mínimos de cantidad y coste por par
-- Gestión de SL por orden separada (más compatible con BingX)
-- Logs más detallados para debugging
+exchange.py — Conexión BingX Futures v6
+- Firma HMAC sin sorted() (orden de inserción = requerido por BingX)
+- parsear_klines soporta dict Y array
+- Actualizar SL en exchange (para trailing stop)
+- Cierre parcial de posición
 """
 
-import logging
-import os
+import hmac
+import hashlib
 import time
-import ccxt
-import config as cfg
+import requests
+from datetime import datetime
+import config
 
-log = logging.getLogger("exchange")
-_exchange = None
-
-PAPER_MODE = False   # True = simula sin dinero real
+BASE_URL = "https://open-api.bingx.com"
 
 
-# ──────────────────────────────────────────────
-# CONEXIÓN
-# ──────────────────────────────────────────────
+# ============================================================
+# HELPERS DE FIRMA Y HTTP
+# ============================================================
 
-def get_exchange():
-    """
-    Devuelve la instancia ccxt de BingX.
-    Lee las keys primero de variables de entorno (Railway),
-    y si no existen las busca en config.py como fallback.
-    """
-    global _exchange
-    if _exchange is None:
-        api_key = os.environ.get("BINGX_API_KEY") or getattr(cfg, "BINGX_API_KEY", "")
-        secret  = os.environ.get("BINGX_SECRET")  or getattr(cfg, "BINGX_SECRET", "")
-
-        if not api_key or not secret:
-            log.error("❌ BINGX_API_KEY o BINGX_SECRET no están configurados. "
-                      "Añádelos en Railway → Variables.")
-            return None
-
-        _exchange = ccxt.bingx({
-            "apiKey":  api_key,
-            "secret":  secret,
-            "options": {"defaultType": "swap"},
-            "timeout": 15000,
-            "enableRateLimit": True,
-        })
-        log.info("✅ Conexión BingX iniciada correctamente")
-    return _exchange
+def _sign(query_string: str) -> str:
+    return hmac.new(
+        config.BINGX_SECRET_KEY.encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
 
 
-def _retry(fn, retries=3, delay=2):
-    """Ejecuta fn hasta 'retries' veces ante errores de red."""
-    for attempt in range(retries):
+def _headers() -> dict:
+    return {
+        "X-BX-APIKEY": config.BINGX_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+
+def _build_query(params: dict) -> str:
+    """Construye query string en orden de inserción (BingX requiere esto)."""
+    return "&".join(f"{k}={v}" for k, v in params.items())
+
+
+def _get(path: str, params: dict = None, auth: bool = True) -> dict:
+    params = params or {}
+    if auth:
+        params["timestamp"] = int(time.time() * 1000)
+        qs  = _build_query(params)
+        sig = _sign(qs)
+        url = f"{BASE_URL}{path}?{qs}&signature={sig}"
         try:
-            return fn()
-        except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
-            if attempt < retries - 1:
-                log.warning(f"Error de red (intento {attempt+1}/{retries}): {e} — reintentando...")
-                time.sleep(delay)
-            else:
-                raise
-        except Exception:
-            raise
+            r    = requests.get(url, headers=_headers(), timeout=10)
+            data = r.json()
+            if config.MODO_DEBUG and data.get("code", 0) != 0:
+                print(f"[EXCHANGE] API error {path}: code={data.get('code')} | {data.get('msg','')[:100]}")
+            return data
+        except Exception as e:
+            print(f"[EXCHANGE] GET(auth) error {path}: {e}")
+            return {"code": -1, "data": None}
+    else:
+        try:
+            r = requests.get(BASE_URL + path, params=params, headers=_headers(), timeout=10)
+            return r.json()
+        except Exception as e:
+            print(f"[EXCHANGE] GET(pub) error {path}: {e}")
+            return {"code": -1, "data": None}
 
 
-# ──────────────────────────────────────────────
+def _post(path: str, params: dict) -> dict:
+    params["timestamp"] = int(time.time() * 1000)
+    qs  = _build_query(params)
+    sig = _sign(qs)
+    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
+    try:
+        r    = requests.post(url, headers=_headers(), timeout=10)
+        data = r.json()
+        if config.MODO_DEBUG and data.get("code", 0) != 0:
+            print(f"[EXCHANGE] POST error {path}: code={data.get('code')} | {data.get('msg','')[:100]}")
+        return data
+    except Exception as e:
+        print(f"[EXCHANGE] POST error {path}: {e}")
+        return {"code": -1}
+
+
+# ============================================================
 # BALANCE
-# ──────────────────────────────────────────────
+# ============================================================
 
-def get_balance():
-    if PAPER_MODE:
-        return 100.0
+def get_balance() -> float:
+    if config.MODO_DEMO:
+        return _demo_balance()
+
+    resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
     try:
-        ex  = get_exchange()
-        if ex is None:
-            return 0.0
-        bal = _retry(lambda: ex.fetch_balance({"type": "swap"}))
-        return float(bal.get("USDT", {}).get("free") or 0)
+        bal = resp.get("data", {}).get("balance", {})
+        if isinstance(bal, dict):
+            return float(bal.get("availableMargin", 0))
+        if isinstance(bal, list):
+            for item in bal:
+                if item.get("asset") == "USDT":
+                    return float(item.get("availableMargin", 0))
     except Exception as e:
-        log.error(f"Error balance: {e}")
-        return 0.0
+        print(f"[EXCHANGE] Error balance: {e}")
+    return 0.0
 
 
-def has_enough_balance(min_usdt=None):
-    if min_usdt is None:
-        min_usdt = getattr(cfg, "MIN_USDT_BALANCE", 5.0)
-    bal = get_balance()
-    if bal < min_usdt:
-        log.warning(f"Balance insuficiente: ${bal:.2f} < ${min_usdt:.2f} mínimo")
-        return False
-    return True
+def get_equity() -> float:
+    if config.MODO_DEMO:
+        return _demo_balance()
+
+    resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
+    try:
+        bal = resp.get("data", {}).get("balance", {})
+        if isinstance(bal, dict):
+            return float(bal.get("balance", 0))
+        if isinstance(bal, list):
+            for item in bal:
+                if item.get("asset") == "USDT":
+                    return float(item.get("balance", 0))
+    except Exception as e:
+        print(f"[EXCHANGE] Error equity: {e}")
+    return 0.0
 
 
-# ──────────────────────────────────────────────
+# ============================================================
+# PRECIO Y MERCADO (públicos)
+# ============================================================
+
+def get_precio(par: str) -> float:
+    resp = _get("/openApi/swap/v2/quote/price", {"symbol": par}, auth=False)
+    try:
+        data = resp.get("data", {})
+        if isinstance(data, dict):
+            return float(data.get("price", 0))
+        if isinstance(data, list) and data:
+            return float(data[0].get("price", 0))
+    except Exception as e:
+        print(f"[EXCHANGE] Error precio {par}: {e}")
+    return 0.0
+
+
+def get_klines(par: str, intervalo: str = "5m", limit: int = 100) -> list:
+    resp = _get("/openApi/swap/v3/quote/klines", {
+        "symbol": par, "interval": intervalo, "limit": limit
+    }, auth=False)
+    try:
+        data = resp.get("data", [])
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        print(f"[EXCHANGE] Error klines {par}: {e}")
+    return []
+
+
+def get_spread_pct(par: str) -> float:
+    resp = _get("/openApi/swap/v2/quote/ticker", {"symbol": par}, auth=False)
+    try:
+        data = resp.get("data", {})
+        if isinstance(data, list) and data:
+            data = data[0]
+        bid = float(data.get("bidPrice", 0))
+        ask = float(data.get("askPrice", 0))
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+            return ((ask - bid) / mid) * 100
+        vol = float(data.get("quoteVolume", 0))
+        if vol > 500_000:
+            return 0.1
+        if vol > 0:
+            return 0.5
+    except Exception as e:
+        print(f"[EXCHANGE] Error spread {par}: {e}")
+    return 999.0
+
+
+def get_volumen_24h(par: str) -> float:
+    resp = _get("/openApi/swap/v2/quote/ticker", {"symbol": par}, auth=False)
+    try:
+        data = resp.get("data", {})
+        if isinstance(data, list) and data:
+            data = data[0]
+        return float(data.get("quoteVolume", 0))
+    except Exception as e:
+        print(f"[EXCHANGE] Error volumen {par}: {e}")
+    return 0.0
+
+
+# ============================================================
+# PARSEAR KLINES — soporta dict Y array (BingX v3)
+# ============================================================
+
+def parsear_klines(klines: list) -> dict:
+    opens = []; highs = []; lows = []; closes = []; vols = []
+    for k in klines:
+        try:
+            if isinstance(k, dict):
+                opens.append( float(k.get("open",   k.get("o", 0))))
+                highs.append( float(k.get("high",   k.get("h", 0))))
+                lows.append(  float(k.get("low",    k.get("l", 0))))
+                closes.append(float(k.get("close",  k.get("c", 0))))
+                vols.append(  float(k.get("volume", k.get("v", 0))))
+            elif isinstance(k, (list, tuple)) and len(k) >= 6:
+                opens.append(float(k[1]))
+                highs.append(float(k[2]))
+                lows.append( float(k[3]))
+                closes.append(float(k[4]))
+                vols.append( float(k[5]))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return {"opens": opens, "highs": highs, "lows": lows, "closes": closes, "vols": vols}
+
+
+# ============================================================
 # APALANCAMIENTO
-# ──────────────────────────────────────────────
+# ============================================================
 
-def set_leverage(symbol, side="BOTH"):
-    if PAPER_MODE:
+def set_leverage(par: str, leverage: int) -> bool:
+    if config.MODO_DEMO:
         return True
-    ex = get_exchange()
-    if ex is None:
-        return False
-    try:
-        try:
-            ex.set_leverage(cfg.LEVERAGE, symbol, params={"side": side})
-        except Exception:
-            ex.set_leverage(cfg.LEVERAGE, symbol, params={"side": "BOTH"})
-        log.debug(f"Leverage {cfg.LEVERAGE}x aplicado a {symbol}")
-        return True
-    except Exception as e:
-        log.warning(f"Leverage no aplicado {symbol}: {e}")
-        return False
+    resp = _post("/openApi/swap/v2/trade/leverage", {
+        "symbol": par, "side": "LONG", "leverage": leverage
+    })
+    ok = resp.get("code") == 0
+    if config.MODO_DEBUG:
+        estado = "ok" if ok else resp.get("msg", "error")
+        print(f"[EXCHANGE] Leverage {par} {leverage}x → {estado}")
+    return ok
 
 
-# ──────────────────────────────────────────────
-# CANTIDAD MÍNIMA POR PAR
-# ──────────────────────────────────────────────
+# ============================================================
+# CALCULAR CANTIDAD
+# ============================================================
 
-def _adjust_qty(ex, symbol, qty, price):
+def calcular_cantidad(par: str, balance: float, precio: float) -> float:
+    if balance <= 0 or precio <= 0:
+        return 0.0
+    capital  = balance * config.RIESGO_POR_TRADE * config.LEVERAGE
+    cantidad = capital / precio
+    return round(cantidad, 4) if cantidad >= 0.0001 else 0.0
+
+
+# ============================================================
+# ÓRDENES
+# ============================================================
+
+def abrir_long(par: str, cantidad: float, precio_entrada: float,
+               sl: float, tp: float) -> dict:
+    if config.MODO_DEMO:
+        return _demo_orden(par, "BUY", cantidad, precio_entrada, sl, tp)
+
+    # Orden de mercado
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol": par, "side": "BUY",
+        "positionSide": "LONG", "type": "MARKET",
+        "quantity": str(cantidad),
+    })
+
+    if resp.get("code") != 0:
+        print(f"[EXCHANGE] Error LONG {par}: {resp}")
+        return {}
+
+    order_id = str(resp.get("data", {}).get("orderId", ""))
+
+    # Stop Loss
+    _post("/openApi/swap/v2/trade/order", {
+        "symbol": par, "side": "SELL", "positionSide": "LONG",
+        "type": "STOP_MARKET", "quantity": str(cantidad),
+        "stopPrice": str(round(sl, 6)), "workingType": "MARK_PRICE"
+    })
+
+    # Take Profit
+    _post("/openApi/swap/v2/trade/order", {
+        "symbol": par, "side": "SELL", "positionSide": "LONG",
+        "type": "TAKE_PROFIT_MARKET", "quantity": str(cantidad),
+        "stopPrice": str(round(tp, 6)), "workingType": "MARK_PRICE"
+    })
+
+    if config.MODO_DEBUG:
+        print(f"[EXCHANGE] LONG {par} qty:{cantidad} SL:{sl:.6f} TP:{tp:.6f}")
+
+    return {
+        "order_id": order_id, "par": par, "lado": "LONG",
+        "cantidad": cantidad, "precio_entrada": precio_entrada,
+        "sl": sl, "tp": tp, "timestamp": datetime.now().isoformat()
+    }
+
+
+def actualizar_sl(par: str, cantidad: float, nuevo_sl: float) -> bool:
     """
-    Ajusta qty para respetar los mínimos del par en BingX.
-    Devuelve qty ajustada o None si es imposible.
+    Cancela el SL existente y pone uno nuevo.
+    Usado por trailing stop y breakeven.
     """
+    if config.MODO_DEMO:
+        if config.MODO_DEBUG:
+            print(f"[DEMO] Actualizar SL {par} → {nuevo_sl:.6f}")
+        return True
+
+    # Cancelar órdenes abiertas del par (SL anterior)
+    cancelar_ordenes_abiertas(par)
+
+    # Poner nuevo SL
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol": par, "side": "SELL", "positionSide": "LONG",
+        "type": "STOP_MARKET", "quantity": str(cantidad),
+        "stopPrice": str(round(nuevo_sl, 6)), "workingType": "MARK_PRICE"
+    })
+
+    ok = resp.get("code") == 0
+    if config.MODO_DEBUG:
+        estado = "ok" if ok else resp.get("msg", "error")
+        print(f"[EXCHANGE] SL actualizado {par} → {nuevo_sl:.6f} [{estado}]")
+    return ok
+
+
+def cerrar_parcial(par: str, cantidad_parcial: float) -> dict:
+    """
+    Cierra una fracción de la posición (para cierre parcial al TP50).
+    """
+    if config.MODO_DEMO:
+        precio = get_precio(par)
+        if config.MODO_DEBUG:
+            print(f"[DEMO] Cierre parcial {par} qty:{cantidad_parcial} @ {precio:.6f}")
+        return {"order_id": f"demo_parcial_{int(time.time())}", "precio_salida": precio}
+
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol": par, "side": "SELL",
+        "positionSide": "LONG", "type": "MARKET",
+        "quantity": str(round(cantidad_parcial, 4)),
+    })
+
+    if resp.get("code") != 0:
+        print(f"[EXCHANGE] Error cierre parcial {par}: {resp}")
+        return {}
+
+    return {
+        "order_id":     str(resp.get("data", {}).get("orderId", "")),
+        "precio_salida": get_precio(par)
+    }
+
+
+def cerrar_posicion(par: str, cantidad: float) -> dict:
+    if config.MODO_DEMO:
+        return {"order_id": f"demo_close_{int(time.time())}", "precio_salida": get_precio(par)}
+
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol": par, "side": "SELL",
+        "positionSide": "LONG", "type": "MARKET",
+        "quantity": str(cantidad),
+    })
+
+    if resp.get("code") != 0:
+        print(f"[EXCHANGE] Error cerrando {par}: {resp}")
+        return {}
+
+    cancelar_ordenes_abiertas(par)
+    return {
+        "order_id":     str(resp.get("data", {}).get("orderId", "")),
+        "precio_salida": get_precio(par)
+    }
+
+
+def cancelar_ordenes_abiertas(par: str):
+    if config.MODO_DEMO:
+        return
+    _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
+
+
+def get_posiciones_abiertas() -> list:
+    if config.MODO_DEMO:
+        return _demo_posiciones()
+    resp = _get("/openApi/swap/v2/user/positions", {}, auth=True)
     try:
-        market   = ex.market(symbol)
-        limits   = market.get("limits", {})
-        min_qty  = float(limits.get("amount", {}).get("min") or 0)
-        min_cost = float(limits.get("cost",   {}).get("min") or 0)
-
-        if min_qty > 0 and qty < min_qty:
-            log.warning(f"Qty {qty:.6f} < mínimo {min_qty:.6f} → ajustando")
-            qty = min_qty
-
-        if min_cost > 0 and qty * price < min_cost:
-            qty = round(min_cost / price * 1.05, 6)
-            log.warning(f"Coste mínimo ${min_cost} → qty ajustada a {qty:.6f}")
-
-        # Redondear al precision del par
-        precision = market.get("precision", {}).get("amount")
-        if precision:
-            qty = round(qty, int(precision))
-
-    except Exception as e:
-        log.debug(f"No se pudo verificar mínimos {symbol}: {e}")
-
-    return qty if qty > 0 else None
-
-
-# ──────────────────────────────────────────────
-# POSICIONES ABIERTAS
-# ──────────────────────────────────────────────
-
-def get_open_positions():
-    if PAPER_MODE:
+        posiciones = resp.get("data", []) or []
+        return [p for p in posiciones if float(p.get("positionAmt", 0)) != 0]
+    except:
         return []
-    ex = get_exchange()
-    if ex is None:
-        return []
-    try:
-        positions = _retry(lambda: ex.fetch_positions())
-        open_pos  = []
-        for p in positions:
-            if float(p.get("contracts") or 0) != 0:
-                open_pos.append({
-                    "symbol":  p["symbol"],
-                    "side":    p["side"],
-                    "entry":   float(p.get("entryPrice")    or 0),
-                    "current": float(p.get("markPrice")     or 0),
-                    "qty":     float(p.get("contracts")     or 0),
-                    "pnl":     float(p.get("unrealizedPnl") or 0),
-                    "sl":      float(p.get("stopLossPrice") or 0),
-                })
-        return open_pos
-    except Exception as e:
-        log.error(f"Error posiciones: {e}")
-        return []
 
 
-# ──────────────────────────────────────────────
-# ABRIR LONG
-# ──────────────────────────────────────────────
-
-def open_long(symbol, signal):
-    price = signal["entry"]
-    sl    = signal["sl"]
-    tp    = signal["tp"]
-
-    if PAPER_MODE:
-        bal = get_balance()
-        qty = round((bal * cfg.RISK_PCT * cfg.LEVERAGE) / price, 4) or 0.001
-        log.info(f"[PAPER] LONG {symbol} qty={qty} @ {price} | SL={sl} TP={tp}")
-        return {"symbol": symbol, "qty": qty, "entry": price,
-                "sl": sl, "tp": tp, "tp_partial": signal.get("tp_partial"), "side": "long"}
-
-    ex = get_exchange()
-    if ex is None:
-        return None
-
-    try:
-        if price <= 0 or sl >= price:
-            log.error(f"Señal inválida LONG {symbol}: price={price} sl={sl}")
-            return None
-
-        bal = get_balance()
-        qty = round((bal * cfg.RISK_PCT * cfg.LEVERAGE) / price, 6)
-        qty = _adjust_qty(ex, symbol, qty, price)
-        if qty is None:
-            log.error(f"Qty inválida para {symbol} con balance ${bal:.2f}")
-            return None
-
-        set_leverage(symbol, side="LONG")
-
-        # Orden de entrada
-        _retry(lambda: ex.create_order(
-            symbol=symbol, type="market", side="buy", amount=qty
-        ))
-        log.info(f"✅ LONG abierto: {symbol} qty={qty} @ ~{price:.4f}")
-
-        # Stop Loss
-        try:
-            _retry(lambda: ex.create_order(
-                symbol=symbol, type="stop_market", side="sell",
-                amount=qty, params={"stopPrice": sl, "reduceOnly": True}
-            ))
-            log.info(f"   SL fijado: {sl:.4f}")
-        except Exception as e:
-            log.warning(f"   ⚠️ SL no aplicado automáticamente ({sl:.4f}): {e}")
-
-        return {"symbol": symbol, "qty": qty, "entry": price,
-                "sl": sl, "tp": tp, "tp_partial": signal.get("tp_partial"), "side": "long"}
-
-    except Exception as e:
-        log.error(f"❌ Error abriendo LONG {symbol}: {e}")
-        return None
+def get_posicion(par: str) -> dict:
+    for p in get_posiciones_abiertas():
+        if p.get("symbol") == par:
+            return p
+    return {}
 
 
-# ──────────────────────────────────────────────
-# ABRIR SHORT
-# ──────────────────────────────────────────────
+# ============================================================
+# MODO DEMO
+# ============================================================
 
-def open_short(symbol, signal):
-    price = signal["entry"]
-    sl    = signal["sl"]
-    tp    = signal["tp"]
-
-    if PAPER_MODE:
-        bal = get_balance()
-        qty = round((bal * cfg.RISK_PCT * cfg.LEVERAGE) / price, 4) or 0.001
-        log.info(f"[PAPER] SHORT {symbol} qty={qty} @ {price} | SL={sl} TP={tp}")
-        return {"symbol": symbol, "qty": qty, "entry": price,
-                "sl": sl, "tp": tp, "tp_partial": signal.get("tp_partial"), "side": "short"}
-
-    ex = get_exchange()
-    if ex is None:
-        return None
-
-    try:
-        if price <= 0 or sl <= price:
-            log.error(f"Señal inválida SHORT {symbol}: price={price} sl={sl}")
-            return None
-
-        bal = get_balance()
-        qty = round((bal * cfg.RISK_PCT * cfg.LEVERAGE) / price, 6)
-        qty = _adjust_qty(ex, symbol, qty, price)
-        if qty is None:
-            log.error(f"Qty inválida SHORT {symbol} con balance ${bal:.2f}")
-            return None
-
-        set_leverage(symbol, side="SHORT")
-
-        _retry(lambda: ex.create_order(
-            symbol=symbol, type="market", side="sell", amount=qty
-        ))
-        log.info(f"✅ SHORT abierto: {symbol} qty={qty} @ ~{price:.4f}")
-
-        try:
-            _retry(lambda: ex.create_order(
-                symbol=symbol, type="stop_market", side="buy",
-                amount=qty, params={"stopPrice": sl, "reduceOnly": True}
-            ))
-            log.info(f"   SL SHORT fijado: {sl:.4f}")
-        except Exception as e:
-            log.warning(f"   ⚠️ SL SHORT no aplicado ({sl:.4f}): {e}")
-
-        return {"symbol": symbol, "qty": qty, "entry": price,
-                "sl": sl, "tp": tp, "tp_partial": signal.get("tp_partial"), "side": "short"}
-
-    except Exception as e:
-        log.error(f"❌ Error abriendo SHORT {symbol}: {e}")
-        return None
+_demo_state = {"balance": None}
+_demo_pos   = {}
 
 
-# ──────────────────────────────────────────────
-# CERRAR POSICIONES
-# ──────────────────────────────────────────────
-
-def close_long(symbol, qty):
-    if PAPER_MODE:
-        log.info(f"[PAPER] LONG cerrado: {symbol} qty={qty}")
-        return True
-    ex = get_exchange()
-    if ex is None:
-        return False
-    try:
-        _retry(lambda: ex.create_order(
-            symbol=symbol, type="market", side="sell",
-            amount=qty, params={"reduceOnly": True}
-        ))
-        log.info(f"✅ LONG cerrado: {symbol} qty={qty}")
-        return True
-    except Exception as e:
-        log.error(f"❌ Error cerrando LONG {symbol}: {e}")
-        return False
+def _demo_balance() -> float:
+    if _demo_state["balance"] is None:
+        _demo_state["balance"] = config.BALANCE_INICIAL
+    return _demo_state["balance"]
 
 
-def close_short(symbol, qty):
-    if PAPER_MODE:
-        log.info(f"[PAPER] SHORT cerrado: {symbol} qty={qty}")
-        return True
-    ex = get_exchange()
-    if ex is None:
-        return False
-    try:
-        _retry(lambda: ex.create_order(
-            symbol=symbol, type="market", side="buy",
-            amount=qty, params={"reduceOnly": True}
-        ))
-        log.info(f"✅ SHORT cerrado: {symbol} qty={qty}")
-        return True
-    except Exception as e:
-        log.error(f"❌ Error cerrando SHORT {symbol}: {e}")
-        return False
+def demo_actualizar_balance(pnl: float):
+    _demo_state["balance"] = _demo_balance() + pnl
+    print(f"[DEMO] Balance: ${_demo_state['balance']:.2f} (PnL: ${pnl:+.4f})")
 
 
-# ──────────────────────────────────────────────
-# CANCELAR ÓRDENES PENDIENTES (SL huérfanos)
-# ──────────────────────────────────────────────
+def _demo_orden(par, lado, cantidad, precio, sl, tp) -> dict:
+    oid = f"demo_{int(time.time())}"
+    _demo_pos[par] = {
+        "par": par, "lado": lado, "cantidad": cantidad,
+        "precio_entrada": precio, "sl": sl, "tp": tp,
+        "order_id": oid, "timestamp": datetime.now().isoformat()
+    }
+    print(f"[DEMO] {lado} {par} qty:{cantidad} entrada:{precio:.6f} SL:{sl:.6f} TP:{tp:.6f}")
+    return _demo_pos[par].copy()
 
-def cancel_open_orders(symbol):
-    """Cancela órdenes pendientes de un par (útil tras cerrar posición manualmente)."""
-    if PAPER_MODE:
-        return True
-    ex = get_exchange()
-    if ex is None:
-        return False
-    try:
-        orders = _retry(lambda: ex.fetch_open_orders(symbol))
-        for o in orders:
-            try:
-                ex.cancel_order(o["id"], symbol)
-                log.info(f"Orden cancelada: {o['id']} {symbol}")
-            except Exception as e:
-                log.warning(f"No se pudo cancelar orden {o['id']}: {e}")
-        return True
-    except Exception as e:
-        log.error(f"Error cancelando órdenes {symbol}: {e}")
-        return False
+
+def _demo_posiciones() -> list:
+    return list(_demo_pos.values())
