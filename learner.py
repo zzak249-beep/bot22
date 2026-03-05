@@ -1,398 +1,448 @@
 """
-learner.py — Motor de aprendizaje v6 ELITE
-Mejoras v6:
-  - Analisis por hora del dia (detecta horas ganadoras/perdedoras)
-  - Deteccion de regimen de mercado (trending/sideways/volatile)
-  - Blacklist automatica de pares cronicamente perdedores
-  - Patron 5: trades muy cortos (ruido de mercado)
-  - Patron 6: R:R insuficiente en ganadores
-  - Compound mejorado con penalizacion en drawdown severo
+learner.py — Aprendizaje adaptativo v6
+MEJORAS:
+  - Persiste los parámetros aprendidos en config.py en disco
+  - Evalúa score promedio de las señales (no solo WR/PF)
+  - Penalización proporcional (más agresiva si el par es muy malo)
+  - Rehabilitación gradual (prueba con tamaño reducido)
+  - Detección mejorada de horas malas
 """
-import logging
-import sqlite3
+
 import json
+import os
+import re
 from datetime import datetime, timedelta
-from collections import defaultdict
-import config as cfg
+import config
+import database
+import notifier
 
-log = logging.getLogger("learner")
-
-REVIEW_EVERY = 10
-MIN_TRADES   = 5
-DB_PATH      = "bot_data.db"  # FIX: era trades.db — database.py usa bot_data.db
-
-_symbol_blacklist: set = set()
+ESTADO_FILE = "learner_estado.json"
 
 
-# ═══════════════════════════════════════════════════════════
-# COMPOUND — reinversion de ganancias
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# ESTADO PERSISTENTE
+# ============================================================
 
-def update_compound(current_balance: float, initial_balance: float):
+def _cargar_estado() -> dict:
+    if os.path.exists(ESTADO_FILE):
+        try:
+            with open(ESTADO_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[LEARNER] Error cargando estado: {e}")
+    return {
+        "ultima_evaluacion": None,
+        "rsi_optimo":        config.RSI_OVERSOLD,
+        "sl_optimo":         config.SL_ATR_MULT,
+        "tp_optimo":         config.TP_ATR_MULT,
+        "horas_malas":       [],
+        "pares_penalizados": {},
+        "historial_ajustes": []
+    }
+
+
+def _guardar_estado(estado: dict):
+    try:
+        with open(ESTADO_FILE, "w") as f:
+            json.dump(estado, f, indent=2)
+    except Exception as e:
+        print(f"[LEARNER] Error guardando estado: {e}")
+
+
+def _persistir_config_disco(rsi: float, sl: float, tp: float):
     """
-    Escala RISK_PCT segun crecimiento del balance.
-    Penaliza mas agresivamente en drawdown > 15%.
+    Actualiza config.py en disco con los valores aprendidos.
+    Usa regex para reemplazar solo la línea correspondiente,
+    manteniendo el resto del archivo intacto.
     """
-    if initial_balance <= 0 or current_balance <= 0:
+    if not config.LEARNER_PERSISTIR:
         return
 
-    BASE_RISK = 0.015
-    MIN_RISK  = 0.005
-    MAX_RISK  = 0.03
-    growth    = current_balance / initial_balance
+    config_path = os.path.join(os.path.dirname(__file__), "config.py")
+    if not os.path.exists(config_path):
+        return
 
-    if growth <= 0.85:
-        new_risk = MIN_RISK                             # drawdown > 15%: minimo absoluto
-    elif growth <= 1.0:
-        new_risk = max(BASE_RISK * growth, MIN_RISK)   # drawdown leve: reducir
-    else:
-        scale    = 1.0 + (growth - 1.0) * 0.35
-        new_risk = min(BASE_RISK * scale, MAX_RISK)    # ganancia: escalar conservador
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            contenido = f.read()
 
-    if abs(new_risk - cfg.RISK_PCT) > 0.001:
-        old = cfg.RISK_PCT
-        cfg.RISK_PCT = round(new_risk, 4)
-        log.info(f"Compound: ${current_balance:.2f} (x{growth:.2f}) → RISK {old:.3f}→{cfg.RISK_PCT:.3f}")
+        reemplazos = {
+            r"^RSI_OVERSOLD\s*=\s*[\d.]+": f"RSI_OVERSOLD     = {int(rsi)}",
+            r"^SL_ATR_MULT\s*=\s*[\d.]+":  f"SL_ATR_MULT      = {sl}",
+            r"^TP_ATR_MULT\s*=\s*[\d.]+":  f"TP_ATR_MULT      = {tp}",
+        }
 
+        for patron, reemplazo in reemplazos.items():
+            contenido = re.sub(patron, reemplazo, contenido, flags=re.MULTILINE)
 
-# ═══════════════════════════════════════════════════════════
-# KELLY CRITERION
-# ═══════════════════════════════════════════════════════════
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(contenido)
 
-def calc_kelly_risk(win_rate: float, avg_win: float, avg_loss: float) -> float:
-    if avg_loss <= 0 or win_rate <= 0:
-        return cfg.RISK_PCT
-    rr            = avg_win / avg_loss
-    kelly         = win_rate - (1 - win_rate) / rr
-    quarter_kelly = max(0.0, kelly) * 0.25
-    return round(max(0.005, min(0.03, quarter_kelly)), 4)
+        print(f"[LEARNER] config.py actualizado: RSI={int(rsi)} SL={sl} TP={tp}")
+    except Exception as e:
+        print(f"[LEARNER] Error actualizando config.py en disco: {e}")
 
 
-# ═══════════════════════════════════════════════════════════
-# ANALISIS POR HORA DEL DIA
-# ═══════════════════════════════════════════════════════════
-
-def analyze_hour_performance(trades: list) -> dict:
-    """
-    Detecta en que horas UTC el bot gana y pierde sistematicamente.
-    """
-    hour_stats = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
-    for t in trades:
-        ts = t.get("entry_time") or t.get("opened_at") or t.get("closed_at")
-        if not ts:
-            continue
-        try:
-            hour = datetime.fromisoformat(str(ts)).hour
-        except Exception:
-            continue
-        pnl = t.get("pnl", 0)
-        if pnl >= 0:
-            hour_stats[hour]["wins"] += 1
-        else:
-            hour_stats[hour]["losses"] += 1
-        hour_stats[hour]["pnl"] += pnl
-
-    bad_hours  = []
-    good_hours = []
-    for hour, s in hour_stats.items():
-        total = s["wins"] + s["losses"]
-        if total < 3:
-            continue
-        wr = s["wins"] / total
-        if wr < 0.30 and s["pnl"] < 0:
-            bad_hours.append(hour)
-        elif wr > 0.60 and s["pnl"] > 0:
-            good_hours.append(hour)
-
-    if bad_hours:
-        log.info(f"Horas malas detectadas (WR<30%): {sorted(bad_hours)} UTC")
-    if good_hours:
-        log.info(f"Horas buenas detectadas (WR>60%): {sorted(good_hours)} UTC")
-
-    return {"bad_hours": bad_hours, "good_hours": good_hours}
+def necesita_evaluacion() -> bool:
+    estado = _cargar_estado()
+    ultima = estado.get("ultima_evaluacion")
+    if not ultima:
+        return True
+    dt = datetime.fromisoformat(ultima)
+    return datetime.now() - dt > timedelta(hours=config.LEARNER_CICLO_H)
 
 
-# ═══════════════════════════════════════════════════════════
-# BLACKLIST DE PARES PERDEDORES
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# ANÁLISIS DE TRADES
+# ============================================================
 
-def update_symbol_blacklist(trades: list) -> set:
-    """
-    Añade a blacklist pares con WR < 25% en >= 6 trades.
-    Los rehabilita si mejoran.
-    """
-    sym_stats = defaultdict(lambda: {"wins": 0, "total": 0, "pnl": 0.0})
-    for t in trades:
-        sym = t.get("symbol", "")
-        if not sym:
-            continue
-        sym_stats[sym]["total"] += 1
-        if t.get("pnl", 0) >= 0:
-            sym_stats[sym]["wins"] += 1
-        sym_stats[sym]["pnl"] += t.get("pnl", 0)
-
-    new_blacklist = set()
-    for sym, s in sym_stats.items():
-        if s["total"] >= 6:
-            wr = s["wins"] / s["total"]
-            if wr < 0.25 and s["pnl"] < -2.0:
-                new_blacklist.add(sym)
-
-    global _symbol_blacklist
-    added   = new_blacklist - _symbol_blacklist
-    removed = _symbol_blacklist - new_blacklist
-    if added:
-        log.warning(f"Blacklist añadidos: {added}")
-    if removed:
-        log.info(f"Blacklist rehabilitados: {removed}")
-
-    _symbol_blacklist = new_blacklist
-
-    if new_blacklist and cfg.SYMBOLS:
-        before       = len(cfg.SYMBOLS)
-        cfg.SYMBOLS  = [s for s in cfg.SYMBOLS if s not in new_blacklist]
-        if len(cfg.SYMBOLS) < before:
-            log.info(f"SYMBOLS: {before} → {len(cfg.SYMBOLS)} (blacklist)")
-
-    return new_blacklist
-
-
-def get_blacklist() -> set:
-    return _symbol_blacklist
-
-
-# ═══════════════════════════════════════════════════════════
-# DETECCION DE REGIMEN DE MERCADO
-# ═══════════════════════════════════════════════════════════
-
-def detect_market_regime(trades: list) -> str:
-    """
-    Detecta regimen: 'trending', 'sideways', 'volatile'.
-    Ajusta parametros segun regimen.
-    """
-    if len(trades) < 8:
-        return "unknown"
-
-    recent    = trades[:8]
-    pnls      = [t.get("pnl", 0) for t in recent]
-    tp_closes = sum(1 for t in recent if t.get("close_reason", "") in ("TP", "TP1_30%", "TP2_40%", "TP3", "SIGNAL"))
-    sl_closes = sum(1 for t in recent if t.get("close_reason", "") == "SL")
-    avg_pnl   = sum(pnls) / len(pnls)
-    pnl_var   = sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls)
-
-    if tp_closes >= 5 and avg_pnl > 0:
-        regime = "trending"
-    elif sl_closes >= 5 and pnl_var > 1.0:
-        regime = "volatile"
-    else:
-        regime = "sideways"
-
-    log.info(f"Regimen: {regime} | TP={tp_closes} SL={sl_closes} AvgPnL=${avg_pnl:.2f}")
-
-    if regime == "trending" and cfg.SL_ATR < 3.0:
-        cfg.SL_ATR = round(min(cfg.SL_ATR + 0.2, 3.0), 1)
-        log.info(f"Trending → SL_ATR ampliado a {cfg.SL_ATR}")
-    elif regime == "sideways" and cfg.BB_SIGMA < 2.3:
-        cfg.BB_SIGMA = round(min(cfg.BB_SIGMA + 0.1, 2.3), 1)
-        log.info(f"Sideways → BB_SIGMA endurecido a {cfg.BB_SIGMA}")
-    elif regime == "volatile":
-        cfg.RISK_PCT = max(cfg.RISK_PCT * 0.8, 0.005)
-        cfg.SL_ATR   = round(min(cfg.SL_ATR + 0.3, 4.0), 1)
-        log.info(f"Volatile → RISK={cfg.RISK_PCT:.3f} SL_ATR={cfg.SL_ATR}")
-
-    return regime
-
-
-# ═══════════════════════════════════════════════════════════
-# PATRONES DE ERROR
-# ═══════════════════════════════════════════════════════════
-
-def analyze_losing_patterns(trades: list) -> dict:
+def _analizar_trades(trades: list) -> dict:
+    """Extrae patrones de wins vs losses."""
     if not trades:
         return {}
 
-    losing  = [t for t in trades if t.get("pnl", 0) < 0]
-    winning = [t for t in trades if t.get("pnl", 0) > 0]
+    wins   = [t for t in trades if t.get("resultado") == "WIN"]
+    losses = [t for t in trades if t.get("resultado") == "LOSS"]
+    total  = len(trades)
 
-    if not losing:
-        return {}
+    analisis = {
+        "total":  total,
+        "wins":   len(wins),
+        "losses": len(losses),
+        "wr":     len(wins) / total * 100 if total else 0,
+    }
 
-    adjustments = {}
-    patterns    = []
+    # RSI promedio
+    if wins:
+        analisis["rsi_wins"]  = sum(t.get("rsi_entrada", 30) for t in wins) / len(wins)
+    if losses:
+        analisis["rsi_losses"]= sum(t.get("rsi_entrada", 30) for t in losses) / len(losses)
 
-    # Patron 1: RSI alto en perdidas
-    l_rsi = [t.get("rsi_at_entry", 50) for t in losing  if t.get("rsi_at_entry")]
-    w_rsi = [t.get("rsi_at_entry", 50) for t in winning if t.get("rsi_at_entry")]
-    if l_rsi and w_rsi:
-        avg_lr = sum(l_rsi) / len(l_rsi)
-        avg_wr = sum(w_rsi) / len(w_rsi)
-        if avg_lr > avg_wr + 5:
-            new_ob = max(30, cfg.RSI_OB - 3)
-            if new_ob != cfg.RSI_OB:
-                adjustments["RSI_OB"] = new_ob
-                patterns.append(f"RSI alto en perdidas ({avg_lr:.1f} vs {avg_wr:.1f})")
+    # BB posición promedio
+    if wins:
+        analisis["bb_wins"]   = sum(t.get("bb_posicion", 0.5) for t in wins) / len(wins)
+    if losses:
+        analisis["bb_losses"] = sum(t.get("bb_posicion", 0.5) for t in losses) / len(losses)
 
-    # Patron 2: SL muy ajustado
-    sl_hits  = [t for t in losing if t.get("close_reason", "") == "SL"]
-    sl_ratio = len(sl_hits) / len(losing) if losing else 0
-    if sl_ratio > 0.7:
-        new_sl = min(cfg.SL_ATR + 0.3, 4.0)
-        if new_sl != cfg.SL_ATR:
-            adjustments["SL_ATR"] = round(new_sl, 1)
-            patterns.append(f"SL muy ajustado ({sl_ratio*100:.0f}% son SL)")
+    # Score promedio wins vs losses
+    if wins:
+        analisis["score_wins"]  = sum(t.get("score_entrada", 50) for t in wins) / len(wins)
+    if losses:
+        analisis["score_losses"]= sum(t.get("score_entrada", 50) for t in losses) / len(losses)
 
-    # Patron 3: BB Sigma bajo
-    if len(losing) > len(winning) and cfg.BB_SIGMA < 2.2:
-        new_sigma = round(min(cfg.BB_SIGMA + 0.1, 2.5), 1)
-        adjustments["BB_SIGMA"] = new_sigma
-        patterns.append("Muchas perdidas: endurecer BB_SIGMA")
-
-    # Patron 4: Longs contra tendencia 4h
-    bear_losses = [t for t in losing if t.get("trend_4h") == "bear" and t.get("side") == "long"]
-    if len(bear_losses) > 2:
-        patterns.append("Longs contra tendencia bajista 4h")
-
-    # Patron 5: Trades cerrados en menos de 30 min (ruido)
-    short_trades = []
-    for t in losing:
+    # Horas con muchos losses
+    horas_loss = {}
+    for t in losses:
+        ts = t.get("timestamp_entrada", "")
         try:
-            opened = datetime.fromisoformat(str(t.get("entry_time", "")))
-            closed = datetime.fromisoformat(str(t.get("exit_time", "")))
-            if (closed - opened).total_seconds() / 60 < 30:
-                short_trades.append(t)
-        except Exception:
+            hora = int(ts[11:13])
+            horas_loss[hora] = horas_loss.get(hora, 0) + 1
+        except:
             pass
-    if len(short_trades) > 3:
-        patterns.append(f"{len(short_trades)} trades < 30min (ruido)")
-        if cfg.SL_ATR < 3.0:
-            adjustments["SL_ATR"] = round(min(cfg.SL_ATR + 0.2, 3.0), 1)
+    analisis["horas_loss"] = horas_loss
 
-    # Patron 6: R:R bajo en ganadores
-    if winning:
-        avg_win_pnl  = sum(t.get("pnl", 0) for t in winning) / len(winning)
-        avg_loss_pnl = abs(sum(t.get("pnl", 0) for t in losing)) / len(losing)
-        rr = avg_win_pnl / avg_loss_pnl if avg_loss_pnl > 0 else 0
-        if rr < 1.0:
-            patterns.append(f"R:R bajo ({rr:.2f}) — TP demasiado conservador")
+    # PnL promedio
+    if wins:
+        analisis["avg_win"]  = sum(t.get("pnl_usd", 0) for t in wins) / len(wins)
+    if losses:
+        analisis["avg_loss"] = abs(sum(t.get("pnl_usd", 0) for t in losses) / len(losses))
 
-    if patterns:
-        log.info(f"Patrones detectados: {' | '.join(patterns)}")
-
-    return adjustments
+    return analisis
 
 
-# ═══════════════════════════════════════════════════════════
-# ANALISIS Y AJUSTE PRINCIPAL
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# AJUSTE DE RSI
+# ============================================================
 
-def should_review(trades_closed: int) -> bool:
-    return trades_closed >= REVIEW_EVERY and trades_closed % REVIEW_EVERY == 0
+def _ajustar_rsi(estado: dict, analisis: dict) -> tuple:
+    ajustes    = []
+    rsi_actual = estado.get("rsi_optimo", config.RSI_OVERSOLD)
+    wr         = analisis.get("wr", 50)
+    rsi_wins   = analisis.get("rsi_wins")
+    rsi_losses = analisis.get("rsi_losses")
+
+    # Si wins tienen RSI más bajo → ser más selectivo
+    if rsi_wins and rsi_losses and rsi_wins < rsi_losses - 2:
+        nuevo = max(20, rsi_actual - 1)
+        if nuevo != rsi_actual:
+            ajustes.append(f"RSI {rsi_actual}→{nuevo} (wins con RSI más bajo)")
+            estado["rsi_optimo"] = nuevo
+
+    # Si losses tienen RSI muy bajo → relajar un poco
+    elif rsi_wins and rsi_losses and rsi_losses < rsi_wins - 2:
+        nuevo = min(40, rsi_actual + 1)
+        if nuevo != rsi_actual:
+            ajustes.append(f"RSI {rsi_actual}→{nuevo} (losses con RSI muy bajo)")
+            estado["rsi_optimo"] = nuevo
+
+    # WR muy baja → más restrictivo
+    if wr < 35 and rsi_actual > 22:
+        nuevo = rsi_actual - 2
+        if nuevo != rsi_actual:
+            ajustes.append(f"RSI {rsi_actual}→{nuevo} (WR baja: {wr:.1f}%)")
+            estado["rsi_optimo"] = nuevo
+
+    # WR muy alta con pocas señales → relajar para más señales
+    elif wr > 75 and analisis.get("total", 0) < 10 and rsi_actual < 35:
+        nuevo = rsi_actual + 1
+        if nuevo != rsi_actual:
+            ajustes.append(f"RSI {rsi_actual}→{nuevo} (WR alta, pocas señales)")
+            estado["rsi_optimo"] = nuevo
+
+    return estado, ajustes
 
 
-def _load_recent_trades(limit=50) -> list:
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM trades WHERE exit_time IS NOT NULL ORDER BY exit_time DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        log.error(f"Error cargando trades: {e}")
-        return []
+# ============================================================
+# AJUSTE DE SL / TP
+# ============================================================
+
+def _ajustar_sl_tp(estado: dict, analisis: dict) -> tuple:
+    ajustes   = []
+    avg_win   = analisis.get("avg_win",  0)
+    avg_loss  = analisis.get("avg_loss", 0)
+    sl_actual = estado.get("sl_optimo", config.SL_ATR_MULT)
+    tp_actual = estado.get("tp_optimo", config.TP_ATR_MULT)
+
+    if avg_win > 0 and avg_loss > 0:
+        rr_real = avg_win / avg_loss
+
+        if rr_real < 1.0:
+            # Losses mayores que wins → ajustar SL más ajustado
+            nuevo_sl = round(max(1.0, sl_actual - 0.1), 1)
+            if nuevo_sl != sl_actual:
+                ajustes.append(f"SL {sl_actual:.1f}→{nuevo_sl:.1f} (R:R real {rr_real:.2f})")
+                estado["sl_optimo"] = nuevo_sl
+
+        elif rr_real > 3.0 and tp_actual < 4.0:
+            # R:R excelente → ampliar TP
+            nuevo_tp = round(min(4.0, tp_actual + 0.2), 1)
+            if nuevo_tp != tp_actual:
+                ajustes.append(f"TP {tp_actual:.1f}→{nuevo_tp:.1f} (R:R excelente {rr_real:.2f})")
+                estado["tp_optimo"] = nuevo_tp
+
+    return estado, ajustes
 
 
-def analyze_and_adjust() -> dict:
-    trades = _load_recent_trades(50)
-    if len(trades) < MIN_TRADES:
-        log.info(f"Learner: {len(trades)} trades, necesita {MIN_TRADES}")
-        return {}
+# ============================================================
+# DETECCIÓN DE HORAS MALAS
+# ============================================================
 
-    wins      = [t for t in trades if t.get("pnl", 0) >= 0]
-    losses    = [t for t in trades if t.get("pnl", 0) <  0]
-    total     = len(trades)
-    win_rate  = len(wins) / total if total > 0 else 0
-    avg_win   = sum(t["pnl"] for t in wins)   / len(wins)   if wins   else 0
-    avg_loss  = abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else 0.001
-    total_pnl = sum(t.get("pnl", 0) for t in trades)
+def _detectar_horas_malas(estado: dict, analisis: dict) -> tuple:
+    ajustes    = []
+    horas_loss = analisis.get("horas_loss", {})
 
-    log.info(
-        f"Learner: {total} trades | WR={win_rate*100:.1f}% | "
-        f"AvgW=${avg_win:.2f} AvgL=${avg_loss:.2f} | PnL=${total_pnl:.2f}"
+    # Horas con 3+ losses
+    horas_malas_nuevas = [h for h, n in horas_loss.items() if n >= 3]
+
+    # Mantener horas ya detectadas + nuevas
+    horas_existentes = set(estado.get("horas_malas", []))
+    horas_malas      = list(horas_existentes | set(horas_malas_nuevas))
+
+    if horas_malas_nuevas:
+        ajustes.append(f"Horas problemáticas detectadas: {horas_malas_nuevas}")
+        estado["horas_malas"] = horas_malas
+
+    return estado, ajustes
+
+
+# ============================================================
+# PENALIZACIÓN Y REHABILITACIÓN DE PARES
+# ============================================================
+
+def _penalizar_pares_malos(estado: dict, pares: list) -> tuple:
+    penalizados   = []
+    rehabilitados = []
+    ahora = datetime.now()
+    pares_pen = estado.get("pares_penalizados", {})
+
+    # Rehabilitar pares cuya penalización expiró
+    for par, hasta_str in list(pares_pen.items()):
+        try:
+            hasta = datetime.fromisoformat(hasta_str)
+            if ahora >= hasta:
+                del pares_pen[par]
+                rehabilitados.append(par)
+                database.rehabilitar_par(par)
+                notifier.learner_ajuste(par, "REHABILITAR", "penalización expirada")
+                print(f"  ✓ REHABILITADO {par}")
+        except:
+            del pares_pen[par]
+
+    # Evaluar cada par
+    for par in pares:
+        if par in pares_pen:
+            continue
+
+        m = database.get_metricas_par(par)
+        if not m or m.get("total_trades", 0) < config.LEARNER_MIN_TRADES:
+            continue
+
+        wr  = m.get("wr", 0)
+        pf  = m.get("pf", 0)
+        avg_score = m.get("avg_score", 50)
+
+        motivo = None
+        horas_pen = config.LEARNER_PENALIZACION_H
+
+        if wr < 25 and pf < 0.6:
+            motivo    = f"WR={wr:.0f}% PF={pf:.2f} (crítico)"
+            horas_pen = 48   # Penalización doble si es muy malo
+        elif wr < config.LEARNER_MIN_WR and pf < config.LEARNER_MIN_PF:
+            motivo = f"WR={wr:.0f}% PF={pf:.2f} bajo mínimo"
+        elif avg_score > 0 and avg_score < 40 and wr < 40:
+            motivo = f"score promedio bajo ({avg_score:.0f}) con WR={wr:.0f}%"
+
+        if motivo:
+            hasta = (ahora + timedelta(hours=horas_pen)).isoformat()
+            pares_pen[par] = hasta
+            penalizados.append(par)
+            database.penalizar_par(par, hasta, motivo)
+            notifier.learner_ajuste(par, "PENALIZAR", motivo)
+            print(f"  ⛔ PENALIZADO {par} {horas_pen}h: {motivo}")
+        else:
+            if m.get("total_trades", 0) >= config.LEARNER_MIN_TRADES:
+                print(f"  ✓ OK {par}: WR={wr:.0f}% PF={pf:.2f} Score={avg_score:.0f}")
+
+    estado["pares_penalizados"] = pares_pen
+    return estado, penalizados, rehabilitados
+
+
+# ============================================================
+# APLICAR CAMBIOS A CONFIG EN MEMORIA Y EN DISCO
+# ============================================================
+
+def _aplicar_aprendizaje(estado: dict) -> list:
+    rsi_nuevo = estado.get("rsi_optimo", config.RSI_OVERSOLD)
+    sl_nuevo  = estado.get("sl_optimo",  config.SL_ATR_MULT)
+    tp_nuevo  = estado.get("tp_optimo",  config.TP_ATR_MULT)
+
+    cambiado = []
+    if rsi_nuevo != config.RSI_OVERSOLD:
+        cambiado.append(f"RSI_OVERSOLD: {config.RSI_OVERSOLD} → {rsi_nuevo}")
+        config.RSI_OVERSOLD = rsi_nuevo
+    if sl_nuevo != config.SL_ATR_MULT:
+        cambiado.append(f"SL_ATR_MULT: {config.SL_ATR_MULT} → {sl_nuevo}")
+        config.SL_ATR_MULT = sl_nuevo
+    if tp_nuevo != config.TP_ATR_MULT:
+        cambiado.append(f"TP_ATR_MULT: {config.TP_ATR_MULT} → {tp_nuevo}")
+        config.TP_ATR_MULT = tp_nuevo
+
+    # Persistir en disco si hubo cambios
+    if cambiado:
+        _persistir_config_disco(rsi_nuevo, sl_nuevo, tp_nuevo)
+
+    return cambiado
+
+
+# ============================================================
+# FUNCIÓN PRINCIPAL
+# ============================================================
+
+def evaluar_y_ajustar(pares_config: list) -> list:
+    print(f"\n[LEARNER] Evaluando {len(pares_config)} pares...")
+    ahora  = datetime.now()
+    estado = _cargar_estado()
+    trades = database.get_ultimos_trades(100)
+    analisis = _analizar_trades(trades)
+
+    todos_ajustes = []
+
+    if len(trades) >= config.LEARNER_MIN_TRADES:
+        # 1. RSI
+        estado, aj = _ajustar_rsi(estado, analisis)
+        todos_ajustes.extend(aj)
+
+        # 2. SL / TP
+        estado, aj = _ajustar_sl_tp(estado, analisis)
+        todos_ajustes.extend(aj)
+
+        # 3. Horas malas
+        estado, aj = _detectar_horas_malas(estado, analisis)
+        todos_ajustes.extend(aj)
+
+    # 4. Penalizar/rehabilitar pares
+    estado, penalizados, rehabilitados = _penalizar_pares_malos(estado, pares_config)
+
+    # 5. Aplicar cambios en memoria y en disco
+    cambios_config = _aplicar_aprendizaje(estado)
+    todos_ajustes.extend(cambios_config)
+
+    # 6. Registrar historial
+    if todos_ajustes:
+        entrada = {
+            "timestamp": ahora.isoformat(),
+            "ajustes":   todos_ajustes,
+            "stats": {
+                "total_trades": analisis.get("total", 0),
+                "wr":           round(analisis.get("wr", 0), 1),
+                "rsi_optimo":   estado.get("rsi_optimo"),
+                "sl_optimo":    estado.get("sl_optimo"),
+                "tp_optimo":    estado.get("tp_optimo"),
+            }
+        }
+        historial = estado.get("historial_ajustes", [])
+        historial.append(entrada)
+        estado["historial_ajustes"] = historial[-30:]
+
+        print("[LEARNER] Ajustes aplicados:")
+        for a in todos_ajustes:
+            print(f"  → {a}")
+
+        if cambios_config:
+            msg = "🧠 <b>LEARNER — Parámetros ajustados</b>\n" + "\n".join(f"• {c}" for c in cambios_config)
+            _telegram(msg)
+    else:
+        print("[LEARNER] Sin ajustes necesarios")
+
+    wr_str = f"{analisis.get('wr', 0):.1f}%" if analisis else "N/A"
+    print(
+        f"[LEARNER] WR={wr_str} | Trades={analisis.get('total',0)} | "
+        f"RSI={config.RSI_OVERSOLD} | SL={config.SL_ATR_MULT} | TP={config.TP_ATR_MULT} | "
+        f"Penalizados={len(penalizados)}"
     )
 
-    changes = {}
+    estado["ultima_evaluacion"] = ahora.isoformat()
+    _guardar_estado(estado)
 
-    # Kelly
-    kelly_risk = calc_kelly_risk(win_rate, avg_win, avg_loss)
-    if abs(kelly_risk - cfg.RISK_PCT) > 0.002:
-        changes["RISK_PCT"] = kelly_risk
-        cfg.RISK_PCT = kelly_risk
-        log.info(f"Kelly → RISK_PCT={kelly_risk:.3f}")
+    # Retornar pares activos (sin penalizados)
+    pares_pen    = estado.get("pares_penalizados", {})
+    pares_activos = [p for p in pares_config if p not in pares_pen]
+    return pares_activos
 
-    # Patrones
-    for param, val in analyze_losing_patterns(trades).items():
-        changes[param] = val
-        setattr(cfg, param, val)
 
-    # BB_SIGMA por WR
-    if win_rate < 0.40 and cfg.BB_SIGMA < 2.3:
-        cfg.BB_SIGMA = round(cfg.BB_SIGMA + 0.1, 1)
-        changes["BB_SIGMA"] = cfg.BB_SIGMA
-        log.info(f"WR bajo → BB_SIGMA={cfg.BB_SIGMA}")
-    elif win_rate > 0.65 and cfg.BB_SIGMA > 1.7:
-        cfg.BB_SIGMA = round(cfg.BB_SIGMA - 0.05, 2)
-        changes["BB_SIGMA"] = cfg.BB_SIGMA
-        log.info(f"WR alto → BB_SIGMA={cfg.BB_SIGMA}")
+def ajustar_parametros_globales():
+    """Comprobación adicional de horas problemáticas."""
+    estado      = _cargar_estado()
+    horas_malas = estado.get("horas_malas", [])
+    if horas_malas:
+        hora_actual = datetime.now().hour
+        if hora_actual in horas_malas:
+            print(f"[LEARNER] ⚠️ Hora actual ({hora_actual}h) marcada como problemática")
 
-    # Regimen de mercado
-    regime = detect_market_regime(trades)
-    changes["market_regime"] = regime
 
-    # Blacklist
-    blacklist = update_symbol_blacklist(trades)
-    if blacklist:
-        changes["blacklisted"] = list(blacklist)
+def get_estado_actual() -> dict:
+    """Retorna el estado actual del learner para diagnóstico."""
+    estado = _cargar_estado()
+    return {
+        "rsi_optimo":        estado.get("rsi_optimo", config.RSI_OVERSOLD),
+        "sl_optimo":         estado.get("sl_optimo",  config.SL_ATR_MULT),
+        "tp_optimo":         estado.get("tp_optimo",  config.TP_ATR_MULT),
+        "horas_malas":       estado.get("horas_malas", []),
+        "pares_penalizados": list(estado.get("pares_penalizados", {}).keys()),
+        "ultima_evaluacion": estado.get("ultima_evaluacion", "nunca"),
+        "total_ajustes":     len(estado.get("historial_ajustes", []))
+    }
 
-    # Analisis horario
-    hour_info = analyze_hour_performance(trades)
-    if hour_info.get("bad_hours"):
-        changes["bad_hours"] = hour_info["bad_hours"]
 
-    # Guardar en DB
+def _telegram(msg: str):
+    import requests
+    if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
+        return
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS learner_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT, win_rate REAL, avg_win REAL, avg_loss REAL,
-                total_pnl REAL, changes TEXT
-            )
-        """)
-        conn.execute(
-            "INSERT INTO learner_log VALUES (NULL,?,?,?,?,?,?)",
-            (datetime.now().isoformat(), win_rate, avg_win, avg_loss,
-             total_pnl, json.dumps(changes))
+        requests.post(
+            f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": config.TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
         )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log.error(f"Error guardando learner log: {e}")
-
-    return changes
-
-
-def get_performance_report() -> str:
-    trades = _load_recent_trades(20)
-    if not trades:
-        return "Sin datos"
-    wins      = sum(1 for t in trades if t.get("pnl", 0) >= 0)
-    total_pnl = sum(t.get("pnl", 0) for t in trades)
-    wr        = wins / len(trades) * 100
-    return (
-        f"WR={wr:.1f}% | PnL=${total_pnl:.2f} | "
-        f"Risk={cfg.RISK_PCT*100:.2f}% | BB_σ={cfg.BB_SIGMA} | "
-        f"Blacklist={len(_symbol_blacklist)}"
-    )
+    except:
+        pass
