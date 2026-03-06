@@ -62,7 +62,7 @@ REENTRY_SCORE_MIN = 55
 # ── Filtro de volumen ──────────────────────────────────
 VOLUME_FILTER    = True
 VOLUME_MA_PERIOD = 20
-VOLUME_MIN_RATIO = 0.7
+VOLUME_MIN_RATIO = 0.3
 
 # ── Multi-timeframe 1h como confirmación ──────────────
 MTF_ENABLED       = True
