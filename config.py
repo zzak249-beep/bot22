@@ -1,13 +1,14 @@
 """
-config.py — Configuración central BB+RSI BOT ELITE v7
-Compatible 100% con main.py v6 + strategy.py v7 + liquidity.py
+config.py — Configuración central v7
+100% compatible con main.py (usa nombres en español: MAX_POSICIONES, CICLO_SEGUNDOS, etc.)
+Los pares se cargan dinámicamente desde BingX al arrancar (symbols_loader.py)
 """
 import os
 from dotenv import load_dotenv
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════
-# CREDENCIALES (Railway → Settings → Variables)
+# CREDENCIALES
 # ══════════════════════════════════════════════════════════
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
 BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
@@ -16,73 +17,88 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
 
 # ══════════════════════════════════════════════════════════
-# PARES
+# PARES — se reemplaza en runtime por symbols_loader
+# Fallback: los 30 pares más líquidos de BingX Futuros
 # ══════════════════════════════════════════════════════════
 PARES = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
-    "LINK-USDT", "AVAX-USDT", "NEAR-USDT", "ARB-USDT", "OP-USDT",
-    "LTC-USDT", "DOGE-USDT", "MATIC-USDT", "APT-USDT", "SUI-USDT",
-    "TON-USDT", "UNI-USDT", "ATOM-USDT", "DOT-USDT", "INJ-USDT",
+    "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
+    "DOGE-USDT","AVAX-USDT","LINK-USDT","ADA-USDT","DOT-USDT",
+    "MATIC-USDT","LTC-USDT","UNI-USDT","ATOM-USDT","NEAR-USDT",
+    "ARB-USDT","OP-USDT","APT-USDT","SUI-USDT","INJ-USDT",
+    "TRX-USDT","FIL-USDT","ICP-USDT","AAVE-USDT","MKR-USDT",
+    "TON-USDT","WLD-USDT","STX-USDT","PEPE-USDT","SHIB-USDT",
 ]
-SYMBOLS        = [p.replace("-", "/") for p in PARES]
+# Formato slash para ccxt — se sincroniza automáticamente
+SYMBOLS = [p.replace("-", "/") for p in PARES]
 
 # ══════════════════════════════════════════════════════════
 # MODO
 # ══════════════════════════════════════════════════════════
-MODO_DEMO  = False   # ← FALSE = trades REALES en BingX
+MODO_DEMO  = False   # FALSE = trades REALES en BingX
 MODO_DEBUG = False
 
 # ══════════════════════════════════════════════════════════
-# OPERACIÓN
+# OPERACIÓN / LOOP
 # ══════════════════════════════════════════════════════════
+CICLO_SEGUNDOS  = 300    # intervalo del loop principal (5 min)
 LOOP_SECONDS    = 300
-SCAN_BATCH_SIZE = 5
+SCAN_BATCH_SIZE = 10     # pares por lote al escanear
 COOLDOWN_BARS   = 3
 TIMEFRAME       = "15m"
 TIMEFRAME_HI    = "4h"
-CICLO_SEGUNDOS  = 300
 
 # ══════════════════════════════════════════════════════════
 # CAPITAL Y RIESGO
 # ══════════════════════════════════════════════════════════
-RISK_PCT         = 0.01
-RIESGO_POR_TRADE = 0.01
 LEVERAGE         = 5
+RIESGO_POR_TRADE = 0.01    # 1% del balance por trade
+RISK_PCT         = 0.01
 MIN_USDT_BALANCE = 10.0
-MAX_POSITIONS    = 3
+MAX_POSICIONES   = 5       # ← nombre que usa main.py
+MAX_POSITIONS    = 5       # alias inglés
 BALANCE_SNAPSHOT = 0.0
 BALANCE_INICIAL  = 100.0
 
 # ══════════════════════════════════════════════════════════
 # BOLLINGER BANDS
 # ══════════════════════════════════════════════════════════
-BB_PERIOD = 20
-BB_SIGMA  = 2.0
-BB_STD    = 2.0
+BB_PERIODO = 20
+BB_PERIOD  = 20
+BB_STD     = 2.0
+BB_SIGMA   = 2.0
 
 # ══════════════════════════════════════════════════════════
 # RSI
 # ══════════════════════════════════════════════════════════
 RSI_PERIODO  = 14
+RSI_OVERSOLD = 30    # ← nombre que usa main.py
 RSI_OB       = 70
 RSI_OS       = 30
-RSI_OVERSOLD = 30
+RSI_OB_SHORT = 70
 
 # ══════════════════════════════════════════════════════════
 # ATR / SL / TP
 # ══════════════════════════════════════════════════════════
 ATR_PERIODO  = 14
+SL_ATR_MULT  = 1.5   # ← nombre que usa main.py
 SL_ATR       = 1.5
-SL_ATR_MULT  = 1.5
-TP_ATR_MULT  = 2.5
+TP_ATR_MULT  = 2.5   # ← nombre que usa main.py
+TP_ATR       = 2.5
 MIN_RR_RATIO = 1.5
+RR_MINIMO    = 1.5
 
 # ══════════════════════════════════════════════════════════
 # EMA
 # ══════════════════════════════════════════════════════════
+EMA_FILTRO_ACTIVO = True   # ← nombre que usa main.py
 EMA_TREND_ENABLED = True
 EMA_PERIODO       = 200
-EMA_FILTRO_ACTIVO = True
+
+# ══════════════════════════════════════════════════════════
+# MULTI-TIMEFRAME
+# ══════════════════════════════════════════════════════════
+MTF_ACTIVO   = True    # ← nombre que usa main.py
+MTF_RSI_MAX  = 60
 
 # ══════════════════════════════════════════════════════════
 # ADX
@@ -102,51 +118,47 @@ STOCH_RSI_OB      = 85
 STOCH_RSI_OS      = 15
 
 # ══════════════════════════════════════════════════════════
-# CONFIRMACIÓN DE VELA
-# ══════════════════════════════════════════════════════════
-CANDLE_CONFIRM_ENABLED  = True
-CANDLE_CONFIRM_MIN_BODY = 0.3
-
-# ══════════════════════════════════════════════════════════
 # VOLUMEN
 # ══════════════════════════════════════════════════════════
 VOLUME_CONFIRM_ENABLED = True
 VOLUME_CONFIRM_MULT    = 0.7
 VOLUMEN_MIN_USD        = 500_000
 SPREAD_MAX_PCT         = 2.0
-MTF_ACTIVO             = True
-MTF_RSI_MAX            = 60
 VOL_RELATIVO_ACTIVO    = True
 VOL_RELATIVO_MIN       = 0.9
 
 # ══════════════════════════════════════════════════════════
-# MULTI-TP
-# ══════════════════════════════════════════════════════════
-MULTI_TP_ENABLED  = True
-TP1_ATR_MULT      = 1.2
-TP2_ATR_MULT      = 2.0
-TP1_CLOSE_PCT     = 0.30
-TP2_CLOSE_PCT     = 0.40
-PARTIAL_TP_ENABLED = False
-PARTIAL_TP_PCT     = 0.50
-
-# ══════════════════════════════════════════════════════════
 # TRAILING STOP
 # ══════════════════════════════════════════════════════════
+TRAILING_STOP_ACTIVO     = True    # ← nombre que usa main.py
 TRAILING_STOP_ENABLED    = True
-TRAILING_STOP_ACTIVO     = True
-TRAILING_DYNAMIC_ENABLED = True
+TRAILING_ATR_MULT        = 1.0    # ← nombre que usa main.py
 TRAILING_STOP_ATR        = 1.5
-TRAILING_ATR_MULT        = 1.0
+TRAILING_ACTIVAR_PCT     = 0.5    # ← nombre que usa main.py
+TRAILING_ACTIVATE_PCT    = 0.5
+TRAILING_DYNAMIC_ENABLED = True
 TRAILING_VOL_THRESHOLD   = 0.02
 TRAILING_ATR_HIGH_VOL    = 2.0
 TRAILING_ATR_LOW_VOL     = 1.2
-TRAILING_ACTIVATE_PCT    = 0.5
-TRAILING_ACTIVAR_PCT     = 0.5
-CIERRE_PARCIAL_ACTIVO    = False
-CIERRE_PARCIAL_PCT       = 0.5
-CIERRE_PARCIAL_TP_PCT    = 0.5
-BREAKEVEN_ACTIVO         = True
+
+# ══════════════════════════════════════════════════════════
+# CIERRE PARCIAL
+# ══════════════════════════════════════════════════════════
+CIERRE_PARCIAL_ACTIVO = False   # ← nombre que usa main.py
+CIERRE_PARCIAL_PCT    = 0.5    # ← nombre que usa main.py
+CIERRE_PARCIAL_TP_PCT = 0.5    # ← nombre que usa main.py
+BREAKEVEN_ACTIVO      = True   # ← nombre que usa main.py
+PARTIAL_TP_ENABLED    = False
+PARTIAL_TP_PCT        = 0.5
+
+# ══════════════════════════════════════════════════════════
+# MULTI-TP
+# ══════════════════════════════════════════════════════════
+MULTI_TP_ENABLED = True
+TP1_ATR_MULT     = 1.2
+TP2_ATR_MULT     = 2.0
+TP1_CLOSE_PCT    = 0.30
+TP2_CLOSE_PCT    = 0.40
 
 # ══════════════════════════════════════════════════════════
 # STALE TRADE
@@ -158,11 +170,17 @@ STALE_TRADE_MIN_MOVE = 0.005
 # ══════════════════════════════════════════════════════════
 # FILTRO HORARIO (UTC)
 # ══════════════════════════════════════════════════════════
+HORA_FILTRO_ACTIVO    = True
+HORAS_EXCLUIDAS       = [1, 2, 3]
 TIME_FILTER_ENABLED   = True
 TIME_FILTER_OFF_START = 1
 TIME_FILTER_OFF_END   = 4
-HORA_FILTRO_ACTIVO    = True
-HORAS_EXCLUIDAS       = [1, 2, 3]
+
+# ══════════════════════════════════════════════════════════
+# DIVERGENCIA RSI
+# ══════════════════════════════════════════════════════════
+DIVERGENCIA_ACTIVA  = True
+DIVERGENCIA_VENTANA = 10
 
 # ══════════════════════════════════════════════════════════
 # SENTIMIENTO
@@ -176,8 +194,8 @@ CRYPTOPANIC_ENABLED  = False
 # ══════════════════════════════════════════════════════════
 # CIRCUIT BREAKER
 # ══════════════════════════════════════════════════════════
-MAX_PNL_NEGATIVO_DIA  = -0.06
-MAX_PERDIDAS_SEGUIDAS = 5
+MAX_PNL_NEGATIVO_DIA  = -0.06   # ← nombre que usa main.py
+MAX_PERDIDAS_SEGUIDAS = 5       # ← nombre que usa main.py
 
 # ══════════════════════════════════════════════════════════
 # LEARNER
@@ -190,22 +208,16 @@ LEARNER_CICLO_H        = 6
 LEARNER_PERSISTIR      = True
 
 # ══════════════════════════════════════════════════════════
-# DIVERGENCIA RSI
+# ESTRATEGIAS
 # ══════════════════════════════════════════════════════════
-DIVERGENCIA_ACTIVA  = True
-DIVERGENCIA_VENTANA = 10
-
-# ══════════════════════════════════════════════════════════
-# ESTRATEGIAS INDEPENDIENTES
-# ══════════════════════════════════════════════════════════
-STRATEGY_BB_RSI_ENABLED    = True   # Bollinger + RSI
-STRATEGY_EMA_CROSS_ENABLED = True   # EMA 3/8/21/55/200 continuaciones+reversiones
-STRATEGY_BREAKOUT_ENABLED  = True   # Ruptura de rango
-STRATEGY_FLASH_ARB_ENABLED = True   # Spread precio multi-capa
-STRATEGY_MIN_SCORE         = 45     # Score mínimo para ejecutar
+STRATEGY_BB_RSI_ENABLED    = True
+STRATEGY_EMA_CROSS_ENABLED = True
+STRATEGY_BREAKOUT_ENABLED  = True
+STRATEGY_FLASH_ARB_ENABLED = True
+STRATEGY_MIN_SCORE         = 45
 
 # ══════════════════════════════════════════════════════════
 # LIQUIDEZ INSTITUCIONAL
 # ══════════════════════════════════════════════════════════
 LIQUIDITY_ENABLED     = True
-LIQUIDITY_BLOCK_SCORE = 25     # score ≤25 o ≥75 bloquea señal contraria
+LIQUIDITY_BLOCK_SCORE = 25
