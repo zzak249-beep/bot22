@@ -1,95 +1,240 @@
 """
-analizar.py — Señales RSI + Bollinger Bands + ATR  v6
-MEJORAS:
-  - EMA50 en 1h como filtro de tendencia
-  - Confirmación multi-timeframe (RSI en 15m)
-  - Detección de divergencia alcista RSI
-  - Filtro de volumen relativo
-  - Filtro horario (evita 00-03 UTC)
-  - Scoring mejorado (0-100) con todos los factores
+analizar.py — Puente entre main.py y el motor de estrategias v7
+════════════════════════════════════════════════════════════════
+main.py llama: analizar.analizar_todos(pares)
+Este módulo:
+  1. Obtiene los klines de BingX para cada par
+  2. Llama a strategy.get_signal() que ejecuta las 4 estrategias
+     + filtro de liquidez institucional
+  3. Traduce el resultado al formato que espera main.py
+     (campos: par, señal, precio, sl, tp, rr, rsi, atr, score, motivo...)
+
+También expone analizar_par() para compatibilidad con backtest.py
 """
 
+import logging
 import numpy as np
+import pandas as pd
 from datetime import datetime, timezone
+
 import config
 import exchange
+import strategy
+
+log = logging.getLogger("analizar")
 
 
-# ============================================================
-# INDICADORES
-# ============================================================
+# ══════════════════════════════════════════════════════════
+# HELPERS: klines → DataFrame
+# ══════════════════════════════════════════════════════════
+
+def _klines_to_df(klines: list) -> pd.DataFrame | None:
+    """Convierte la respuesta de BingX a DataFrame OHLCV."""
+    rows = []
+    for k in klines:
+        try:
+            if isinstance(k, dict):
+                ts = int(k.get("time", k.get("t", 0)))
+                o  = float(k.get("open",   k.get("o", 0)))
+                h  = float(k.get("high",   k.get("h", 0)))
+                l  = float(k.get("low",    k.get("l", 0)))
+                c  = float(k.get("close",  k.get("c", 0)))
+                v  = float(k.get("volume", k.get("v", 0)))
+            elif isinstance(k, (list, tuple)) and len(k) >= 6:
+                ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+            else:
+                continue
+            rows.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
+        except Exception:
+            continue
+
+    if len(rows) < 25:
+        return None
+
+    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+    df = df[df["close"] > 0]
+    return df if len(df) >= 25 else None
+
+
+def _get_df(par: str, intervalo: str, limit: int) -> pd.DataFrame | None:
+    klines = exchange.get_klines(par, intervalo=intervalo, limit=limit)
+    if not klines:
+        return None
+    return _klines_to_df(klines)
+
+
+# ══════════════════════════════════════════════════════════
+# FILTROS PREVIOS (rápidos, sin estrategia)
+# ══════════════════════════════════════════════════════════
+
+def _filtros_basicos(par: str) -> tuple[bool, str]:
+    """Rechaza pares con bajo volumen, spread alto u hora excluida."""
+    # Filtro horario
+    if config.HORA_FILTRO_ACTIVO:
+        h = datetime.now(timezone.utc).hour
+        if h in config.HORAS_EXCLUIDAS:
+            return False, f"hora excluida ({h}h UTC)"
+
+    # Volumen
+    vol = exchange.get_volumen_24h(par)
+    if vol < config.VOLUMEN_MIN_USD:
+        return False, f"vol ${vol:,.0f} < min ${config.VOLUMEN_MIN_USD:,.0f}"
+
+    # Spread
+    spread = exchange.get_spread_pct(par)
+    if spread > config.SPREAD_MAX_PCT:
+        return False, f"spread {spread:.2f}% > {config.SPREAD_MAX_PCT}%"
+
+    return True, ""
+
+
+# ══════════════════════════════════════════════════════════
+# ANALIZAR UN PAR — devuelve formato main.py
+# ══════════════════════════════════════════════════════════
+
+def analizar_par(par: str) -> dict:
+    """
+    Analiza un par y retorna dict compatible con main.py.
+    Campos obligatorios que main.py necesita:
+      par, señal, precio, sl, tp, rr, rsi, atr, bb, score, motivo,
+      divergencia, vol_relativo, mtf_rsi
+    """
+    resultado = {
+        "par":          par,
+        "señal":        False,
+        "precio":       0.0,
+        "sl":           0.0,
+        "tp":           0.0,
+        "rr":           0.0,
+        "rsi":          50.0,
+        "atr":          0.0,
+        "bb":           {"posicion": 0.5},
+        "score":        0,
+        "motivo":       "",
+        "divergencia":  False,
+        "vol_relativo": 1.0,
+        "mtf_rsi":      50.0,
+        # extra: info institucional
+        "liquidity_bias":  "neutral",
+        "liquidity_score": 50,
+    }
+
+    # ── Filtros rápidos ────────────────────────────────────
+    ok, razon = _filtros_basicos(par)
+    if not ok:
+        resultado["motivo"] = razon
+        return resultado
+
+    # ── Obtener klines principales (15m) ──────────────────
+    df = _get_df(par, config.TIMEFRAME, 250)
+    if df is None or len(df) < 25:
+        resultado["motivo"] = f"klines 15m insuficientes"
+        return resultado
+
+    # Pasar el símbolo al DataFrame para que liquidity.py sepa qué par es
+    df.attrs["symbol"] = par
+
+    # ── Obtener klines de tendencia (4h) ──────────────────
+    df_4h = _get_df(par, config.TIMEFRAME_HI, 100)
+
+    # ── Ejecutar motor de estrategias ─────────────────────
+    sig = strategy.get_signal(df, df_4h)
+
+    # Si no hay señal, retornar sin señal
+    if sig.get("action") not in ("buy", "sell_short"):
+        resultado["motivo"] = sig.get("reason", "sin señal")
+        # Incluir datos técnicos aunque no haya señal (útil para debug)
+        resultado["rsi"]   = sig.get("rsi", 50.0)
+        resultado["atr"]   = sig.get("atr", 0.0)
+        resultado["precio"] = float(df["close"].iloc[-1])
+        return resultado
+
+    # ── Hay señal — verificar score mínimo ────────────────
+    score = sig.get("score", 0)
+    if score < config.STRATEGY_MIN_SCORE:
+        resultado["motivo"] = f"score {score} < mínimo {config.STRATEGY_MIN_SCORE}"
+        return resultado
+
+    # ── Verificar R:R mínimo ──────────────────────────────
+    rr = sig.get("rr", 0)
+    if rr < config.RR_MINIMO:
+        resultado["motivo"] = f"R:R {rr:.2f} < mínimo {config.RR_MINIMO}"
+        return resultado
+
+    # ── Volumen relativo ──────────────────────────────────
+    vols = df["volume"].tolist()
+    if len(vols) >= 21:
+        media_vol = float(np.mean(vols[-21:-1]))
+        vol_rel   = float(vols[-1]) / media_vol if media_vol > 0 else 1.0
+    else:
+        vol_rel = 1.0
+
+    # ── BB posición actual ─────────────────────────────────
+    closes = df["close"].tolist()
+    from analizar import calcular_bb
+    bb_data = calcular_bb(closes, config.BB_PERIODO, config.BB_STD)
+
+    # ── MTF RSI (15m ya calculado internamente, tomamos el valor) ─
+    mtf_rsi = sig.get("rsi", 50.0)  # strategy ya usa multi-tf internamente
+
+    # ── Construir resultado final ──────────────────────────
+    precio = sig.get("entry", float(df["close"].iloc[-1]))
+
+    resultado.update({
+        "señal":           True,
+        "precio":          precio,
+        "sl":              sig["sl"],
+        "tp":              sig["tp"],
+        "rr":              rr,
+        "rsi":             sig.get("rsi", 50.0),
+        "atr":             sig.get("atr", 0.0),
+        "bb":              {"posicion": bb_data.get("posicion", 0.5), **bb_data},
+        "score":           score,
+        "motivo":          sig.get("reason", ""),
+        "divergencia":     sig.get("divergencia", False),
+        "vol_relativo":    vol_rel,
+        "mtf_rsi":         mtf_rsi,
+        "strategy":        sig.get("strategy", ""),
+        "trend_4h":        sig.get("trend_4h", "flat"),
+        "liquidity_bias":  sig.get("liquidity_bias", "neutral"),
+        "liquidity_score": sig.get("liquidity_score", 50),
+        "liquidity_summary": sig.get("liquidity_summary", ""),
+    })
+
+    if config.MODO_DEBUG:
+        liq_str = f" 🏦{resultado['liquidity_bias'].upper()}({resultado['liquidity_score']})" \
+                  if resultado['liquidity_score'] != 50 else ""
+        print(f"  ✓ SEÑAL {par}: {sig.get('strategy','')} score={score} "
+              f"R:R={rr:.2f} trend={resultado['trend_4h']}{liq_str}")
+
+    return resultado
+
+
+# ══════════════════════════════════════════════════════════
+# HELPERS BB / RSI para compatibilidad con backtest.py
+# ══════════════════════════════════════════════════════════
 
 def calcular_rsi(closes: list, periodo: int = 14) -> float:
     if len(closes) < periodo + 1:
         return 50.0
-
-    arr      = np.array(closes, dtype=float)
-    deltas   = np.diff(arr)
-    ganancias = np.where(deltas > 0, deltas, 0.0)
-    perdidas  = np.where(deltas < 0, -deltas, 0.0)
-
-    avg_g = float(np.mean(ganancias[:periodo]))
-    avg_p = float(np.mean(perdidas[:periodo]))
-
+    arr    = np.array(closes, dtype=float)
+    deltas = np.diff(arr)
+    g = np.where(deltas > 0, deltas, 0.0)
+    p = np.where(deltas < 0, -deltas, 0.0)
+    ag = float(np.mean(g[:periodo]))
+    ap = float(np.mean(p[:periodo]))
     for i in range(periodo, len(deltas)):
-        avg_g = (avg_g * (periodo - 1) + ganancias[i]) / periodo
-        avg_p = (avg_p * (periodo - 1) + perdidas[i]) / periodo
-
-    if avg_p == 0:
+        ag = (ag * (periodo - 1) + g[i]) / periodo
+        ap = (ap * (periodo - 1) + p[i]) / periodo
+    if ap == 0:
         return 100.0
-
-    rs = avg_g / avg_p
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def calcular_rsi_serie(closes: list, periodo: int = 14) -> list:
-    """Devuelve la serie completa de valores RSI (para detectar divergencias)."""
-    if len(closes) < periodo + 2:
-        return [50.0] * len(closes)
-
-    arr      = np.array(closes, dtype=float)
-    deltas   = np.diff(arr)
-    ganancias = np.where(deltas > 0, deltas, 0.0)
-    perdidas  = np.where(deltas < 0, -deltas, 0.0)
-
-    rsi_values = [50.0] * (periodo + 1)  # Primeros valores no calculables
-
-    avg_g = float(np.mean(ganancias[:periodo]))
-    avg_p = float(np.mean(perdidas[:periodo]))
-
-    def _rsi(ag, ap):
-        if ap == 0:
-            return 100.0
-        return 100.0 - (100.0 / (1.0 + ag / ap))
-
-    rsi_values.append(_rsi(avg_g, avg_p))
-
-    for i in range(periodo, len(deltas)):
-        avg_g = (avg_g * (periodo - 1) + ganancias[i]) / periodo
-        avg_p = (avg_p * (periodo - 1) + perdidas[i]) / periodo
-        rsi_values.append(_rsi(avg_g, avg_p))
-
-    return rsi_values
-
-
-def calcular_ema(closes: list, periodo: int = 50) -> float:
-    """EMA Exponential Moving Average."""
-    if len(closes) < periodo:
-        return float(np.mean(closes)) if closes else 0.0
-
-    arr = np.array(closes, dtype=float)
-    k   = 2.0 / (periodo + 1)
-    ema = float(np.mean(arr[:periodo]))  # SMA inicial
-    for precio in arr[periodo:]:
-        ema = precio * k + ema * (1 - k)
-    return ema
+    return 100.0 - (100.0 / (1.0 + ag / ap))
 
 
 def calcular_bb(closes: list, periodo: int = 20, std_mult: float = 2.0) -> dict:
     vacio = {"media": 0, "superior": 0, "inferior": 0, "posicion": 0.5, "ancho": 0}
     if len(closes) < periodo:
         return vacio
-
     serie    = np.array(closes[-periodo:], dtype=float)
     media    = float(np.mean(serie))
     std      = float(np.std(serie))
@@ -98,336 +243,77 @@ def calcular_bb(closes: list, periodo: int = 20, std_mult: float = 2.0) -> dict:
     ancho    = superior - inferior
     precio   = float(closes[-1])
     posicion = float((precio - inferior) / ancho) if ancho > 0 else 0.5
-
-    return {
-        "media":    media,
-        "superior": superior,
-        "inferior": inferior,
-        "posicion": posicion,   # 0 = banda inferior, 1 = banda superior
-        "ancho":    ancho
-    }
+    return {"media": media, "superior": superior, "inferior": inferior,
+            "posicion": posicion, "ancho": ancho}
 
 
 def calcular_atr(highs: list, lows: list, closes: list, periodo: int = 14) -> float:
     if len(closes) < 2:
         return float(closes[-1]) * 0.02 if closes else 0.01
-
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i]  - closes[i - 1]),
-            abs(lows[i]   - closes[i - 1])
-        )
-        trs.append(tr)
-
+    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+           for i in range(1, len(closes))]
     if not trs:
         return float(closes[-1]) * 0.02
-
     if len(trs) < periodo:
         return float(np.mean(trs))
-
     atr = float(np.mean(trs[:periodo]))
     for i in range(periodo, len(trs)):
         atr = (atr * (periodo - 1) + trs[i]) / periodo
-
     return atr
 
 
-# ============================================================
-# DIVERGENCIA ALCISTA RSI
-# ============================================================
-
-def tiene_divergencia_alcista(closes: list, ventana: int = 10) -> bool:
-    """
-    Divergencia alcista: precio hace mínimo más bajo pero RSI hace mínimo más alto.
-    Señal de reversión alcista muy fiable.
-    """
-    if len(closes) < ventana * 2 + 5:
-        return False
-
-    rsi_serie = calcular_rsi_serie(closes, config.RSI_PERIODO)
-    if len(rsi_serie) < ventana * 2:
-        return False
-
-    # Mitad reciente vs mitad anterior
-    mitad      = ventana
-    closes_rec = closes[-mitad:]
-    closes_ant = closes[-mitad * 2:-mitad]
-    rsi_rec    = rsi_serie[-mitad:]
-    rsi_ant    = rsi_serie[-mitad * 2:-mitad]
-
-    min_precio_rec = min(closes_rec)
-    min_precio_ant = min(closes_ant)
-    min_rsi_rec    = min(rsi_rec)
-    min_rsi_ant    = min(rsi_ant)
-
-    # Precio hace mínimo más bajo Y RSI hace mínimo más alto
-    return min_precio_rec < min_precio_ant and min_rsi_rec > min_rsi_ant + 1.0
+def calcular_ema(closes: list, periodo: int = 50) -> float:
+    if len(closes) < periodo:
+        return float(np.mean(closes)) if closes else 0.0
+    arr = np.array(closes, dtype=float)
+    k   = 2.0 / (periodo + 1)
+    ema = float(np.mean(arr[:periodo]))
+    for precio in arr[periodo:]:
+        ema = precio * k + ema * (1 - k)
+    return ema
 
 
-# ============================================================
-# VOLUMEN RELATIVO
-# ============================================================
-
-def calcular_vol_relativo(vols: list, periodo: int = 20) -> float:
-    """Retorna el ratio: volumen_actual / media_volumen_reciente."""
-    if len(vols) < periodo + 1:
-        return 1.0
-    media = float(np.mean(vols[-periodo - 1:-1]))
-    if media == 0:
-        return 1.0
-    return float(vols[-1]) / media
-
-
-# ============================================================
-# FILTRO HORARIO
-# ============================================================
-
-def hora_permitida() -> bool:
-    """Retorna False si estamos en una hora de baja liquidez (UTC)."""
-    if not config.HORA_FILTRO_ACTIVO:
-        return True
-    hora_utc = datetime.now(timezone.utc).hour
-    return hora_utc not in config.HORAS_EXCLUIDAS
-
-
-# ============================================================
-# ANÁLISIS PRINCIPAL DE UN PAR
-# ============================================================
-
-def analizar_par(par: str) -> dict:
-    """
-    Analiza un par con todos los filtros v6.
-
-    Retorna dict con:
-        señal: bool
-        rsi, bb, atr: indicadores
-        precio, sl, tp, rr: niveles
-        score: 0-100
-        motivo: descripción
-        divergencia: bool
-        vol_relativo: float
-        ema_ok: bool
-        mtf_rsi: float
-    """
-    resultado = {
-        "par":          par,
-        "señal":        False,
-        "rsi":          50.0,
-        "bb":           {},
-        "atr":          0.0,
-        "precio":       0.0,
-        "sl":           0.0,
-        "tp":           0.0,
-        "rr":           0.0,
-        "score":        0,
-        "motivo":       "",
-        "divergencia":  False,
-        "vol_relativo": 1.0,
-        "ema_ok":       False,
-        "mtf_rsi":      50.0,
-    }
-
-    # ── Filtro horario ────────────────────────────────────────
-    if not hora_permitida():
-        hora_utc = datetime.now(timezone.utc).hour
-        resultado["motivo"] = f"hora excluida ({hora_utc}h UTC)"
-        return resultado
-
-    # ── Klines 5m (señal principal) ───────────────────────────
-    klines_5m = exchange.get_klines(par, intervalo="5m", limit=120)
-    if len(klines_5m) < 30:
-        resultado["motivo"] = f"klines 5m insuficientes ({len(klines_5m)})"
-        return resultado
-
-    data_5m = exchange.parsear_klines(klines_5m)
-    if len(data_5m["closes"]) < 30:
-        resultado["motivo"] = "closes 5m insuficientes"
-        return resultado
-
-    closes = data_5m["closes"]
-    highs  = data_5m["highs"]
-    lows   = data_5m["lows"]
-    vols   = data_5m["vols"]
-    precio = closes[-1]
-
-    if precio <= 0:
-        resultado["motivo"] = "precio = 0"
-        return resultado
-
-    resultado["precio"] = precio
-
-    # ── Indicadores base ──────────────────────────────────────
-    rsi = calcular_rsi(closes, config.RSI_PERIODO)
-    bb  = calcular_bb(closes, config.BB_PERIODO, config.BB_STD)
-    atr = calcular_atr(highs, lows, closes, config.ATR_PERIODO)
-
-    resultado["rsi"] = rsi
-    resultado["bb"]  = bb
-    resultado["atr"] = atr
-
-    # ── Filtros de calidad de mercado ─────────────────────────
-    volumen = exchange.get_volumen_24h(par)
-    if volumen < config.VOLUMEN_MIN_USD:
-        resultado["motivo"] = f"vol bajo ${volumen:,.0f}"
-        return resultado
-
-    spread = exchange.get_spread_pct(par)
-    if spread > config.SPREAD_MAX_PCT:
-        resultado["motivo"] = f"spread {spread:.2f}%"
-        return resultado
-
-    # ── Filtro EMA50 en 1h (tendencia superior) ───────────────
-    ema_ok = True
-    if config.EMA_FILTRO_ACTIVO:
-        klines_1h = exchange.get_klines(par, intervalo="1h", limit=80)
-        if len(klines_1h) >= 60:
-            data_1h = exchange.parsear_klines(klines_1h)
-            ema50_1h = calcular_ema(data_1h["closes"], config.EMA_PERIODO)
-            ema_ok   = precio > ema50_1h * 0.995  # Tolerancia 0.5%
-            resultado["ema_ok"] = ema_ok
-            if not ema_ok:
-                resultado["motivo"] = f"precio bajo EMA50-1h ({ema50_1h:.6f})"
-                return resultado
-        else:
-            resultado["ema_ok"] = True  # Sin datos suficientes: no bloquear
-
-    resultado["ema_ok"] = ema_ok
-
-    # ── Multi-timeframe: RSI en 15m ───────────────────────────
-    mtf_rsi = 50.0
-    if config.MTF_ACTIVO:
-        klines_15m = exchange.get_klines(par, intervalo="15m", limit=60)
-        if len(klines_15m) >= 20:
-            data_15m = exchange.parsear_klines(klines_15m)
-            mtf_rsi  = calcular_rsi(data_15m["closes"], config.RSI_PERIODO)
-            resultado["mtf_rsi"] = mtf_rsi
-            if mtf_rsi > config.MTF_RSI_MAX:
-                resultado["motivo"] = f"RSI 15m sobrecomprado ({mtf_rsi:.1f} > {config.MTF_RSI_MAX})"
-                return resultado
-
-    resultado["mtf_rsi"] = mtf_rsi
-
-    # ── Condiciones de entrada LONG ───────────────────────────
-    condicion_rsi = rsi < config.RSI_OVERSOLD
-    condicion_bb  = bb["inferior"] > 0 and precio <= bb["inferior"] * 1.002
-
-    if not condicion_rsi:
-        resultado["motivo"] = f"RSI={rsi:.1f} (necesita <{config.RSI_OVERSOLD})"
-        return resultado
-
-    if not condicion_bb:
-        resultado["motivo"] = f"precio lejos BB inferior (pos={bb['posicion']:.2f})"
-        return resultado
-
-    # ── Volumen relativo ──────────────────────────────────────
-    vol_rel = calcular_vol_relativo(vols)
-    resultado["vol_relativo"] = vol_rel
-    if config.VOL_RELATIVO_ACTIVO and vol_rel < config.VOL_RELATIVO_MIN:
-        resultado["motivo"] = f"vol relativo bajo ({vol_rel:.2f}x)"
-        return resultado
-
-    # ── SL / TP ───────────────────────────────────────────────
-    if atr <= 0:
-        resultado["motivo"] = "ATR = 0"
-        return resultado
-
-    sl = precio - (atr * config.SL_ATR_MULT)
-    tp = precio + (atr * config.TP_ATR_MULT)
-
-    riesgo    = precio - sl
-    beneficio = tp - precio
-    rr = beneficio / riesgo if riesgo > 0 else 0.0
-
-    resultado["sl"] = sl
-    resultado["tp"] = tp
-    resultado["rr"] = rr
-
-    if rr < config.RR_MINIMO:
-        resultado["motivo"] = f"R:R={rr:.2f} < {config.RR_MINIMO}"
-        return resultado
-
-    # ── Divergencia alcista ───────────────────────────────────
-    divergencia = False
-    if config.DIVERGENCIA_ACTIVA:
-        divergencia = tiene_divergencia_alcista(closes, config.DIVERGENCIA_VENTANA)
-    resultado["divergencia"] = divergencia
-
-    # ── Score 0-100 ───────────────────────────────────────────
-    score = 50
-
-    # RSI: cuanto más bajo, mejor (máx +20 pts)
-    score += min(20, int(max(0, config.RSI_OVERSOLD - rsi)))
-
-    # R:R: hasta +15 pts
-    score += min(15, int(rr * 4))
-
-    # Posición BB: muy cerca del fondo → +10
-    if bb["posicion"] < 0.05:
-        score += 10
-    elif bb["posicion"] < 0.1:
-        score += 6
-
-    # Divergencia alcista → +15 pts
-    if divergencia:
-        score += 15
-
-    # Volumen relativo elevado → hasta +8 pts
-    if vol_rel >= 2.0:
-        score += 8
-    elif vol_rel >= 1.5:
-        score += 4
-
-    # Multi-timeframe alineado (RSI 15m también bajo) → +7 pts
-    if mtf_rsi < config.RSI_OVERSOLD:
-        score += 7
-    elif mtf_rsi < 40:
-        score += 3
-
-    # Penalización si hora es marginalmente aceptable (04-05 UTC)
-    hora_utc = datetime.now(timezone.utc).hour
-    if hora_utc in [4, 5]:
-        score -= 5
-
-    score = max(0, min(100, score))
-
-    resultado["score"]  = score
-    resultado["señal"]  = True
-    resultado["motivo"] = (
-        f"RSI={rsi:.1f} | BB={bb['posicion']:.2f} | R:R={rr:.2f} | "
-        f"VolRel={vol_rel:.1f}x | MTF={mtf_rsi:.0f} | "
-        f"{'DIV ✓' if divergencia else 'nodiv'} | score={score}"
-    )
-
-    return resultado
-
-
-# ============================================================
+# ══════════════════════════════════════════════════════════
 # ANALIZAR LISTA DE PARES
-# ============================================================
+# ══════════════════════════════════════════════════════════
 
 def analizar_todos(pares: list) -> list:
     """
-    Analiza una lista de pares y retorna los que tienen señal,
-    ordenados por score descendente.
+    Analiza todos los pares en lotes.
+    Retorna lista de señales ordenadas por score DESC.
     """
-    señales = []
-    for par in pares:
+    import time as _time
+
+    señales  = []
+    total    = len(pares)
+    batch    = getattr(config, "SCAN_BATCH_SIZE", 10)
+
+    print(f"[ANALIZAR] Escaneando {total} pares con 4 estrategias + filtro institucional...")
+
+    for i, par in enumerate(pares):
         try:
             r = analizar_par(par)
             if r["señal"]:
                 señales.append(r)
                 if config.MODO_DEBUG:
-                    div = " ★DIV" if r.get("divergencia") else ""
-                    print(f"  ✓ SEÑAL {par}: {r['motivo']}{div}")
+                    liq = f" 🏦{r['liquidity_bias'].upper()}" if r.get("liquidity_bias") != "neutral" else ""
+                    print(f"  ✓ {par}: score={r['score']} strategy={r.get('strategy','')}{liq}")
             elif config.MODO_DEBUG:
-                print(f"  ✗ {par}: {r['motivo']}")
+                print(f"  ✗ {par}: {r['motivo'][:60]}")
+
+            # Pausa pequeña entre pares para no saturar la API
+            if (i + 1) % batch == 0:
+                _time.sleep(0.5)
+                pct = int((i + 1) / total * 100)
+                print(f"[ANALIZAR] {i+1}/{total} ({pct}%) — {len(señales)} señales hasta ahora")
+
         except Exception as e:
-            print(f"  [ERROR] {par}: {e}")
+            log.error(f"[ANALIZAR] {par}: {e}")
             if config.MODO_DEBUG:
                 import traceback
                 traceback.print_exc()
 
     señales.sort(key=lambda x: x["score"], reverse=True)
+
+    print(f"[ANALIZAR] Completado: {total} pares → {len(señales)} señales")
     return señales
