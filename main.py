@@ -18,6 +18,7 @@ import exchange
 import analizar
 import learner
 import notifier
+import symbols_loader
 
 # Estado en memoria
 posiciones_abiertas: dict = {}   # par → trade_dict
@@ -39,6 +40,11 @@ def inicializar():
     print(f"  EMA={config.EMA_FILTRO_ACTIVO} | MTF={config.MTF_ACTIVO} | "
           f"Trailing={config.TRAILING_STOP_ACTIVO} | ParcialClose={config.CIERRE_PARCIAL_ACTIVO}")
     print("=" * 60)
+
+    # Cargar TODOS los pares de BingX Futuros
+    print("[MAIN] Cargando pares desde BingX Futuros...")
+    pares_cargados = symbols_loader.load_symbols(force=True)
+    print(f"[MAIN] {len(pares_cargados)} pares cargados y listos para escanear")
 
     database.init_db()
     balance_inicio_dia = exchange.get_balance()
