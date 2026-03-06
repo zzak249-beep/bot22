@@ -201,3 +201,94 @@ def send_status(positions: list, balance: float, stats: dict, perf: str):
         f"📋 Posiciones:\n{pos_lines}"
         f"🧠 Learner : _{perf}_"
     )
+
+# ══════════════════════════════════════════════════════════
+# FUNCIONES ADICIONALES para main.py v6
+# ══════════════════════════════════════════════════════════
+
+def send_error(msg: str):
+    """Alias de error_critico para main.py v6."""
+    error_critico(msg)
+
+
+def send_buy_signal(symbol: str, sig: dict, balance: float, executed: bool = True):
+    """Notifica apertura de posición."""
+    modo = "REAL" if executed else "SEÑAL MANUAL"
+    action = sig.get("action", "buy")
+    side_txt = "🟢 LONG" if action == "buy" else "🔴 SHORT"
+    entry = sig.get("entry", 0)
+    sl    = sig.get("sl", 0)
+    tp    = sig.get("tp", 0)
+    score = sig.get("score", 0)
+    rsi   = sig.get("rsi", "N/A")
+    atr   = sig.get("atr", 0)
+    reason = sig.get("reason", "")
+    strategy = sig.get("strategy", "?")
+    rr    = sig.get("rr", 0)
+    trend = sig.get("trend_4h", "N/A")
+
+    risk   = abs(entry - sl) if sl else 0
+    sl_pct = round(risk / entry * 100, 2) if entry > 0 else 0
+    reward = abs(tp - entry) if tp else 0
+    tp_pct = round(reward / entry * 100, 2) if entry > 0 else 0
+
+    _send(
+        f"{side_txt} *{modo}* — `{symbol}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Entrada : `{entry}`\n"
+        f"🛑 SL      : `{sl}` _(-{sl_pct}%)_\n"
+        f"🎯 TP      : `{tp}` _(+{tp_pct}%)_\n"
+        f"📐 R:R     : `{rr}x` | Score: `{score}/100`\n"
+        f"📊 RSI: `{rsi}` | ATR: `{round(atr,4) if atr else 'N/A'}`\n"
+        f"🧠 Estrategia: `{strategy}` | Tendencia: `{trend}`\n"
+        f"💬 _{reason}_\n"
+        f"💼 Balance: `${balance:.2f}`"
+    )
+
+
+def send_close_signal(symbol: str, entry: float, cur_price: float,
+                      pnl_est: float, reason: str, executed: bool):
+    """Notifica cierre de posición."""
+    emoji  = "✅" if pnl_est >= 0 else "❌"
+    modo   = "" if executed else " _(no ejecutado)_"
+    change = (cur_price - entry) / entry * 100 if entry > 0 else 0
+    _send(
+        f"{emoji} *CIERRE{modo}* — `{symbol}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Entrada  : `{entry}`\n"
+        f"Salida   : `{cur_price}` _({change:+.2f}%)_\n"
+        f"PnL est. : `${pnl_est:+.2f}`\n"
+        f"Motivo   : `{reason}`"
+    )
+
+
+def send_startup(symbol_stats: dict):
+    """Notifica arranque del bot."""
+    total  = symbol_stats.get("total", 0)
+    source = symbol_stats.get("source", "?")
+    loaded = symbol_stats.get("loaded_at", "?")
+    _send(
+        f"🚀 *Bot ELITE v6 iniciado*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Pares cargados: `{total}` (desde {source})\n"
+        f"🕐 A las: `{loaded}`\n"
+        f"⚙️ Estrategias: BB_RSI + EMA_CROSS + BREAKOUT\n"
+        f"🔧 Leverage: `{cfg.LEVERAGE}x` | Riesgo: `{cfg.RISK_PCT*100:.0f}%`\n"
+        f"{'🧪 MODO DEMO' if cfg.MODO_DEMO else '💰 MODO REAL'}"
+    )
+
+
+def send_symbols_update(symbols: list):
+    """Notifica actualización de lista de pares."""
+    _send(f"🔄 *Pares actualizados*: `{len(symbols)}` pares cargados")
+
+
+def send_param_update(updates: dict, perf_report: str):
+    """Notifica ajustes del learner."""
+    lines = "\n".join(f"  • `{k}`: {v}" for k, v in updates.items())
+    _send(
+        f"🧠 *Learner — ajuste de parámetros*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{lines}\n"
+        f"📊 _{perf_report}_"
+    )
