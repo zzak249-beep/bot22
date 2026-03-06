@@ -321,3 +321,78 @@ def get_stats_resumen() -> dict:
 if __name__ == "__main__":
     init_db()
     print("[DB] Tablas creadas correctamente")
+
+# ══════════════════════════════════════════════════════════
+# FUNCIONES ADICIONALES para main.py v6
+# ══════════════════════════════════════════════════════════
+
+def open_trade(symbol: str, signal: dict, qty: float, balance: float,
+               leverage: int, bb_sigma: float, bb_period: int, rsi_ob: int) -> int:
+    conn = get_conn()
+    c    = conn.cursor()
+    c.execute("""
+        INSERT INTO trades (
+            par, lado, precio_entrada, cantidad, cantidad_inicial,
+            rsi_entrada, bb_posicion, atr_entrada, sl_precio, sl_original,
+            tp_precio, score_entrada, vol_relativo, mtf_rsi,
+            balance_antes, timestamp_entrada
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        symbol.replace("/", "-"),
+        "LONG" if signal.get("action") == "buy" else "SHORT",
+        signal.get("entry", 0),
+        qty, qty,
+        signal.get("rsi", 50),
+        signal.get("bb_pos", 0.5),
+        signal.get("atr", 0),
+        signal.get("sl", 0),
+        signal.get("sl", 0),
+        signal.get("tp", 0),
+        signal.get("score", 0),
+        signal.get("vol_ratio", 1.0),
+        signal.get("mtf_rsi", 50),
+        balance,
+        datetime.now().isoformat(),
+    ))
+    trade_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return trade_id
+
+
+def close_trade(trade_id: int, exit_price: float, pnl_usd: float, reason: str):
+    conn = get_conn()
+    resultado = "WIN" if pnl_usd >= 0 else "LOSS"
+    conn.execute("""
+        UPDATE trades SET precio_salida=?, pnl_usd=?, resultado=?,
+        motivo_cierre=?, timestamp_salida=? WHERE id=?
+    """, (exit_price, pnl_usd, resultado, reason,
+          datetime.now().isoformat(), trade_id))
+    conn.commit()
+    conn.close()
+    row = get_conn().execute("SELECT par FROM trades WHERE id=?", (trade_id,)).fetchone()
+    if row:
+        _actualizar_metricas(row["par"])
+
+
+def log_signal(symbol: str, signal: dict, executed: bool = False, trade_id: int = None):
+    import logging
+    logging.getLogger("database").debug(
+        f"SIGNAL {'EXEC' if executed else 'SKIP'}: {symbol} "
+        f"action={signal.get('action')} score={signal.get('score',0)}"
+    )
+
+
+def get_stats_summary() -> dict:
+    return get_stats_resumen()
+
+
+def log_params(bb_period, bb_sigma, rsi_ob, sl_atr, note=""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO learner_log (timestamp, par, accion, motivo, valor_despues) VALUES (?,?,?,?,?)",
+        (datetime.now().isoformat(), "SYSTEM", "PARAMS", note,
+         f"BB={bb_period}/{bb_sigma} RSI_OB={rsi_ob} SL={sl_atr}")
+    )
+    conn.commit()
+    conn.close()
