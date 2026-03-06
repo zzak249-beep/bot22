@@ -414,3 +414,222 @@ def _demo_orden(par, lado, cantidad, precio, sl, tp) -> dict:
 
 def _demo_posiciones() -> list:
     return list(_demo_pos.values())
+
+import logging
+log = logging.getLogger("exchange")
+
+# ══════════════════════════════════════════════════════════
+# WRAPPER CCXT-COMPATIBLE (main.py v6 usa fetch_ohlcv)
+# ══════════════════════════════════════════════════════════
+
+class _BingXCCXT:
+    def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 200) -> list:
+        par    = symbol.replace("/", "-")
+        klines = get_klines(par, intervalo=timeframe, limit=limit)
+        result = []
+        for k in klines:
+            try:
+                if isinstance(k, dict):
+                    ts = int(k.get("time", k.get("t", 0)))
+                    o  = float(k.get("open",   k.get("o", 0)))
+                    h  = float(k.get("high",   k.get("h", 0)))
+                    l  = float(k.get("low",    k.get("l", 0)))
+                    c  = float(k.get("close",  k.get("c", 0)))
+                    v  = float(k.get("volume", k.get("v", 0)))
+                elif isinstance(k, (list, tuple)) and len(k) >= 6:
+                    ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+                else:
+                    continue
+                result.append([ts, o, h, l, c, v])
+            except Exception:
+                continue
+        return result
+
+    def load_markets(self):
+        return {}
+
+_exchange_instance = None
+
+def get_exchange() -> _BingXCCXT:
+    global _exchange_instance
+    if _exchange_instance is None:
+        _exchange_instance = _BingXCCXT()
+    return _exchange_instance
+
+
+# ══════════════════════════════════════════════════════════
+# get_open_positions — formato que espera main.py
+# ══════════════════════════════════════════════════════════
+
+def get_open_positions() -> list:
+    raw    = get_posiciones_abiertas()
+    result = []
+    for p in raw:
+        sym      = p.get("symbol", "")
+        sym_ccxt = sym.replace("-", "/")
+        side_raw = p.get("positionSide", p.get("side", "LONG")).upper()
+        side     = "long" if side_raw == "LONG" else "short"
+        result.append({
+            "symbol":  sym_ccxt,
+            "current": float(p.get("markPrice", p.get("avgPrice", 0))),
+            "side":    side,
+            "qty":     abs(float(p.get("positionAmt", 0))),
+        })
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+# open_long — abre LONG real en BingX Futuros
+# ══════════════════════════════════════════════════════════
+
+def open_long(symbol: str, sig: dict) -> dict | None:
+    try:
+        par     = symbol.replace("/", "-")
+        balance = get_balance()
+        precio  = sig.get("entry", get_precio(par))
+        cant    = calcular_cantidad(par, balance, precio)
+        if cant <= 0:
+            log.warning(f"open_long {symbol}: cantidad=0 balance=${balance:.2f}")
+            return None
+
+        # Configurar apalancamiento para LONG
+        _post("/openApi/swap/v2/trade/leverage", {
+            "symbol": par, "side": "LONG", "leverage": str(config.LEVERAGE)
+        })
+
+        # Orden de mercado LONG
+        resp = _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "BUY",
+            "positionSide": "LONG", "type": "MARKET",
+            "quantity": str(cant),
+        })
+
+        if resp.get("code") != 0:
+            log.error(f"open_long {symbol}: {resp.get('msg', resp)}")
+            return None
+
+        order_id = str(resp.get("data", {}).get("orderId", ""))
+
+        # SL automático
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "SELL", "positionSide": "LONG",
+            "type": "STOP_MARKET", "quantity": str(cant),
+            "stopPrice": str(round(sig["sl"], 8)),
+            "workingType": "MARK_PRICE"
+        })
+
+        # TP automático
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "SELL", "positionSide": "LONG",
+            "type": "TAKE_PROFIT_MARKET", "quantity": str(cant),
+            "stopPrice": str(round(sig["tp"], 8)),
+            "workingType": "MARK_PRICE"
+        })
+
+        log.info(f"LONG ABIERTO {par} qty:{cant} entrada:{precio} SL:{sig['sl']:.8f} TP:{sig['tp']:.8f}")
+        return {"side": "long", "qty": cant, "order_id": order_id}
+
+    except Exception as e:
+        log.error(f"open_long {symbol}: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════
+# open_short — abre SHORT real en BingX Futuros
+# ══════════════════════════════════════════════════════════
+
+def open_short(symbol: str, sig: dict) -> dict | None:
+    try:
+        par     = symbol.replace("/", "-")
+        balance = get_balance()
+        precio  = sig.get("entry", get_precio(par))
+        cant    = calcular_cantidad(par, balance, precio)
+        if cant <= 0:
+            log.warning(f"open_short {symbol}: cantidad=0 balance=${balance:.2f}")
+            return None
+
+        # Configurar apalancamiento para SHORT
+        _post("/openApi/swap/v2/trade/leverage", {
+            "symbol": par, "side": "SHORT", "leverage": str(config.LEVERAGE)
+        })
+
+        # Orden de mercado SHORT
+        resp = _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "SELL",
+            "positionSide": "SHORT", "type": "MARKET",
+            "quantity": str(cant),
+        })
+
+        if resp.get("code") != 0:
+            log.error(f"open_short {symbol}: {resp.get('msg', resp)}")
+            return None
+
+        order_id = str(resp.get("data", {}).get("orderId", ""))
+
+        # SL automático SHORT
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "BUY", "positionSide": "SHORT",
+            "type": "STOP_MARKET", "quantity": str(cant),
+            "stopPrice": str(round(sig["sl"], 8)),
+            "workingType": "MARK_PRICE"
+        })
+
+        # TP automático SHORT
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "BUY", "positionSide": "SHORT",
+            "type": "TAKE_PROFIT_MARKET", "quantity": str(cant),
+            "stopPrice": str(round(sig["tp"], 8)),
+            "workingType": "MARK_PRICE"
+        })
+
+        log.info(f"SHORT ABIERTO {par} qty:{cant} entrada:{precio} SL:{sig['sl']:.8f} TP:{sig['tp']:.8f}")
+        return {"side": "short", "qty": cant, "order_id": order_id}
+
+    except Exception as e:
+        log.error(f"open_short {symbol}: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════
+# close_long / close_short — cierran posición real
+# ══════════════════════════════════════════════════════════
+
+def close_long(symbol: str, qty: float) -> bool:
+    try:
+        par  = symbol.replace("/", "-")
+        resp = _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "SELL",
+            "positionSide": "LONG", "type": "MARKET",
+            "quantity": str(round(qty, 4)),
+        })
+        ok = resp.get("code") == 0
+        if ok:
+            # Cancelar SL/TP pendientes del LONG
+            _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
+            log.info(f"LONG CERRADO {par} qty:{qty}")
+        else:
+            log.error(f"close_long {symbol}: {resp.get('msg', resp)}")
+        return ok
+    except Exception as e:
+        log.error(f"close_long {symbol}: {e}")
+        return False
+
+
+def close_short(symbol: str, qty: float) -> bool:
+    try:
+        par  = symbol.replace("/", "-")
+        resp = _post("/openApi/swap/v2/trade/order", {
+            "symbol": par, "side": "BUY",
+            "positionSide": "SHORT", "type": "MARKET",
+            "quantity": str(round(qty, 4)),
+        })
+        ok = resp.get("code") == 0
+        if ok:
+            _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
+            log.info(f"SHORT CERRADO {par} qty:{qty}")
+        else:
+            log.error(f"close_short {symbol}: {resp.get('msg', resp)}")
+        return ok
+    except Exception as e:
+        log.error(f"close_short {symbol}: {e}")
+        return False
