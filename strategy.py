@@ -1,472 +1,540 @@
 """
-strategy.py — BB+RSI ELITE v5
-Fixes vs v4:
-  - Score minimo bajado de 55 → 45 (55 bloqueaba todo con tendencia neutral)
-  - bb_touch_long: precio TOCA la banda inferior (no solo cruza por debajo)
-    Esto multiplica las señales sin sacrificar calidad
-  - RSI_OB subido a 45 en config (40 era demasiado estricto)
-  - MACD ya no es obligatorio — suma al score pero no bloquea solo
-  - Mantiene todos los filtros de calidad: score, divergencia, momentum
+strategy.py — Motor de 4 Estrategias + Filtro Institucional v7
+═══════════════════════════════════════════════════════════════
+Cada señal técnica pasa por liquidity.py antes de ejecutarse:
+
+  1. BB_RSI      — Bollinger Bands + RSI sobrevendido/sobrecomprado
+  2. EMA_MULTI   — EMAs 3/8/21/55/200: continuaciones + reversiones
+  3. BREAKOUT    — Ruptura de rango + volumen + expansión ATR
+  4. FLASH_ARB   — Spread precio vs 3 precios justos independientes
+
+Flujo institucional (liquidity.py):
+  • Confirma la señal   → +bonus score (hasta +15)
+  • Contradice suave    → penalización score (-10)
+  • Contradice fuerte   → señal BLOQUEADA
+  • Consenso 2 estrat.  → +10 score
+  • Consenso 3+ estrat. → +15 score
 """
+import logging
+import statistics
 import pandas as pd
-import numpy as np
+
 import config as cfg
 
+log = logging.getLogger("strategy")
 
-# ═══════════════════════════════════════════════════════════
-# INDICADORES BASE
-# ═══════════════════════════════════════════════════════════
-
-def calc_bb(close, period=None, sigma=None):
-    period = period or cfg.BB_PERIOD
-    sigma  = sigma  or cfg.BB_SIGMA
-    basis  = close.rolling(period).mean()
-    std    = close.rolling(period).std()
-    return basis + sigma * std, basis, basis - sigma * std
+# Import liquidity con fallback por si hay error de red
+try:
+    import liquidity as liq
+    _LIQ_AVAILABLE = True
+except Exception:
+    _LIQ_AVAILABLE = False
+    log.warning("liquidity.py no disponible — filtro institucional desactivado")
 
 
-def calc_rsi(close, period=None):
-    period = period or cfg.RSI_PERIOD
-    delta  = close.diff()
-    gain   = delta.clip(lower=0).rolling(period).mean()
-    loss   = (-delta.clip(upper=0)).rolling(period).mean()
-    rs     = gain / loss.replace(0, float("nan"))
-    return 100 - 100 / (1 + rs)
+# ══════════════════════════════════════════════════════════
+# HELPERS COMUNES
+# ══════════════════════════════════════════════════════════
 
+def _ema(s: pd.Series, p: int) -> pd.Series:
+    return s.ewm(span=p, adjust=False).mean()
 
-def calc_atr(df, p=14):
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat(
-        [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1
-    ).max(axis=1)
-    return tr.rolling(p).mean()
+def _rsi(closes: pd.Series, period: int = 14) -> float:
+    d   = closes.diff()
+    g   = d.clip(lower=0).rolling(period).mean()
+    l   = (-d.clip(upper=0)).rolling(period).mean()
+    rs  = g / l.replace(0, 1e-10)
+    val = (100 - 100 / (1 + rs)).iloc[-1]
+    return float(val) if val == val else 50.0
 
+def _atr(df: pd.DataFrame, period: int = 14) -> float:
+    hi, lo, cl = df["high"], df["low"], df["close"]
+    tr  = pd.concat([(hi - lo),
+                     (hi - cl.shift()).abs(),
+                     (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    val = tr.rolling(period).mean().iloc[-1]
+    return float(val) if val == val else 0.0
 
-def calc_macd(close, fast=12, slow=26, signal=9):
-    ema_f = close.ewm(span=fast,   adjust=False).mean()
-    ema_s = close.ewm(span=slow,   adjust=False).mean()
-    line  = ema_f - ema_s
-    sig   = line.ewm(span=signal,  adjust=False).mean()
-    hist  = line - sig
-    return line, sig, hist
+def _bb(closes: pd.Series, period: int = 20, sigma: float = 2.0) -> dict:
+    m  = closes.rolling(period).mean()
+    s  = closes.rolling(period).std()
+    up = m + sigma * s
+    dn = m - sigma * s
+    price = float(closes.iloc[-1])
+    upper = float(up.iloc[-1]); lower = float(dn.iloc[-1])
+    width = upper - lower
+    return {
+        "mid":   float(m.iloc[-1]),
+        "upper": upper,
+        "lower": lower,
+        "pos":   (price - lower) / width if width > 0 else 0.5,
+        "width": width,
+    }
 
+def _trend_4h(df_4h) -> str:
+    if df_4h is None or len(df_4h) < 50:
+        return "flat"
+    p = float(df_4h["close"].iloc[-1])
+    e = float(_ema(df_4h["close"], 50).iloc[-1])
+    if p > e * 1.01:  return "up"
+    if p < e * 0.99:  return "down"
+    return "flat"
 
-def calc_keltner(df, period=20, mult=1.5):
-    mid = df["close"].ewm(span=period, adjust=False).mean()
-    atr = calc_atr(df, period)
-    return mid + mult * atr, mid, mid - mult * atr
+def _vol_ratio(df: pd.DataFrame, period: int = 20) -> float:
+    v = df["volume"]
+    a = float(v.iloc[-period - 1:-1].mean())
+    return float(v.iloc[-1]) / a if a > 0 else 1.0
 
-
-def calc_volume_spike(volume, period=20):
-    avg = volume.rolling(period).mean()
-    return volume / avg.replace(0, float("nan"))
-
-
-def calc_stoch_rsi(close, period=14, smooth_k=3, smooth_d=3):
-    rsi     = calc_rsi(close, period)
-    rsi_min = rsi.rolling(period).min()
-    rsi_max = rsi.rolling(period).max()
-    rng     = (rsi_max - rsi_min).replace(0, float("nan"))
-    k       = ((rsi - rsi_min) / rng * 100).rolling(smooth_k).mean()
-    d       = k.rolling(smooth_d).mean()
-    return k, d
-
-
-# ═══════════════════════════════════════════════════════════
-# REGIMEN DE MERCADO
-# ═══════════════════════════════════════════════════════════
-
-def get_trend_htf(df_4h):
-    """Tendencia en 4h: BB + RSI + MACD. Requiere los 3 de acuerdo."""
-    if df_4h is None or len(df_4h) < cfg.BB_PERIOD + 5:
-        return "neutral"
-    _, basis_4h, _ = calc_bb(df_4h["close"])
-    rsi_4h          = calc_rsi(df_4h["close"])
-    _, _, macd_h    = calc_macd(df_4h["close"])
-    price  = float(df_4h["close"].iloc[-1])
-    basis  = float(basis_4h.iloc[-1])
-    rsi    = float(rsi_4h.iloc[-1])
-    m_hist = float(macd_h.iloc[-1])
-    if price > basis and rsi < 70 and m_hist > 0:
-        return "bull"
-    elif price < basis and rsi > 30 and m_hist < 0:
-        return "bear"
-    return "neutral"
-
-
-def is_sideways(df):
-    cur   = df.iloc[-1]
-    basis = float(cur["basis"])
-    if basis == 0:
-        return False
-    bb_width  = (float(cur["upper"]) - float(cur["lower"])) / basis
-    atr_avg   = df["atr"].rolling(50).mean().iloc[-1]
-    atr_ratio = float(cur["atr"]) / atr_avg if atr_avg and atr_avg > 0 else 1.0
-    return bb_width < cfg.SIDEWAYS_BB_WIDTH and atr_ratio < cfg.SIDEWAYS_ATR_RATIO
-
-
-def detect_squeeze(df):
-    upper_bb, _, lower_bb = calc_bb(df["close"])
-    upper_kc, _, lower_kc = calc_keltner(df)
-    return (lower_bb.iloc[-1] > lower_kc.iloc[-1]) and \
-           (upper_bb.iloc[-1] < upper_kc.iloc[-1])
-
-
-# ═══════════════════════════════════════════════════════════
-# DIVERGENCIAS
-# ═══════════════════════════════════════════════════════════
-
-def detect_rsi_divergence(df, lookback=6):
-    if len(df) < lookback + 2:
-        return None
-    rec = df.tail(lookback + 1)
-    p_now      = float(rec["close"].iloc[-1])
-    r_now      = float(rec["rsi"].iloc[-1])
-    p_low_prev = float(rec["close"].iloc[:-1].min())
-    r_prev_min = float(rec["rsi"].iloc[:-1].min())
-    if p_now < p_low_prev and r_now > r_prev_min + 3:
-        return "bullish"
-    p_hi_prev = float(rec["close"].iloc[:-1].max())
-    r_hi_prev = float(rec["rsi"].iloc[:-1].max())
-    if p_now > p_hi_prev and r_now < r_hi_prev - 3:
-        return "bearish"
-    return None
-
-
-# ═══════════════════════════════════════════════════════════
-# FILTROS DE CALIDAD
-# ═══════════════════════════════════════════════════════════
-
-def has_momentum_confirmation(df, side="long"):
-    if len(df) < 4:
-        return True
-    bodies = (df["close"] - df["open"]).abs().tail(3)
-    return float(bodies.iloc[-1]) <= float(bodies.iloc[-2]) * 1.6
-
-
-def calc_signal_score(rsi, trend, divergence, macd_aligned,
-                      squeeze, sideways, side="long"):
-    """
-    Score 0-100. FIX: minimo bajado a 45 (antes 55 bloqueaba señales validas).
-    Con tendencia neutral y RSI 35-45, score = 40+10+5 = 55 → ENTRA.
-    """
-    score = 40  # base por tener señal BB
-
+def _sl_tp(price: float, atr: float, side: str):
+    """Calcula SL, TP y R:R para long o short."""
     if side == "long":
-        if rsi < 25:              score += 25   # RSI extremadamente sobrevendido
-        elif rsi < 30:            score += 20
-        elif rsi < 40:            score += 12
-        elif rsi < 48:            score += 6    # FIX: RSI hasta 48 da puntos (antes cortaba en 40)
-        if trend == "bull":       score += 15
-        elif trend == "neutral":  score += 5
-        if divergence == "bullish": score += 15
-        if macd_aligned:          score += 8    # FIX: reducido de 10 a 8, ya no es obligatorio
-        if squeeze:               score += 8
-        if sideways:              score += 5
+        sl = price - atr * cfg.SL_ATR
+        tp = price + atr * cfg.TP_ATR_MULT
+        rr_n = tp - price; rr_d = price - sl
     else:
-        if rsi > 75:              score += 25
-        elif rsi > 70:            score += 20
-        elif rsi > 60:            score += 12
-        elif rsi > 52:            score += 6    # FIX: RSI desde 52 da puntos
-        if trend == "bear":       score += 15
-        elif trend == "neutral":  score += 5
-        if divergence == "bearish": score += 15
-        if macd_aligned:          score += 8
-        if squeeze:               score += 8
-        if sideways:              score += 5
+        sl = price + atr * cfg.SL_ATR
+        tp = price - atr * cfg.TP_ATR_MULT
+        rr_n = price - tp; rr_d = sl - price
+    rr = rr_n / rr_d if rr_d > 0 else 0
+    return round(sl, 8), round(tp, 8), round(rr, 2)
 
-    return min(score, 100)
+def _base(price, atr, side, strategy, score, reason, rsi, trend):
+    """Construye el dict base de una señal."""
+    sl, tp, rr = _sl_tp(price, atr, side)
+    return {
+        "action":   "buy" if side == "long" else "sell_short",
+        "strategy": strategy,
+        "entry":    price,
+        "sl":       sl,
+        "tp":       tp,
+        "rr":       rr,
+        "atr":      atr,
+        "score":    min(100, max(0, score)),
+        "reason":   reason,
+        "rsi":      round(rsi, 1) if rsi else 50,
+        "trend_4h": trend,
+    }
 
 
-# ═══════════════════════════════════════════════════════════
-# SEÑAL PRINCIPAL
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# ESTRATEGIA 1: BOLLINGER BANDS + RSI
+# ══════════════════════════════════════════════════════════
 
-def get_signal(df, df_4h=None):
-    if len(df) < cfg.BB_PERIOD + 15:
-        return {"action": "hold", "reason": "datos insuficientes"}
+def _strategy_bb_rsi(df: pd.DataFrame, df_4h=None) -> dict:
+    """
+    LONG : precio ≤ banda inferior BB + RSI sobrevendido
+    SHORT: precio ≥ banda superior BB + RSI sobrecomprado
+    Bonus: profundidad de RSI, posición en BB, tendencia 4h
+    """
+    if not getattr(cfg, "STRATEGY_BB_RSI_ENABLED", True) or len(df) < 30:
+        return {"action": "none", "score": 0, "reason": "BB_RSI desactivado"}
 
-    df = df.copy()
-    upper, basis, lower = calc_bb(df["close"])
-    df["basis"]     = basis
-    df["lower"]     = lower
-    df["upper"]     = upper
-    df["rsi"]       = calc_rsi(df["close"])
-    df["atr"]       = calc_atr(df)
-    df["vol_spike"] = calc_volume_spike(df["volume"]) if "volume" in df.columns else 1.0
-    _, _, macd_hist = calc_macd(df["close"])
-    df["macd_hist"] = macd_hist
-    stoch_k, stoch_d = calc_stoch_rsi(df["close"])
-    df["stoch_k"]   = stoch_k
-    df["stoch_d"]   = stoch_d
+    closes = df["close"]
+    price  = float(closes.iloc[-1])
+    rsi    = _rsi(closes)
+    bb     = _bb(closes, cfg.BB_PERIOD, cfg.BB_SIGMA)
+    atr    = _atr(df)
+    trend  = _trend_4h(df_4h)
 
-    cur  = df.iloc[-1]
-    prev = df.iloc[-2]
-    price     = float(cur["close"])
-    rsi       = float(cur["rsi"])
-    atr       = float(cur["atr"])
-    stoch_k_v = float(cur["stoch_k"]) if not pd.isna(cur["stoch_k"]) else 50
-    vol_spike = float(cur["vol_spike"]) if not pd.isna(cur["vol_spike"]) else 1.0
-    macd_bull = float(cur["macd_hist"]) > 0
-    macd_bear = float(cur["macd_hist"]) < 0
+    if atr <= 0:
+        return {"action": "none", "score": 0, "reason": "ATR=0"}
 
-    # ── Filtro volumen anomalo ─────────────────────────────
-    if cfg.VOLUME_SPIKE_ENABLED and vol_spike > cfg.VOLUME_SPIKE_MULT:
-        return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                "reason": f"Volumen anomalo x{vol_spike:.1f}"}
+    # ── LONG ──────────────────────────────────────────────
+    if price <= bb["lower"] * 1.003 and rsi < cfg.RSI_OS and trend != "down":
+        score = 50
+        score += min(20, int(cfg.RSI_OS - rsi))      # RSI más bajo = más señal
+        if bb["pos"] < 0.05:  score += 12             # muy dentro de la banda
+        elif bb["pos"] < 0.1: score += 7
+        if trend == "up":     score += 10
+        return _base(price, atr, "long", "BB_RSI", score,
+                     f"BB_RSI LONG | RSI={rsi:.1f} pos={bb['pos']:.2f} trend={trend}",
+                     rsi, trend)
 
-    trend      = get_trend_htf(df_4h)
-    sideways   = is_sideways(df)
-    squeeze    = detect_squeeze(df)
-    divergence = detect_rsi_divergence(df)
+    # ── SHORT ─────────────────────────────────────────────
+    if price >= bb["upper"] * 0.997 and rsi > cfg.RSI_OB and trend != "up":
+        score = 50
+        score += min(20, int(rsi - cfg.RSI_OB))
+        if bb["pos"] > 0.95:  score += 12
+        elif bb["pos"] > 0.9: score += 7
+        if trend == "down":   score += 10
+        return _base(price, atr, "short", "BB_RSI", score,
+                     f"BB_RSI SHORT | RSI={rsi:.1f} pos={bb['pos']:.2f} trend={trend}",
+                     rsi, trend)
 
-    bb_lower = float(cur["lower"])
-    bb_upper = float(cur["upper"])
-    bb_basis = float(cur["basis"])
+    return {"action": "none", "score": 0,
+            "reason": f"BB_RSI sin señal RSI={rsi:.1f} pos={bb['pos']:.2f}"}
 
-    # ─────────────────────────────────────────────────────
-    # MERCADO LATERAL — mean reversion pura
-    # ─────────────────────────────────────────────────────
-    if sideways:
-        if price <= bb_lower * 1.005 and rsi < 45 and stoch_k_v < 30 and trend != "bear":
-            score = calc_signal_score(rsi, trend, divergence, macd_bull, squeeze, True, "long")
-            if score >= 45:
-                sl      = round(price - cfg.SL_ATR * atr * 0.7, 4)
-                risk    = price - sl
-                tp      = round(max(bb_basis, price + risk * 1.8), 4)
-                tp_part = round(price + risk * 0.9, 4)
-                return {
-                    "action": "buy", "entry": round(price, 4),
-                    "sl": sl, "tp": tp, "tp_partial": tp_part,
-                    "rsi": round(rsi, 1), "atr": round(atr, 4),
-                    "score": score, "trend_4h": trend,
-                    "reason": f"LONG LATERAL | RSI={round(rsi,1)} Stoch={round(stoch_k_v,1)} Score={score}"
-                }
 
-        if cfg.SHORT_ENABLED and price >= bb_upper * 0.995 and rsi > 55 and stoch_k_v > 70 and trend != "bull":
-            score = calc_signal_score(rsi, trend, divergence, macd_bear, squeeze, True, "short")
-            if score >= 45:
-                sl      = round(price + cfg.SL_ATR * atr * 0.7, 4)
-                risk    = sl - price
-                tp      = round(min(bb_basis, price - risk * 1.8), 4)
-                tp_part = round(price - risk * 0.9, 4)
-                return {
-                    "action": "sell_short", "entry": round(price, 4),
-                    "sl": sl, "tp": tp, "tp_partial": tp_part,
-                    "rsi": round(rsi, 1), "atr": round(atr, 4),
-                    "score": score, "trend_4h": trend,
-                    "reason": f"SHORT LATERAL | RSI={round(rsi,1)} Stoch={round(stoch_k_v,1)} Score={score}"
-                }
+# ══════════════════════════════════════════════════════════
+# ESTRATEGIA 2: EMA MULTI 3/8/21/55/200
+# Continuaciones Y Reversiones
+# ══════════════════════════════════════════════════════════
 
-    # ─────────────────────────────────────────────────────
-    # SEÑAL LONG — BB inferior
-    # FIX: bb_touch_long = precio TOCA o cruza la banda (no solo cruza por debajo)
-    # Antes: solo cruce estricto → muy raro. Ahora: precio <= lower * 1.002
-    # ─────────────────────────────────────────────────────
-    bb_touch_long = price <= bb_lower * 1.002   # toca o esta dentro del 0.2% de la banda
-    bb_cross_long = float(prev["close"]) >= float(prev["lower"]) and price < bb_lower
-    div_long      = divergence == "bullish" and rsi < 48 and price <= bb_lower * 1.008
+def _strategy_ema_multi(df: pd.DataFrame, df_4h=None) -> dict:
+    """
+    4 modos de entrada usando la estructura completa de EMAs:
 
-    if (bb_touch_long or bb_cross_long or div_long) and rsi < cfg.RSI_OB and atr > 0:
-        if trend == "bear" and not div_long:
-            return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                    "reason": "LONG bloqueado: tendencia 4h bajista"}
-        # FIX 5: LONG_ONLY_UP — strategy usa "bull", permitir también neutral con RSI muy bajo
-        if getattr(cfg, "LONG_ONLY_UP", False) and trend == "bear":
-            return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                    "reason": f"LONG bloqueado: LONG_ONLY_UP activo (trend={trend})"}
-        if cfg.REQUIRE_MOMENTUM and not has_momentum_confirmation(df, "long"):
-            return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                    "reason": "LONG bloqueado: caida libre sin desaceleracion"}
+    CONTINUACIÓN ALCISTA:
+      Todas EMAs alineadas 3>8>21>55>200 + pullback a EMA8/21 + bounce
 
-        score = calc_signal_score(rsi, trend, divergence, macd_bull, squeeze, sideways, "long")
-        if score < 45:  # FIX: bajado de 55 a 45
-            return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                    "reason": f"LONG descartado: score bajo ({score}/100)"}
+    REVERSIÓN ALCISTA:
+      EMA200 pendiente positiva + precio rebota en EMA55 + cruce 3>8
 
-        sl        = round(price - cfg.SL_ATR * atr, 4)
-        risk      = price - sl
-        # TP garantiza R:R >= 2.0 — usa el mayor entre: media BB y precio + 2x riesgo
-        tp_rr     = round(price + risk * 2.0, 4)
-        tp_full   = round(max(bb_basis, tp_rr), 4)
-        tp_part   = round(price + risk * 1.0, 4)   # TP1 a 1:1 — asegura ganancia parcial
-        tag     = "DIV" if div_long else ("SQZ" if squeeze else ("TOUCH" if bb_touch_long else "BB"))
-        reason  = (f"LONG {tag} | RSI={round(rsi,1)} Stoch={round(stoch_k_v,1)} "
-                   f"MACD={'↑' if macd_bull else '↓'} 4h={trend} Score={score}")
+    CONTINUACIÓN BAJISTA (mirror):
+      Todas EMAs 3<8<21<55<200 + rebote en EMA8/21 bajista
+
+    REVERSIÓN BAJISTA (mirror):
+      EMA200 pendiente negativa + precio rechazado en EMA55 + cruce 3<8
+    """
+    if not getattr(cfg, "STRATEGY_EMA_CROSS_ENABLED", True) or len(df) < 210:
+        return {"action": "none", "score": 0, "reason": "EMA_MULTI sin datos (necesita 210 velas)"}
+
+    closes = df["close"]
+    price  = float(closes.iloc[-1])
+    atr    = _atr(df)
+    trend  = _trend_4h(df_4h)
+    vr     = _vol_ratio(df)
+
+    if atr <= 0:
+        return {"action": "none", "score": 0, "reason": "ATR=0"}
+
+    # Calcular todas las EMAs
+    e3   = _ema(closes, 3);   e8   = _ema(closes, 8)
+    e21  = _ema(closes, 21);  e55  = _ema(closes, 55)
+    e200 = _ema(closes, 200)
+
+    v3   = float(e3.iloc[-1]);   v3p  = float(e3.iloc[-2])
+    v8   = float(e8.iloc[-1]);   v8p  = float(e8.iloc[-2])
+    v21  = float(e21.iloc[-1])
+    v55  = float(e55.iloc[-1])
+    v200 = float(e200.iloc[-1]);  v200_10 = float(e200.iloc[-10])
+
+    # Pendiente EMA200 (momentum de largo plazo)
+    slope200 = (v200 - v200_10) / v200_10 if v200_10 > 0 else 0
+
+    # Estructura de EMAs
+    aligned_bull = v3 > v8 > v21 > v55 > v200
+    aligned_bear = v3 < v8 < v21 < v55 < v200
+
+    # Cruce EMA3 sobre/bajo EMA8
+    cross_up   = v3p <= v8p and v3 > v8
+    cross_down = v3p >= v8p and v3 < v8
+
+    rsi = _rsi(closes)
+
+    # ── CONTINUACIÓN ALCISTA ───────────────────────────────
+    if aligned_bull and trend != "down":
+        touch  = v55 < price <= max(v8, v21) * 1.005
+        bounce = cross_up or (price > v8 and float(closes.iloc[-2]) <= v8 * 1.001)
+        if touch and bounce and vr >= 1.0:
+            score = 60
+            if trend == "up":       score += 10
+            if vr > 1.5:            score += 8
+            if slope200 > 0.001:    score += 7
+            if cross_up:            score += 5
+            return _base(price, atr, "long", "EMA_MULTI", score,
+                         f"EMA_CONT_BULL pull EMA8/21 vol={vr:.1f}x slope200={slope200*100:.3f}%",
+                         rsi, trend)
+
+    # ── REVERSIÓN ALCISTA ──────────────────────────────────
+    if not aligned_bull and slope200 > 0 and trend != "down":
+        near_e55 = v55 * 0.99 <= price <= v55 * 1.02
+        if near_e55 and price > v200 and cross_up and rsi < 50 and vr >= 1.0:
+            score = 55
+            if slope200 > 0.002: score += 8
+            if trend == "up":    score += 8
+            if vr > 1.3:         score += 7
+            if rsi < 40:         score += 5
+            return _base(price, atr, "long", "EMA_MULTI", score,
+                         f"EMA_REV_BULL toque EMA55={v55:.5f} cross3>8 RSI={rsi:.1f}",
+                         rsi, trend)
+
+    # ── CONTINUACIÓN BAJISTA ───────────────────────────────
+    if aligned_bear and trend != "up":
+        touch  = min(v8, v21) * 0.995 <= price < v55
+        bounce = cross_down or (price < v8 and float(closes.iloc[-2]) >= v8 * 0.999)
+        if touch and bounce and vr >= 1.0:
+            score = 60
+            if trend == "down":     score += 10
+            if vr > 1.5:            score += 8
+            if slope200 < -0.001:   score += 7
+            if cross_down:          score += 5
+            return _base(price, atr, "short", "EMA_MULTI", score,
+                         f"EMA_CONT_BEAR pull EMA8/21 vol={vr:.1f}x slope200={slope200*100:.3f}%",
+                         rsi, trend)
+
+    # ── REVERSIÓN BAJISTA ──────────────────────────────────
+    if not aligned_bear and slope200 < 0 and trend != "up":
+        near_e55 = v55 * 0.98 <= price <= v55 * 1.01
+        if near_e55 and price < v200 and cross_down and rsi > 50 and vr >= 1.0:
+            score = 55
+            if slope200 < -0.002: score += 8
+            if trend == "down":   score += 8
+            if vr > 1.3:          score += 7
+            if rsi > 60:          score += 5
+            return _base(price, atr, "short", "EMA_MULTI", score,
+                         f"EMA_REV_BEAR toque EMA55={v55:.5f} cross3<8 RSI={rsi:.1f}",
+                         rsi, trend)
+
+    return {"action": "none", "score": 0,
+            "reason": f"EMA_MULTI sin señal | alin_bull={aligned_bull} alin_bear={aligned_bear} slope200={slope200*100:.3f}%"}
+
+
+# ══════════════════════════════════════════════════════════
+# ESTRATEGIA 3: BREAKOUT DE RANGO
+# ══════════════════════════════════════════════════════════
+
+def _strategy_breakout(df: pd.DataFrame, df_4h=None) -> dict:
+    """
+    LONG : precio rompe máximo de 20 velas + volumen alto + ATR expandiéndose
+    SHORT: precio rompe mínimo de 20 velas + volumen alto + ATR expandiéndose
+    Evita falsas rupturas exigiendo expansión de ATR y volumen 1.3x.
+    """
+    if not getattr(cfg, "STRATEGY_BREAKOUT_ENABLED", True) or len(df) < 30:
+        return {"action": "none", "score": 0, "reason": "BREAKOUT desactivado"}
+
+    closes = df["close"]; highs = df["high"]; lows = df["low"]
+    price  = float(closes.iloc[-1])
+    atr    = _atr(df)
+    trend  = _trend_4h(df_4h)
+    vr     = _vol_ratio(df)
+
+    prev_high = float(highs.iloc[-21:-1].max())
+    prev_low  = float(lows.iloc[-21:-1].min())
+    rng       = prev_high - prev_low
+
+    atr_now  = _atr(df.iloc[-15:]) if len(df) >= 15 else atr
+    atr_prev = _atr(df.iloc[-30:-15]) if len(df) >= 30 else atr
+    atr_exp  = atr_now > atr_prev * 1.1
+
+    # LONG
+    if price > prev_high * 1.001 and vr >= 1.3 and atr_exp and trend != "down":
+        score = 55
+        if vr > 2.0:   score += 15
+        elif vr > 1.5: score += 8
+        if trend == "up":  score += 10
+        if rng > 0 and (price - prev_high) / rng > 0.03: score += 5
+        return _base(price, atr, "long", "BREAKOUT", score,
+                     f"BREAKOUT LONG rango {prev_low:.5f}-{prev_high:.5f} vol={vr:.1f}x",
+                     _rsi(closes), trend)
+
+    # SHORT
+    if price < prev_low * 0.999 and vr >= 1.3 and atr_exp and trend != "up":
+        score = 55
+        if vr > 2.0:    score += 15
+        elif vr > 1.5:  score += 8
+        if trend == "down": score += 10
+        if rng > 0 and (prev_low - price) / rng > 0.03: score += 5
+        return _base(price, atr, "short", "BREAKOUT", score,
+                     f"BREAKOUT SHORT rango {prev_low:.5f}-{prev_high:.5f} vol={vr:.1f}x",
+                     _rsi(closes), trend)
+
+    return {"action": "none", "score": 0,
+            "reason": f"BREAKOUT sin señal vol={vr:.1f}x ATR_exp={atr_exp}"}
+
+
+# ══════════════════════════════════════════════════════════
+# ESTRATEGIA 4: FLASH ARB — Spread precio multi-capa
+# ══════════════════════════════════════════════════════════
+
+def _strategy_flash_arb(df: pd.DataFrame, df_4h=None) -> dict:
+    """
+    Inspirada en el contrato de arbitraje flash (Solidity):
+    El contrato detecta diferencias entre DEXs para obtener ganancia.
+
+    Aquí calculamos 3 "precios justos" como si fueran 3 DEXs:
+      DEX1 = (EMA3 + EMA8) / 2    → precio de corto plazo
+      DEX2 = EMA21                 → precio de medio plazo
+      DEX3 = media BB              → precio "fundamental"
+
+    LONG : precio spot por debajo de los 3 simultáneamente (ineficiencia bajista)
+    SHORT: precio spot por encima de los 3 simultáneamente (ineficiencia alcista)
+
+    El spread mínimo se calcula como porcentaje del ATR (como minProfit en el contrato).
+    """
+    if not getattr(cfg, "STRATEGY_FLASH_ARB_ENABLED", True) or len(df) < 55:
+        return {"action": "none", "score": 0, "reason": "FLASH_ARB desactivado"}
+
+    closes = df["close"]
+    price  = float(closes.iloc[-1])
+    atr    = _atr(df)
+    trend  = _trend_4h(df_4h)
+    rsi    = _rsi(closes)
+    vr     = _vol_ratio(df)
+
+    if atr <= 0 or price <= 0:
+        return {"action": "none", "score": 0, "reason": "FLASH_ARB ATR/precio=0"}
+
+    # 3 precios justos independientes
+    fair_fast = (float(_ema(closes, 3).iloc[-1]) + float(_ema(closes, 8).iloc[-1])) / 2
+    fair_mid  = float(_ema(closes, 21).iloc[-1])
+    fair_slow = _bb(closes, cfg.BB_PERIOD, cfg.BB_SIGMA)["mid"]
+
+    # Spread mínimo ajustado por volatilidad (como minProfit del contrato)
+    min_spread = max(0.004, (atr / price) * 0.3)
+
+    # ── LONG: precio injustamente bajo ─────────────────────
+    sf = (fair_fast - price) / price
+    sm = (fair_mid  - price) / price
+    ss = (fair_slow - price) / price
+
+    if sf > min_spread and sm > min_spread and ss > min_spread and rsi < 55 and trend != "down":
+        avg   = (sf + sm + ss) / 3
+        score = 50 + min(25, int(avg * 1000))
+        if trend == "up":  score += 10
+        if vr > 1.2:       score += 7
+        if rsi < 40:       score += 8
+        try:
+            if statistics.stdev([sf, sm, ss]) < 0.003: score += 5  # spreads coherentes
+        except Exception:
+            pass
+        return _base(price, atr, "long", "FLASH_ARB", score,
+                     f"FLASH_ARB LONG fast={sf*100:.2f}% mid={sm*100:.2f}% slow={ss*100:.2f}% min={min_spread*100:.2f}%",
+                     rsi, trend)
+
+    # ── SHORT: precio injustamente alto ────────────────────
+    sf2 = (price - fair_fast) / price
+    sm2 = (price - fair_mid)  / price
+    ss2 = (price - fair_slow) / price
+
+    if sf2 > min_spread and sm2 > min_spread and ss2 > min_spread and rsi > 45 and trend != "up":
+        avg   = (sf2 + sm2 + ss2) / 3
+        score = 50 + min(25, int(avg * 1000))
+        if trend == "down": score += 10
+        if vr > 1.2:        score += 7
+        if rsi > 60:        score += 8
+        try:
+            if statistics.stdev([sf2, sm2, ss2]) < 0.003: score += 5
+        except Exception:
+            pass
+        return _base(price, atr, "short", "FLASH_ARB", score,
+                     f"FLASH_ARB SHORT fast={sf2*100:.2f}% mid={sm2*100:.2f}% slow={ss2*100:.2f}% min={min_spread*100:.2f}%",
+                     rsi, trend)
+
+    return {"action": "none", "score": 0,
+            "reason": f"FLASH_ARB sin señal | min_req={min_spread*100:.2f}% fast={sf*100:.2f}% mid={sm*100:.2f}% slow={ss*100:.2f}%"}
+
+
+# ══════════════════════════════════════════════════════════
+# AGREGADOR PRINCIPAL
+# ══════════════════════════════════════════════════════════
+
+def get_signal(df: pd.DataFrame, df_4h=None) -> dict:
+    """
+    Flujo completo:
+      1. Ejecutar las 4 estrategias técnicas independientes
+      2. Elegir la de mayor score
+      3. Aplicar bonus por consenso (2+ estrategias misma dirección)
+      4. Aplicar filtro de liquidez institucional (liquidity.py)
+    """
+    if df is None or len(df) < 25:
+        return {"action": "none", "score": 0, "reason": "datos insuficientes",
+                "entry": 0, "sl": 0, "tp": 0, "atr": 0, "rsi": 50, "trend_4h": "flat"}
+
+    price = float(df["close"].iloc[-1])
+
+    # ── 1. Ejecutar estrategias ────────────────────────────
+    results = [
+        _strategy_bb_rsi(df, df_4h),
+        _strategy_ema_multi(df, df_4h),
+        _strategy_breakout(df, df_4h),
+        _strategy_flash_arb(df, df_4h),
+    ]
+
+    active = [r for r in results if r["action"] in ("buy", "sell_short")]
+
+    if not active:
+        best_none = max(results, key=lambda x: len(x.get("reason", "")))
         return {
-            "action": "buy", "entry": round(price, 4),
-            "sl": sl, "tp": tp_full, "tp_partial": tp_part,
-            "rsi": round(rsi, 1), "atr": round(atr, 4),
-            "score": score, "trend_4h": trend,
-            "bb_lower": round(bb_lower, 4),
-            "bb_basis": round(bb_basis, 4),
-            "reason": reason
+            "action": "none", "score": 0,
+            "reason": best_none.get("reason", "sin señal"),
+            "entry": price, "sl": 0, "tp": 0,
+            "atr": _atr(df), "rsi": _rsi(df["close"]), "trend_4h": _trend_4h(df_4h),
         }
 
-    # ─────────────────────────────────────────────────────
-    # SEÑAL SHORT — BB superior
-    # ─────────────────────────────────────────────────────
-    if cfg.SHORT_ENABLED:
-        bb_touch_short = price >= bb_upper * 0.998
-        bb_cross_short = float(prev["close"]) <= float(prev["upper"]) and price > bb_upper
-        div_short      = divergence == "bearish" and rsi > 52 and price >= bb_upper * 0.992
+    # ── 2. Mejor señal ─────────────────────────────────────
+    best = max(active, key=lambda x: x["score"])
 
-        if (bb_touch_short or bb_cross_short or div_short) and rsi > cfg.RSI_OS and atr > 0:
-            if trend == "bull" and not div_short:
-                return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                        "reason": "SHORT bloqueado: tendencia 4h alcista"}
-            if cfg.REQUIRE_MOMENTUM and not has_momentum_confirmation(df, "short"):
-                return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                        "reason": "SHORT bloqueado: subida sin desaceleracion"}
+    # ── 3. Bonus por consenso ──────────────────────────────
+    same = [r for r in active if r["action"] == best["action"]]
+    n    = len(same)
+    if n >= 2:
+        best   = best.copy()
+        bonus  = 10 if n == 2 else 15
+        strats = " + ".join(r.get("strategy", "?") for r in same)
+        best["score"]  = min(100, best["score"] + bonus)
+        best["reason"] = f"[CONSENSO {n}x:{strats} +{bonus}] " + best["reason"]
+        log.info(f"Consenso {n} estrategias ({strats}): {best['action']} score={best['score']}")
 
-            score = calc_signal_score(rsi, trend, divergence, macd_bear, squeeze, sideways, "short")
-            if score < 45:
-                return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1),
-                        "reason": f"SHORT descartado: score bajo ({score}/100)"}
+    # ── 4. Filtro Institucional ────────────────────────────
+    if _LIQ_AVAILABLE and getattr(cfg, "LIQUIDITY_ENABLED", True):
+        try:
+            symbol = df.attrs.get("symbol", "")
+            if symbol:
+                lbias = liq.analyze(symbol, price, best.get("atr", 0))
+                best  = liq.apply_liquidity_filter(best, lbias)
+                best["liquidity_bias"]    = lbias.bias
+                best["liquidity_score"]   = lbias.score
+                best["liquidity_summary"] = lbias.summary
+        except Exception as e:
+            log.debug(f"liquidity filter: {e}")
 
-            sl        = round(price + cfg.SL_ATR * atr, 4)
-            risk      = sl - price
-            # TP garantiza R:R >= 2.0
-            tp_rr     = round(price - risk * 2.0, 4)
-            tp_full   = round(min(bb_basis, tp_rr), 4)
-            tp_part   = round(price - risk * 1.0, 4)   # TP1 a 1:1
-            tag     = "DIV" if div_short else ("SQZ" if squeeze else ("TOUCH" if bb_touch_short else "BB"))
-            reason  = (f"SHORT {tag} | RSI={round(rsi,1)} Stoch={round(stoch_k_v,1)} "
-                       f"MACD={'↑' if macd_bull else '↓'} 4h={trend} Score={score}")
-            return {
-                "action": "sell_short", "entry": round(price, 4),
-                "sl": sl, "tp": tp_full, "tp_partial": tp_part,
-                "rsi": round(rsi, 1), "atr": round(atr, 4),
-                "score": score, "trend_4h": trend,
-                "bb_upper": round(bb_upper, 4),
-                "bb_basis": round(bb_basis, 4),
-                "reason": reason
-            }
+    # Garantizar campos mínimos
+    best.setdefault("rsi",      _rsi(df["close"]))
+    best.setdefault("trend_4h", _trend_4h(df_4h))
+    best.setdefault("atr",      _atr(df))
 
-    # ─────────────────────────────────────────────────────
-    # SALIDAS
-    # ─────────────────────────────────────────────────────
-    if float(prev["close"]) <= float(prev["basis"]) and price > bb_basis:
-        return {"action": "exit_long", "entry": round(price, 4), "rsi": round(rsi, 1),
-                "reason": "LONG exit: cruzo media BB arriba"}
-
-    if float(prev["close"]) >= float(prev["basis"]) and price < bb_basis:
-        return {"action": "exit_short", "entry": round(price, 4), "rsi": round(rsi, 1),
-                "reason": "SHORT exit: cruzo media BB abajo"}
-
-    return {"action": "hold", "entry": round(price, 4), "rsi": round(rsi, 1), "reason": "Sin señal"}
+    return best
 
 
-# ═══════════════════════════════════════════════════════════
-# SALIDA INTELIGENTE
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# SALIDA ANTICIPADA
+# ══════════════════════════════════════════════════════════
 
-def should_exit_early(df, pos):
-    if len(df) < 20:
+def should_exit_early(df: pd.DataFrame, pos: dict) -> tuple:
+    """
+    Detecta agotamiento de tendencia para salir antes del SL.
+    Retorna (salir: bool, razón: str)
+    """
+    if df is None or len(df) < 20:
         return False, ""
 
-    side  = pos.get("side", "long")
-    entry = pos["entry"]
-    cur   = df.iloc[-1]
-    price = float(cur["close"])
-
-    if side == "long"  and price < entry * 1.003:
-        return False, ""
-    if side == "short" and price > entry * 0.997:
-        return False, ""
-
-    signals = []
-
-    _, _, macd_hist = calc_macd(df["close"])
-    h_now   = float(macd_hist.iloc[-1])
-    h_prev  = float(macd_hist.iloc[-2])
-    h_prev2 = float(macd_hist.iloc[-3])
+    closes = df["close"]
+    side   = pos.get("side", "long")
+    entry  = pos.get("entry", 0)
+    price  = float(closes.iloc[-1])
+    rsi    = _rsi(closes)
+    bb     = _bb(closes, cfg.BB_PERIOD, cfg.BB_SIGMA)
 
     if side == "long":
-        if h_now < h_prev < h_prev2 and h_prev2 > 0:
-            signals.append("MACD↓ decreciendo")
-        if h_prev > 0 and h_now < 0:
-            signals.append("MACD cruzó negativo")
-    else:
-        if h_now > h_prev > h_prev2 and h_prev2 < 0:
-            signals.append("MACD↑ creciendo")
-        if h_prev < 0 and h_now > 0:
-            signals.append("MACD cruzó positivo")
+        # RSI sobrecomprado en banda superior → salir con ganancia
+        if rsi > 75 and bb["pos"] > 0.92 and price > entry:
+            return True, "EXIT_OVERBOUGHT"
+        # Divergencia bajista: precio en máximos pero RSI bajando
+        if len(closes) >= 10:
+            p_high = float(closes.iloc[-10:].max())
+            r_prev = _rsi(closes.iloc[:-5])
+            if price >= p_high * 0.99 and r_prev - rsi > 5 and price > entry:
+                return True, "EXIT_DIVERGENCE"
 
-    rsi_s    = df["rsi"] if "rsi" in df.columns else calc_rsi(df["close"])
-    rsi_now  = float(rsi_s.iloc[-1])
-    rsi_prev = float(rsi_s.iloc[-3:-1].mean())
-    p_prev   = float(df["close"].iloc[-3:-1].mean())
-
-    if side == "long":
-        if price > p_prev and rsi_now < rsi_prev - 3:
-            signals.append("Div RSI bajista")
-        if rsi_now > 72:
-            signals.append("RSI sobrecomprado")
-    else:
-        if price < p_prev and rsi_now > rsi_prev + 3:
-            signals.append("Div RSI alcista")
-        if rsi_now < 28:
-            signals.append("RSI sobrevendido")
-
-    if "stoch_k" in df.columns:
-        stoch = float(cur["stoch_k"]) if not pd.isna(cur["stoch_k"]) else 50
-        if side == "long"  and stoch > 85:
-            signals.append(f"StochRSI={round(stoch,1)} sobrecomprado")
-        if side == "short" and stoch < 15:
-            signals.append(f"StochRSI={round(stoch,1)} sobrevendido")
-
-    body = abs(float(cur["close"]) - float(cur["open"]))
-    if side == "long":
-        upper_wick = float(cur["high"]) - max(float(cur["close"]), float(cur["open"]))
-        if body > 0 and upper_wick > body * 2.0:
-            signals.append("Mecha superior larga")
-    else:
-        lower_wick = min(float(cur["close"]), float(cur["open"])) - float(cur["low"])
-        if body > 0 and lower_wick > body * 2.0:
-            signals.append("Mecha inferior larga")
-
-    if len(signals) >= 2:
-        return True, "EXIT_AGOTAMIENTO: " + " | ".join(signals)
+    if side == "short":
+        # RSI sobrevendido en banda inferior → salir con ganancia
+        if rsi < 25 and bb["pos"] < 0.08 and price < entry:
+            return True, "EXIT_OVERSOLD"
 
     return False, ""
 
 
-# ═══════════════════════════════════════════════════════════
-# TRAILING STOP
-# ═══════════════════════════════════════════════════════════
-
-def calc_trailing_stop(pos, cur_price, atr):
-    side       = pos.get("side", "long")
-    old_sl     = pos["sl"]
-    entry      = pos["entry"]
-    trail_dist = cfg.TRAILING_STOP_ATR * atr
-    if side == "long":
-        if cur_price < entry * (1 + cfg.TRAILING_ACTIVATE_PCT / 100):
-            return old_sl
-        return max(cur_price - trail_dist, old_sl)
-    else:
-        if cur_price > entry * (1 - cfg.TRAILING_ACTIVATE_PCT / 100):
-            return old_sl
-        return min(cur_price + trail_dist, old_sl)
-
-
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # CIRCUIT BREAKER
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
-def check_circuit_breaker(stats, balance_snapshot=0):
-    pnl    = stats.get("pnl_today", 0)
-    losses = stats.get("losses", 0)
-    wins   = stats.get("wins", 0)
-    trades = stats.get("trades_today", 0)
-
-    if balance_snapshot > 0 and pnl < 0 and trades >= 2:
-        pct = abs(pnl) / balance_snapshot
-        if pct >= cfg.CB_MAX_DAILY_LOSS_PCT:
-            return True, f"{round(pct*100,1)}% balance perdido hoy"
-
-    if losses >= cfg.CB_MAX_CONSECUTIVE_LOSS and wins == 0 and trades >= cfg.CB_MAX_CONSECUTIVE_LOSS:
-        return True, f"{losses} perdidas consecutivas sin ganancias"
-
-    return False, None
+def check_circuit_breaker(stats: dict, balance_snapshot: float) -> tuple:
+    pnl = stats.get("pnl_today", 0)
+    if balance_snapshot > 0:
+        pct = pnl / balance_snapshot
+        if pct < cfg.MAX_PNL_NEGATIVO_DIA:
+            return True, f"Pérdida día {pct*100:.1f}% > límite {cfg.MAX_PNL_NEGATIVO_DIA*100:.0f}%"
+    if stats.get("losses", 0) >= cfg.MAX_PERDIDAS_SEGUIDAS and stats.get("wins", 0) == 0:
+        return True, f"{stats['losses']} pérdidas seguidas sin wins"
+    return False, ""
