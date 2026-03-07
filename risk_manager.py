@@ -12,14 +12,14 @@ try:
     RISK_PCT         = cfg.RISK_PCT
     LEVERAGE         = cfg.LEVERAGE
     MAX_CONCURRENT   = cfg.MAX_CONCURRENT_POS
-    MAX_DAILY_LOSS   = cfg.MAX_DAILY_LOSS_PCT
-    MAX_DD           = cfg.MAX_DRAWDOWN_PCT
-    CB_LOSS          = cfg.CIRCUIT_BREAKER_LOSS
+    MAX_DAILY_LOSS   = getattr(cfg, "CB_MAX_DAILY_LOSS_PCT",   0.12)
+    MAX_DD           = getattr(cfg, "MAX_DRAWDOWN_PCT",         0.20)
+    CB_LOSS          = getattr(cfg, "CB_MAX_CONSECUTIVE_LOSS",  5)
     ATR_SIZING       = cfg.ATR_SIZING
     ATR_SIZING_BASE  = cfg.ATR_SIZING_BASE
 except Exception:
     RISK_PCT = 0.015; LEVERAGE = 3; MAX_CONCURRENT = 3
-    MAX_DAILY_LOSS = 0.08; MAX_DD = 0.15; CB_LOSS = 3
+    MAX_DAILY_LOSS = 0.12; MAX_DD = 0.20; CB_LOSS = 5
     ATR_SIZING = True; ATR_SIZING_BASE = 0.02
 
 # Estado interno
@@ -72,14 +72,14 @@ def check_circuit_breaker(balance: float) -> tuple[bool, str]:
     peak = _state["peak_balance"]
     if peak > 0 and balance < peak * (1 - MAX_DD):
         dd_pct = (peak - balance) / peak * 100
-        _activate_cb(f"Drawdown {dd_pct:.1f}% > {MAX_DD*100:.0f}%", hours=2)
+        _activate_cb(f"Drawdown {dd_pct:.1f}% > {MAX_DD*100:.0f}%", hours=1)
         return True, f"Drawdown excesivo ({dd_pct:.1f}%)"
 
     # Pérdida diaria
     start = _state["daily_start_bal"]
     if start > 0 and (start - balance) / start > MAX_DAILY_LOSS:
         pct = (start - balance) / start * 100
-        _activate_cb(f"Pérdida diaria {pct:.1f}%", hours=12)
+        _activate_cb(f"Pérdida diaria {pct:.1f}%", hours=3)
         return True, f"Pérdida diaria {pct:.1f}%"
 
     # Pérdidas consecutivas
