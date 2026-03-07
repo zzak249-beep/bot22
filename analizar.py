@@ -1,319 +1,211 @@
+#!/usr/bin/env python3
 """
-analizar.py — Puente entre main.py y el motor de estrategias v7
-════════════════════════════════════════════════════════════════
-main.py llama: analizar.analizar_todos(pares)
-Este módulo:
-  1. Obtiene los klines de BingX para cada par
-  2. Llama a strategy.get_signal() que ejecuta las 4 estrategias
-     + filtro de liquidez institucional
-  3. Traduce el resultado al formato que espera main.py
-     (campos: par, señal, precio, sl, tp, rr, rsi, atr, score, motivo...)
-
-También expone analizar_par() para compatibilidad con backtest.py
+analizar.py — Estrategia RSI + Bollinger Bands + ATR
+Retorna señales LONG / SHORT / NONE con score 0-100
 """
 
-import logging
 import numpy as np
-import pandas as pd
-from datetime import datetime, timezone
-
 import config
 import exchange
-import strategy
-
-log = logging.getLogger("analizar")
 
 
-# ══════════════════════════════════════════════════════════
-# HELPERS: klines → DataFrame
-# ══════════════════════════════════════════════════════════
-
-def _klines_to_df(klines: list) -> pd.DataFrame | None:
-    """Convierte la respuesta de BingX a DataFrame OHLCV."""
-    rows = []
-    for k in klines:
-        try:
-            if isinstance(k, dict):
-                ts = int(k.get("time", k.get("t", 0)))
-                o  = float(k.get("open",   k.get("o", 0)))
-                h  = float(k.get("high",   k.get("h", 0)))
-                l  = float(k.get("low",    k.get("l", 0)))
-                c  = float(k.get("close",  k.get("c", 0)))
-                v  = float(k.get("volume", k.get("v", 0)))
-            elif isinstance(k, (list, tuple)) and len(k) >= 6:
-                ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
-            else:
-                continue
-            rows.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
-        except Exception:
-            continue
-
-    if len(rows) < 25:
-        return None
-
-    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
-    df = df[df["close"] > 0]
-    return df if len(df) >= 25 else None
-
-
-def _get_df(par: str, intervalo: str, limit: int) -> pd.DataFrame | None:
-    klines = exchange.get_klines(par, intervalo=intervalo, limit=limit)
-    if not klines:
-        return None
-    return _klines_to_df(klines)
-
-
-# ══════════════════════════════════════════════════════════
-# FILTROS PREVIOS (rápidos, sin estrategia)
-# ══════════════════════════════════════════════════════════
-
-def _filtros_basicos(par: str) -> tuple[bool, str]:
-    """Rechaza pares con bajo volumen, spread alto u hora excluida."""
-    # Filtro horario
-    if config.HORA_FILTRO_ACTIVO:
-        h = datetime.now(timezone.utc).hour
-        if h in config.HORAS_EXCLUIDAS:
-            return False, f"hora excluida ({h}h UTC)"
-
-    # Volumen
-    vol = exchange.get_volumen_24h(par)
-    if vol < config.VOLUMEN_MIN_USD:
-        return False, f"vol ${vol:,.0f} < min ${config.VOLUMEN_MIN_USD:,.0f}"
-
-    # Spread
-    spread = exchange.get_spread_pct(par)
-    if spread > config.SPREAD_MAX_PCT:
-        return False, f"spread {spread:.2f}% > {config.SPREAD_MAX_PCT}%"
-
-    return True, ""
-
-
-# ══════════════════════════════════════════════════════════
-# ANALIZAR UN PAR — devuelve formato main.py
-# ══════════════════════════════════════════════════════════
-
-def analizar_par(par: str) -> dict:
-    """
-    Analiza un par y retorna dict compatible con main.py.
-    Campos obligatorios que main.py necesita:
-      par, señal, precio, sl, tp, rr, rsi, atr, bb, score, motivo,
-      divergencia, vol_relativo, mtf_rsi
-    """
-    resultado = {
-        "par":          par,
-        "señal":        False,
-        "precio":       0.0,
-        "sl":           0.0,
-        "tp":           0.0,
-        "rr":           0.0,
-        "rsi":          50.0,
-        "atr":          0.0,
-        "bb":           {"posicion": 0.5},
-        "score":        0,
-        "motivo":       "",
-        "divergencia":  False,
-        "vol_relativo": 1.0,
-        "mtf_rsi":      50.0,
-        # extra: info institucional
-        "liquidity_bias":  "neutral",
-        "liquidity_score": 50,
-    }
-
-    # ── Filtros rápidos ────────────────────────────────────
-    ok, razon = _filtros_basicos(par)
-    if not ok:
-        resultado["motivo"] = razon
-        return resultado
-
-    # ── Obtener klines principales (15m) ──────────────────
-    df = _get_df(par, config.TIMEFRAME, 250)
-    if df is None or len(df) < 25:
-        resultado["motivo"] = f"klines 15m insuficientes"
-        return resultado
-
-    # Pasar el símbolo al DataFrame para que liquidity.py sepa qué par es
-    df.attrs["symbol"] = par
-
-    # ── Obtener klines de tendencia (4h) ──────────────────
-    df_4h = _get_df(par, config.TIMEFRAME_HI, 100)
-
-    # ── Ejecutar motor de estrategias ─────────────────────
-    sig = strategy.get_signal(df, df_4h)
-
-    # Si no hay señal, retornar sin señal
-    if sig.get("action") not in ("buy", "sell_short"):
-        resultado["motivo"] = sig.get("reason", "sin señal")
-        # Incluir datos técnicos aunque no haya señal (útil para debug)
-        resultado["rsi"]   = sig.get("rsi", 50.0)
-        resultado["atr"]   = sig.get("atr", 0.0)
-        resultado["precio"] = float(df["close"].iloc[-1])
-        return resultado
-
-    # ── Hay señal — verificar score mínimo ────────────────
-    score = sig.get("score", 0)
-    if score < config.STRATEGY_MIN_SCORE:
-        resultado["motivo"] = f"score {score} < mínimo {config.STRATEGY_MIN_SCORE}"
-        return resultado
-
-    # ── Verificar R:R mínimo ──────────────────────────────
-    rr = sig.get("rr", 0)
-    if rr < config.RR_MINIMO:
-        resultado["motivo"] = f"R:R {rr:.2f} < mínimo {config.RR_MINIMO}"
-        return resultado
-
-    # ── Volumen relativo ──────────────────────────────────
-    vols = df["volume"].tolist()
-    if len(vols) >= 21:
-        media_vol = float(np.mean(vols[-21:-1]))
-        vol_rel   = float(vols[-1]) / media_vol if media_vol > 0 else 1.0
-    else:
-        vol_rel = 1.0
-
-    # ── BB posición actual ─────────────────────────────────
-    closes = df["close"].tolist()
-    from analizar import calcular_bb
-    bb_data = calcular_bb(closes, config.BB_PERIODO, config.BB_STD)
-
-    # ── MTF RSI (15m ya calculado internamente, tomamos el valor) ─
-    mtf_rsi = sig.get("rsi", 50.0)  # strategy ya usa multi-tf internamente
-
-    # ── Construir resultado final ──────────────────────────
-    precio = sig.get("entry", float(df["close"].iloc[-1]))
-
-    resultado.update({
-        "señal":           True,
-        "precio":          precio,
-        "sl":              sig["sl"],
-        "tp":              sig["tp"],
-        "rr":              rr,
-        "rsi":             sig.get("rsi", 50.0),
-        "atr":             sig.get("atr", 0.0),
-        "bb":              {"posicion": bb_data.get("posicion", 0.5), **bb_data},
-        "score":           score,
-        "motivo":          sig.get("reason", ""),
-        "divergencia":     sig.get("divergencia", False),
-        "vol_relativo":    vol_rel,
-        "mtf_rsi":         mtf_rsi,
-        "strategy":        sig.get("strategy", ""),
-        "trend_4h":        sig.get("trend_4h", "flat"),
-        "liquidity_bias":  sig.get("liquidity_bias", "neutral"),
-        "liquidity_score": sig.get("liquidity_score", 50),
-        "liquidity_summary": sig.get("liquidity_summary", ""),
-    })
-
-    if config.MODO_DEBUG:
-        liq_str = f" 🏦{resultado['liquidity_bias'].upper()}({resultado['liquidity_score']})" \
-                  if resultado['liquidity_score'] != 50 else ""
-        print(f"  ✓ SEÑAL {par}: {sig.get('strategy','')} score={score} "
-              f"R:R={rr:.2f} trend={resultado['trend_4h']}{liq_str}")
-
-    return resultado
-
-
-# ══════════════════════════════════════════════════════════
-# HELPERS BB / RSI para compatibilidad con backtest.py
-# ══════════════════════════════════════════════════════════
-
-def calcular_rsi(closes: list, periodo: int = 14) -> float:
+def calcular_rsi(closes: np.ndarray, periodo: int = None) -> float:
+    if periodo is None:
+        periodo = config.RSI_PERIODO
     if len(closes) < periodo + 1:
         return 50.0
-    arr    = np.array(closes, dtype=float)
-    deltas = np.diff(arr)
-    g = np.where(deltas > 0, deltas, 0.0)
-    p = np.where(deltas < 0, -deltas, 0.0)
-    ag = float(np.mean(g[:periodo]))
-    ap = float(np.mean(p[:periodo]))
-    for i in range(periodo, len(deltas)):
-        ag = (ag * (periodo - 1) + g[i]) / periodo
-        ap = (ap * (periodo - 1) + p[i]) / periodo
-    if ap == 0:
+    deltas = np.diff(closes)
+    ganancias = np.where(deltas > 0, deltas, 0)
+    perdidas = np.where(deltas < 0, -deltas, 0)
+    avg_g = np.mean(ganancias[-periodo:])
+    avg_p = np.mean(perdidas[-periodo:])
+    if avg_p == 0:
         return 100.0
-    return 100.0 - (100.0 / (1.0 + ag / ap))
+    rs = avg_g / avg_p
+    return 100 - (100 / (1 + rs))
 
 
-def calcular_bb(closes: list, periodo: int = 20, std_mult: float = 2.0) -> dict:
-    vacio = {"media": 0, "superior": 0, "inferior": 0, "posicion": 0.5, "ancho": 0}
+def calcular_bb(closes: np.ndarray, periodo: int = None, std: float = None):
+    if periodo is None:
+        periodo = config.BB_PERIODO
+    if std is None:
+        std = config.BB_STD
     if len(closes) < periodo:
-        return vacio
-    serie    = np.array(closes[-periodo:], dtype=float)
-    media    = float(np.mean(serie))
-    std      = float(np.std(serie))
-    superior = media + std_mult * std
-    inferior = media - std_mult * std
-    ancho    = superior - inferior
-    precio   = float(closes[-1])
-    posicion = float((precio - inferior) / ancho) if ancho > 0 else 0.5
-    return {"media": media, "superior": superior, "inferior": inferior,
-            "posicion": posicion, "ancho": ancho}
+        return None, None, None
+    media = np.mean(closes[-periodo:])
+    desv = np.std(closes[-periodo:])
+    return media - std * desv, media, media + std * desv
 
 
-def calcular_atr(highs: list, lows: list, closes: list, periodo: int = 14) -> float:
-    if len(closes) < 2:
-        return float(closes[-1]) * 0.02 if closes else 0.01
-    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-           for i in range(1, len(closes))]
-    if not trs:
-        return float(closes[-1]) * 0.02
-    if len(trs) < periodo:
-        return float(np.mean(trs))
-    atr = float(np.mean(trs[:periodo]))
-    for i in range(periodo, len(trs)):
-        atr = (atr * (periodo - 1) + trs[i]) / periodo
-    return atr
+def calcular_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, periodo: int = None) -> float:
+    if periodo is None:
+        periodo = config.ATR_PERIODO
+    if len(closes) < periodo + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        trs.append(tr)
+    return float(np.mean(trs[-periodo:]))
 
 
-def calcular_ema(closes: list, periodo: int = 50) -> float:
-    if len(closes) < periodo:
-        return float(np.mean(closes)) if closes else 0.0
-    arr = np.array(closes, dtype=float)
-    k   = 2.0 / (periodo + 1)
-    ema = float(np.mean(arr[:periodo]))
-    for precio in arr[periodo:]:
-        ema = precio * k + ema * (1 - k)
-    return ema
-
-
-# ══════════════════════════════════════════════════════════
-# ANALIZAR LISTA DE PARES
-# ══════════════════════════════════════════════════════════
-
-def analizar_todos(pares: list) -> list:
+def analizar_par(symbol: str) -> dict:
     """
-    Analiza todos los pares en lotes.
-    Retorna lista de señales ordenadas por score DESC.
+    Analiza un par y retorna señal con score.
+    
+    Returns:
+        {
+            "señal": "LONG" | "SHORT" | "NONE",
+            "score": 0-100,
+            "precio": float,
+            "sl": float,
+            "tp": float,
+            "atr": float,
+            "rsi": float,
+            "volumen_ok": bool,
+            "razon": str
+        }
     """
-    import time as _time
+    resultado_base = {
+        "señal": "NONE",
+        "score": 0,
+        "precio": 0.0,
+        "sl": 0.0,
+        "tp": 0.0,
+        "atr": 0.0,
+        "rsi": 50.0,
+        "volumen_ok": False,
+        "razon": "sin datos"
+    }
 
-    señales  = []
-    total    = len(pares)
-    batch    = getattr(config, "SCAN_BATCH_SIZE", 10)
+    # Obtener velas
+    klines = exchange.get_klines(symbol, interval="15m", limit=120)
+    if not klines or len(klines) < 50:
+        resultado_base["razon"] = "pocas velas"
+        return resultado_base
 
-    print(f"[ANALIZAR] Escaneando {total} pares con 4 estrategias + filtro institucional...")
+    try:
+        closes = np.array([float(k[4]) for k in klines])
+        highs = np.array([float(k[2]) for k in klines])
+        lows = np.array([float(k[3]) for k in klines])
+        volumes = np.array([float(k[5]) for k in klines])
+    except Exception as e:
+        resultado_base["razon"] = f"error datos: {e}"
+        return resultado_base
 
-    for i, par in enumerate(pares):
-        try:
-            r = analizar_par(par)
-            if r["señal"]:
-                señales.append(r)
-                if config.MODO_DEBUG:
-                    liq = f" 🏦{r['liquidity_bias'].upper()}" if r.get("liquidity_bias") != "neutral" else ""
-                    print(f"  ✓ {par}: score={r['score']} strategy={r.get('strategy','')}{liq}")
-            elif config.MODO_DEBUG:
-                print(f"  ✗ {par}: {r['motivo'][:60]}")
+    precio = closes[-1]
+    if precio <= 0:
+        resultado_base["razon"] = "precio inválido"
+        return resultado_base
 
-            # Pausa pequeña entre pares para no saturar la API
-            if (i + 1) % batch == 0:
-                _time.sleep(0.5)
-                pct = int((i + 1) / total * 100)
-                print(f"[ANALIZAR] {i+1}/{total} ({pct}%) — {len(señales)} señales hasta ahora")
+    # Indicadores
+    rsi = calcular_rsi(closes)
+    bb_low, bb_mid, bb_high = calcular_bb(closes)
+    atr = calcular_atr(highs, lows, closes)
 
-        except Exception as e:
-            log.error(f"[ANALIZAR] {par}: {e}")
-            if config.MODO_DEBUG:
-                import traceback
-                traceback.print_exc()
+    if bb_low is None or atr == 0:
+        resultado_base["razon"] = "indicadores inválidos"
+        return resultado_base
 
-    señales.sort(key=lambda x: x["score"], reverse=True)
+    # Volumen
+    vol_usd = float(volumes[-1]) * precio
+    volumen_ok = vol_usd >= config.VOLUMEN_MIN_USD
 
-    print(f"[ANALIZAR] Completado: {total} pares → {len(señales)} señales")
-    return señales
+    # Spread check
+    info = exchange.get_info_par(symbol)
+    spread_ok = True
+    if info.get("bid") and info.get("ask") and info["bid"] > 0:
+        spread_pct = (info["ask"] - info["bid"]) / info["bid"] * 100
+        spread_ok = spread_pct <= config.SPREAD_MAX_PCT
+
+    # ── SCORING ──────────────────────────────────────────────
+    score_long = 0
+    score_short = 0
+
+    # RSI
+    if rsi <= config.RSI_OVERSOLD:  # Oversold → LONG
+        score_long += 35 if rsi <= 30 else 25
+    elif rsi >= config.RSI_OVERBOUGHT:  # Overbought → SHORT
+        score_short += 35 if rsi >= 70 else 25
+
+    # Bollinger Bands
+    if precio <= bb_low:  # Toca banda inferior → LONG
+        score_long += 30 if precio < bb_low else 20
+    elif precio >= bb_high:  # Toca banda superior → SHORT
+        score_short += 30 if precio > bb_high else 20
+
+    # Tendencia (EMA rápida vs lenta)
+    ema_fast = float(np.mean(closes[-10:]))
+    ema_slow = float(np.mean(closes[-30:]))
+    if ema_fast > ema_slow:
+        score_long += 15
+    else:
+        score_short += 15
+
+    # Momentum (últimas 3 velas)
+    if len(closes) >= 4:
+        momentum = closes[-1] - closes[-4]
+        if momentum > 0:
+            score_long += 10
+        else:
+            score_short += 10
+
+    # Volumen bonus
+    if volumen_ok:
+        score_long += 5
+        score_short += 5
+    else:
+        score_long = int(score_long * 0.7)
+        score_short = int(score_short * 0.7)
+
+    # Spread penalización
+    if not spread_ok:
+        score_long = int(score_long * 0.5)
+        score_short = int(score_short * 0.5)
+
+    # Seleccionar señal
+    if score_long >= config.SCORE_MIN and score_long > score_short:
+        señal = "LONG"
+        score = min(score_long, 100)
+        sl = precio - atr * config.SL_ATR_MULT
+        tp = precio + atr * config.TP_ATR_MULT
+        rr = (tp - precio) / (precio - sl) if (precio - sl) > 0 else 0
+        if rr < config.RR_MINIMO:
+            return {**resultado_base, "razon": f"RR bajo {rr:.2f}", "precio": precio}
+        razon = f"RSI:{rsi:.0f} BB:bajo Trend:↑"
+
+    elif score_short >= config.SCORE_MIN and score_short > score_long:
+        señal = "SHORT"
+        score = min(score_short, 100)
+        sl = precio + atr * config.SL_ATR_MULT
+        tp = precio - atr * config.TP_ATR_MULT
+        rr = (precio - tp) / (sl - precio) if (sl - precio) > 0 else 0
+        if rr < config.RR_MINIMO:
+            return {**resultado_base, "razon": f"RR bajo {rr:.2f}", "precio": precio}
+        razon = f"RSI:{rsi:.0f} BB:alto Trend:↓"
+
+    else:
+        return {
+            **resultado_base,
+            "precio": precio,
+            "rsi": rsi,
+            "atr": atr,
+            "volumen_ok": volumen_ok,
+            "razon": f"score insuf L:{score_long} S:{score_short}"
+        }
+
+    return {
+        "señal": señal,
+        "score": score,
+        "precio": precio,
+        "sl": sl,
+        "tp": tp,
+        "atr": atr,
+        "rsi": rsi,
+        "volumen_ok": volumen_ok,
+        "razon": razon
+    }

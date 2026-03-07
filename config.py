@@ -1,143 +1,58 @@
+# ══════════════════════════════════════════════════════
+# config.py — BingX RSI+BB Bot v5.0 AGRESIVO
+# 🔥 DINERO REAL - Railway Production
+# ══════════════════════════════════════════════════════
 import os
 
-# ══════════════════════════════════════════════════════
-# config.py — BB+RSI ELITE v14.0  (FIXED & COMPLETE)
-# ══════════════════════════════════════════════════════
+# ── CREDENCIALES (desde Railway Variables) ──────────
+BINGX_API_KEY    = os.environ.get("BINGX_API_KEY",    "")
+BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-VERSION = "v14.0"
+# ── MODO ────────────────────────────────────────────
+MODO_DEMO        = False    # 🔥 DINERO REAL
+MODO_DEBUG       = False
+BALANCE_INICIAL  = 100.0
 
-# ── Credenciales ───────────────────────────────────────
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
-BINGX_SECRET_KEY = BINGX_API_SECRET
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# ── INDICADORES ─────────────────────────────────────
+RSI_PERIODO   = 14
+RSI_OVERSOLD  = 38    # 🔥 Más permisivo
+RSI_OVERBOUGHT= 62    # 🔥 Más permisivo
+BB_PERIODO    = 20
+BB_STD        = 2.0
+ATR_PERIODO   = 14
 
-# ── Modo ───────────────────────────────────────────────
-TRADE_MODE    = os.getenv("TRADE_MODE", "paper")
-MODO_DEMO     = (TRADE_MODE != "live")
-MODO_DEBUG    = os.getenv("MODO_DEBUG", "false").lower() == "true"
+# ── FILTRO DE SCORE ─────────────────────────────────
+SCORE_MIN     = 65    # 🔥 AGRESIVO
 
-# ── Temporalidad ───────────────────────────────────────
-CANDLE_TF      = "15m"
-TIMEFRAME      = CANDLE_TF
-MTF_INTERVAL   = "1h"
-TIMEFRAME_HI   = MTF_INTERVAL
-POLL_INTERVAL  = int(os.getenv("POLL_INTERVAL", 900))
-LOOP_SECONDS   = POLL_INTERVAL
-CICLO_SEGUNDOS = POLL_INTERVAL
+# ── CALIDAD DE MERCADO ──────────────────────────────
+VOLUMEN_MIN_USD = 400_000
+SPREAD_MAX_PCT  = 2.0
 
-# ── Indicadores ────────────────────────────────────────
-BB_PERIOD      = 20
-BB_PERIODO     = BB_PERIOD
-BB_SIGMA       = 2.0
-BB_STD         = BB_SIGMA
-RSI_PERIOD     = 14
-RSI_LONG       = 35
-RSI_SHORT      = 65
-RSI_OVERSOLD   = RSI_LONG
-RSI_OVERBOUGHT = RSI_SHORT
-PARTIAL_TP_ATR = 2.0
-SMA_PERIOD     = 50
+# ── SL / TP ─────────────────────────────────────────
+SL_ATR_MULT   = 1.2    # 🔥 SL ajustado
+TP_ATR_MULT   = 4.0    # 🔥 TP amplio (R:R 3.3)
+RR_MINIMO     = 1.5
 
-# ── Riesgo ────────────────────────────────────────────
-LEVERAGE         = int(os.getenv("LEVERAGE", 3))
-RISK_PCT         = float(os.getenv("RISK_PCT", 0.015))
-RIESGO_POR_TRADE = RISK_PCT
-INITIAL_BAL      = float(os.getenv("INITIAL_BAL", 100.0))
-BALANCE_INICIAL  = INITIAL_BAL
-MIN_RR           = 1.3
-SL_BUFFER        = 0.002
-SL_ATR_MULT      = 1.5
-TP_ATR_MULT      = 2.5
-SCORE_MIN        = 35
-STRATEGY_MIN_SCORE = SCORE_MIN
-RR_MINIMO        = MIN_RR
-COOLDOWN_BARS    = 2
+# ── RIESGO ──────────────────────────────────────────
+RIESGO_POR_TRADE = 0.03   # 🔥 3% por trade
+LEVERAGE         = 5      # 🔥 5x leverage
+MAX_POSICIONES   = 8      # 🔥 8 posiciones
 
-# ── Posiciones ────────────────────────────────────────
-MAX_CONCURRENT_POS = int(os.getenv("MAX_POSITIONS", 3))
-MAX_POSICIONES     = MAX_CONCURRENT_POS
+# ── CIRCUIT BREAKER ─────────────────────────────────
+CB_MAX_DAILY_LOSS_PCT   = 0.08
+CB_MAX_CONSECUTIVE_LOSS = 5
 
-# ── Circuit breaker ────────────────────────────────────
-MAX_DAILY_LOSS_PCT      = 0.08
-MAX_DRAWDOWN_PCT        = 0.15
-CIRCUIT_BREAKER_LOSS    = 3
-CB_MAX_DAILY_LOSS_PCT   = MAX_DAILY_LOSS_PCT
-CB_MAX_CONSECUTIVE_LOSS = CIRCUIT_BREAKER_LOSS
+# ── OPERACIÓN ───────────────────────────────────────
+LOOP_SECONDS  = 300
+CICLO_SEGUNDOS = 300
 
-# ── Trailing SL ───────────────────────────────────────
-TRAIL_FROM_START     = True
-TRAIL_ATR_MULT_INIT  = 1.8
-TRAIL_ATR_MULT_AFTER = 1.2
-TRAILING_STOP_ACTIVO = TRAIL_FROM_START
-TRAILING_ATR_MULT    = TRAIL_ATR_MULT_INIT
+# ── LEARNER ─────────────────────────────────────────
+LEARNER_CICLO_H = 4
+LEARNER_MIN_TRADES = 5
+LEARNER_MIN_WR = 30
+LEARNER_MIN_PF = 0.7
+LEARNER_PENALIZACION_H = 3
 
-# ── Cierre parcial ─────────────────────────────────────
-CIERRE_PARCIAL_ACTIVO = True
-CIERRE_PARCIAL_PCT    = 0.5
-
-# ── EMA filtro ────────────────────────────────────────
-EMA_FILTRO_ACTIVO = True
-EMA_PERIODO       = 50
-
-# ── ATR sizing ────────────────────────────────────────
-ATR_SIZING      = True
-ATR_SIZING_BASE = 0.02
-
-# ── Re-entry ──────────────────────────────────────────
-REENTRY_ENABLED   = True
-REENTRY_COOLDOWN  = 2
-REENTRY_SCORE_MIN = 50
-
-# ── Volumen ───────────────────────────────────────────
-VOLUME_FILTER    = True
-VOLUME_MA_PERIOD = 20
-VOLUME_MIN_RATIO = 0.6
-VOLUMEN_MIN_USD  = 300_000
-SPREAD_MAX_PCT   = 0.8
-
-# ── MTF ───────────────────────────────────────────────
-MTF_ENABLED       = True
-MTF_ACTIVO        = MTF_ENABLED
-MTF_BLOCK_COUNTER = True
-MTF_RSI_MAX       = RSI_SHORT
-
-# ── Horario ───────────────────────────────────────────
-HORA_FILTRO_ACTIVO = False
-HORAS_EXCLUIDAS    = []
-
-# ── Tendencia ─────────────────────────────────────────
-TREND_LOOKBACK = 8
-TREND_THRESH   = 0.03
-
-# ── Scan / misc ───────────────────────────────────────
-SCAN_BATCH_SIZE = 15
-ALERT_ALWAYS    = True
-
-# ── Liquidez (desactivado — añade latencia) ────────────
-LIQUIDITY_ENABLED     = False
-LIQUIDITY_BLOCK_SCORE = 20
-
-# ── Dashboard ─────────────────────────────────────────
-DASHBOARD_PORT    = int(os.getenv("PORT", 8080))
-DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "false").lower() == "true"
-
-# ── Learner ───────────────────────────────────────────
-LEARNER_PERSISTIR      = False
-LEARNER_CICLO_H        = 4
-LEARNER_MIN_TRADES     = 8
-LEARNER_MIN_WR         = 38.0
-LEARNER_MIN_PF         = 0.9
-LEARNER_PENALIZACION_H = 12
-
-# ── Pares (alta liquidez + volatilidad probada) ────────
-SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
-    "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "ADA-USDT", "DOT-USDT",
-    "ARB-USDT", "OP-USDT", "NEAR-USDT", "INJ-USDT", "TIA-USDT",
-    "PEPE-USDT", "WIF-USDT", "BONK-USDT", "LTC-USDT", "ATOM-USDT",
-    "AAVE-USDT", "UNI-USDT", "FTM-USDT", "SUSHI-USDT", "ZEC-USDT",
-    "CRO-USDT",
-]
-PARES = SYMBOLS
+VERSION = "BingX-RSI+BB-v5.0-AGRESIVO-REAL"
