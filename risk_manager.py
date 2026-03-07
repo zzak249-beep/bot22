@@ -1,122 +1,157 @@
-import json, os
-from datetime import datetime, date, timezone
-from config import (ATR_SIZING, ATR_SIZING_BASE, CIRCUIT_BREAKER_LOSS,
-                    RISK_PCT, LEVERAGE, INITIAL_BAL)
+"""
+risk_manager.py — Gestión de riesgo v14.0
+"""
+import logging
+import time
+from datetime import datetime, timezone
 
-# ══════════════════════════════════════════════════════
-# risk_manager.py v13.1
-# Circuit breaker DESACTIVADO — bot nunca se para solo
-# Solo se pausa con /pause manual desde Telegram
-# ══════════════════════════════════════════════════════
+log = logging.getLogger("risk_manager")
 
-_STATE_FILE = "risk_state.json"
+try:
+    import config as cfg
+    RISK_PCT         = cfg.RISK_PCT
+    LEVERAGE         = cfg.LEVERAGE
+    MAX_CONCURRENT   = cfg.MAX_CONCURRENT_POS
+    MAX_DAILY_LOSS   = cfg.MAX_DAILY_LOSS_PCT
+    MAX_DD           = cfg.MAX_DRAWDOWN_PCT
+    CB_LOSS          = cfg.CIRCUIT_BREAKER_LOSS
+    ATR_SIZING       = cfg.ATR_SIZING
+    ATR_SIZING_BASE  = cfg.ATR_SIZING_BASE
+except Exception:
+    RISK_PCT = 0.015; LEVERAGE = 3; MAX_CONCURRENT = 3
+    MAX_DAILY_LOSS = 0.08; MAX_DD = 0.15; CB_LOSS = 3
+    ATR_SIZING = True; ATR_SIZING_BASE = 0.02
 
-def _load() -> dict:
-    if os.path.exists(_STATE_FILE):
-        try:
-            with open(_STATE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "peak_balance":       INITIAL_BAL,
-        "daily_start_bal":    INITIAL_BAL,
-        "daily_date":         str(date.today()),
-        "consecutive_losses": 0,
-        "paused":             False,
-        "pause_reason":       "",
-    }
+# Estado interno
+_state = {
+    "peak_balance":     0.0,
+    "daily_start_bal":  0.0,
+    "daily_pnl":        0.0,
+    "consecutive_loss": 0,
+    "wins":             0,
+    "losses":           0,
+    "today":            "",
+    "cb_until":         0,     # timestamp hasta el que el CB está activo
+    "paused":           False,
+}
 
-def _save(s: dict):
-    with open(_STATE_FILE, "w") as f:
-        json.dump(s, f, indent=2)
-
-_state = _load()
 
 def reset_daily_if_needed(balance: float):
-    global _state
-    today = str(date.today())
-    if _state.get("daily_date") != today:
-        _state["daily_date"]      = today
-        _state["daily_start_bal"] = balance
-        _save(_state)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _state["today"] != today:
+        _state["today"]            = today
+        _state["daily_start_bal"]  = balance
+        _state["daily_pnl"]        = 0.0
+        _state["consecutive_loss"] = 0
+        log.info(f"Reset diario — balance inicio: ${balance:.2f}")
+
 
 def update_peak(balance: float):
-    global _state
     if balance > _state["peak_balance"]:
         _state["peak_balance"] = balance
-        _save(_state)
 
-def record_loss():
-    global _state
-    _state["consecutive_losses"] += 1
-    _save(_state)
 
 def record_win():
-    global _state
-    _state["consecutive_losses"] = 0
-    _save(_state)
+    _state["wins"] += 1
+    _state["consecutive_loss"] = 0
 
-def check_circuit_breaker(balance: float) -> tuple:
-    """
-    Circuit breaker DESACTIVADO.
-    El bot nunca se para automáticamente.
-    Solo se pausa con /pause desde Telegram.
-    """
-    global _state
-    reset_daily_if_needed(balance)
-    update_peak(balance)
-    return False, ""   # ← siempre permite operar
+
+def record_loss():
+    _state["losses"] += 1
+    _state["consecutive_loss"] += 1
+
+
+def check_circuit_breaker(balance: float) -> tuple[bool, str]:
+    """Retorna (bloqueado, motivo)."""
+    # CB temporal activo
+    if _state["cb_until"] > time.time():
+        remaining = int((_state["cb_until"] - time.time()) / 60)
+        return True, f"CB activo — espera {remaining}min"
+
+    # Drawdown desde pico
+    peak = _state["peak_balance"]
+    if peak > 0 and balance < peak * (1 - MAX_DD):
+        dd_pct = (peak - balance) / peak * 100
+        _activate_cb(f"Drawdown {dd_pct:.1f}% > {MAX_DD*100:.0f}%", hours=2)
+        return True, f"Drawdown excesivo ({dd_pct:.1f}%)"
+
+    # Pérdida diaria
+    start = _state["daily_start_bal"]
+    if start > 0 and (start - balance) / start > MAX_DAILY_LOSS:
+        pct = (start - balance) / start * 100
+        _activate_cb(f"Pérdida diaria {pct:.1f}%", hours=12)
+        return True, f"Pérdida diaria {pct:.1f}%"
+
+    # Pérdidas consecutivas
+    if _state["consecutive_loss"] >= CB_LOSS:
+        _activate_cb(f"{CB_LOSS} pérdidas consecutivas", hours=1)
+        return True, f"{CB_LOSS} pérdidas consecutivas"
+
+    return False, ""
+
+
+def _activate_cb(reason: str, hours: float = 1):
+    _state["cb_until"] = time.time() + hours * 3600
+    log.warning(f"Circuit breaker activado: {reason} — pausa {hours}h")
+
 
 def is_manually_paused() -> bool:
-    return _state.get("paused", False)
+    return _state["paused"]
 
-def pause(reason: str = "manual"):
-    global _state
-    _state["paused"]       = True
-    _state["pause_reason"] = reason
-    _save(_state)
 
-def resume():
-    global _state
-    _state["paused"]       = False
-    _state["pause_reason"] = ""
-    _save(_state)
-
-def get_state() -> dict:
-    return dict(_state)
-
-def can_open_position(open_count: int, balance: float) -> tuple:
-    from config import MAX_CONCURRENT_POS
-    if _state.get("paused"):
-        return False, f"Pausado: {_state.get('pause_reason', 'manual')}"
-    if open_count >= MAX_CONCURRENT_POS:
-        return False, f"Máximo {MAX_CONCURRENT_POS} posiciones alcanzado"
+def can_open_position(open_count: int, balance: float) -> tuple[bool, str]:
+    if open_count >= MAX_CONCURRENT:
+        return False, f"Máx. posiciones ({MAX_CONCURRENT}) alcanzado"
+    if balance < 5.0:
+        return False, f"Balance ${balance:.2f} < $5 mínimo"
     return True, ""
 
-def calc_position_size(balance: float, price: float, sl: float, atr: float) -> float:
-    if not ATR_SIZING or atr <= 0 or price <= 0:
-        risk = RISK_PCT
-    else:
+
+def calc_position_size(balance: float, price: float, sl: float, atr: float = 0) -> float:
+    """
+    Sizing dinámico: arriesgar RISK_PCT del balance por trade.
+    Con ATR sizing: ajusta el tamaño según la volatilidad.
+    """
+    if price <= 0 or sl <= 0 or balance <= 0:
+        return 0.0
+
+    risk_usd  = balance * RISK_PCT
+    sl_dist   = abs(price - sl)
+
+    if sl_dist <= 0:
+        return 0.0
+
+    # Contratos = riesgo_usd / (distancia_SL × leverage)
+    # El leverage amplifica tanto ganancia como pérdida
+    contracts = (risk_usd * LEVERAGE) / sl_dist
+
+    # ATR sizing: si ATR es más grande que el promedio, reducir tamaño
+    if ATR_SIZING and atr > 0 and price > 0:
         atr_pct = atr / price
-        ref_pct = 0.02
-        ratio   = ref_pct / atr_pct if atr_pct > 0 else 1.0
-        ratio   = max(0.5, min(2.0, ratio))
-        risk    = ATR_SIZING_BASE * ratio
-    if _state["consecutive_losses"] >= CIRCUIT_BREAKER_LOSS:
-        risk *= 0.5
-    return (balance * risk * LEVERAGE) / price
+        if atr_pct > ATR_SIZING_BASE * 2:
+            # Volatilidad alta → reducir tamaño
+            contracts *= ATR_SIZING_BASE / atr_pct
+
+    # Redondear a 4 decimales
+    contracts = round(contracts, 4)
+
+    # Sanity check: no más del 20% del balance en valor nocional
+    max_notional = balance * 0.20 * LEVERAGE
+    if contracts * price > max_notional:
+        contracts = round(max_notional / price, 4)
+
+    return max(contracts, 0.0001)
+
 
 def get_stats(balance: float) -> dict:
-    reset_daily_if_needed(balance)
-    peak = _state["peak_balance"]
-    ds   = _state["daily_start_bal"]
+    w = _state["wins"]
+    l = _state["losses"]
     return {
-        "peak_balance":       round(peak, 2),
-        "drawdown_pct":       round((peak - balance) / peak * 100, 2) if peak > 0 else 0,
-        "daily_pnl":          round(balance - ds, 4),
-        "daily_pnl_pct":      round((balance - ds) / ds * 100, 2) if ds > 0 else 0,
-        "consecutive_losses": _state["consecutive_losses"],
-        "paused":             _state.get("paused", False),
-        "pause_reason":       _state.get("pause_reason", ""),
+        "wins":        w,
+        "losses":      l,
+        "wr":          round(w / (w + l) * 100, 1) if (w + l) > 0 else 0,
+        "consecutive": _state["consecutive_loss"],
+        "peak":        _state["peak_balance"],
+        "drawdown_pct": round((1 - balance / _state["peak_balance"]) * 100, 1)
+                        if _state["peak_balance"] > 0 else 0,
     }

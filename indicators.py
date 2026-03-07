@@ -1,132 +1,177 @@
-import pandas as pd
+"""
+indicators.py — Indicadores técnicos v14.0
+Usado por strategy.py
+"""
 import numpy as np
-from config import (RSI_PERIOD, BB_PERIOD, BB_SIGMA, SMA_PERIOD,
-                    TREND_LOOKBACK, TREND_THRESH,
-                    VOLUME_MA_PERIOD, VOLUME_MIN_RATIO, VOLUME_FILTER)
+import pandas as pd
 
-# ══════════════════════════════════════════════════════
-# indicators.py — Indicadores técnicos v12.3
-# Mejoras: filtro de volumen, scoring con momentum
-# ══════════════════════════════════════════════════════
-
-def rsi_calc(close: pd.Series) -> pd.Series:
-    d = close.diff()
-    g = d.clip(lower=0).rolling(RSI_PERIOD).mean()
-    l = (-d.clip(upper=0)).rolling(RSI_PERIOD).mean()
-    return 100 - 100 / (1 + g / l.replace(0, float("nan")))
-
-def atr_calc(df: pd.DataFrame, p: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(p).mean()
-
-def macd_calc(close: pd.Series) -> pd.Series:
-    e12 = close.ewm(span=12, adjust=False).mean()
-    e26 = close.ewm(span=26, adjust=False).mean()
-    line = e12 - e26
-    return line - line.ewm(span=9, adjust=False).mean()
-
-def stoch_rsi_calc(close: pd.Series, period: int = 14, k: int = 3) -> pd.Series:
-    d = close.diff()
-    g = d.clip(lower=0).rolling(period).mean()
-    l = (-d.clip(upper=0)).rolling(period).mean()
-    rs = g / l.replace(0, float("nan"))
-    rsi_s = 100 - 100 / (1 + rs)
-    lo = rsi_s.rolling(period).min()
-    hi = rsi_s.rolling(period).max()
-    stoch = (rsi_s - lo) / (hi - lo).replace(0, float("nan")) * 100
-    return stoch.rolling(k).mean()
-
-def divergence(cls: pd.Series, rsi_s: pd.Series, lb: int = 6):
-    if len(rsi_s) < lb + 2:
-        return None
-    r = rsi_s.iloc[-lb-1:]; p = cls.iloc[-lb-1:]
-    rn = float(r.iloc[-1]); pn = float(p.iloc[-1])
-    if pn < float(p.iloc[:-1].min()) and rn > float(r.iloc[:-1].min()) + 3:
-        return "bull"
-    if pn > float(p.iloc[:-1].max()) and rn < float(r.iloc[:-1].max()) - 3:
-        return "bear"
-    return None
-
-def get_trend(basis_series: pd.Series, i: int) -> str:
-    if i < TREND_LOOKBACK: return "flat"
-    now  = float(basis_series.iloc[i])
-    prev = float(basis_series.iloc[i - TREND_LOOKBACK])
-    if now == 0 or prev == 0: return "flat"
-    change_pct = (now - prev) / prev * 100
-    if   change_pct >  TREND_THRESH: return "up"
-    elif change_pct < -TREND_THRESH: return "down"
-    else:                             return "flat"
-
-def volume_ok(df: pd.DataFrame, i: int) -> bool:
-    """True si el volumen actual es suficiente para operar."""
-    if not VOLUME_FILTER:
-        return True
-    if i < VOLUME_MA_PERIOD:
-        return True
-    vol_now = float(df["volume"].iloc[i])
-    vol_ma  = float(df["volume"].iloc[i-VOLUME_MA_PERIOD:i].mean())
-    if vol_ma == 0:
-        return True
-    return (vol_now / vol_ma) >= VOLUME_MIN_RATIO
-
-def momentum_bars(close: pd.Series, i: int, lookback: int = 5) -> int:
-    """
-    Cuenta cuántas de las últimas N velas son bajistas (negativas).
-    Retorna número 0..lookback. Más alto = más presión bajista.
-    """
-    if i < lookback:
-        return 0
-    segment = close.iloc[i-lookback:i+1]
-    return sum(1 for j in range(1, len(segment)) if float(segment.iloc[j]) < float(segment.iloc[j-1]))
-
-def calc_score_long(r: float, dv, mb: bool, stv, bear_bars: int = 0) -> int:
-    s = 40
-    if   r < 20: s += 30
-    elif r < 25: s += 22
-    elif r < 28: s += 15
-    elif r < 30: s += 12
-    elif r < 32: s += 8
-    if dv == "bull": s += 18
-    if mb: s += 5
-    if stv is not None and not np.isnan(stv):
-        if   stv < 10: s += 15
-        elif stv < 20: s += 10
-        elif stv < 30: s += 5
-    # Penalizar si demasiadas velas seguidas bajistas (momentum bajista)
-    if bear_bars >= 4: s -= 10
-    elif bear_bars == 3: s -= 5
-    return min(max(s, 0), 100)
-
-def calc_score_short(r: float, dv, mb: bool, stv, bull_bars: int = 0) -> int:
-    s = 40
-    if   r > 80: s += 30
-    elif r > 75: s += 22
-    elif r > 72: s += 15
-    elif r > 70: s += 12
-    elif r > 68: s += 8
-    if dv == "bear": s += 18
-    if not mb: s += 5
-    if stv is not None and not np.isnan(stv):
-        if   stv > 90: s += 15
-        elif stv > 80: s += 10
-        elif stv > 70: s += 5
-    # Penalizar si demasiadas velas alcistas seguidas (podría continuar)
-    if bull_bars >= 4: s -= 10
-    elif bull_bars == 3: s -= 5
-    return min(max(s, 0), 100)
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Añade BB, RSI, ATR, EMA/SMA, MACD, Stoch al DataFrame."""
     df = df.copy()
-    basis        = df["close"].rolling(BB_PERIOD).mean()
-    std          = df["close"].rolling(BB_PERIOD).std()
-    df["upper"]  = basis + BB_SIGMA * std
-    df["basis"]  = basis
-    df["lower"]  = basis - BB_SIGMA * std
-    df["rsi"]    = rsi_calc(df["close"])
-    df["atr"]    = atr_calc(df)
-    df["macd"]   = macd_calc(df["close"])
-    df["stoch"]  = stoch_rsi_calc(df["close"])
-    df["sma50"]  = df["close"].rolling(SMA_PERIOD).mean()
-    df["vol_ma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    v = df["volume"].astype(float) if "volume" in df.columns else pd.Series(1.0, index=df.index)
+
+    # ── Bollinger Bands (20, 2σ) ──────────────────────
+    sma20  = c.rolling(20).mean()
+    std20  = c.rolling(20).std()
+    df["basis"] = sma20
+    df["upper"] = sma20 + 2.0 * std20
+    df["lower"] = sma20 - 2.0 * std20
+
+    # ── SMA50 ─────────────────────────────────────────
+    df["sma50"] = c.rolling(50).mean()
+
+    # ── EMA50 ─────────────────────────────────────────
+    df["ema50"] = c.ewm(span=50, adjust=False).mean()
+
+    # ── RSI 14 ────────────────────────────────────────
+    delta = c.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    ag    = gain.ewm(com=13, adjust=False).mean()
+    al    = loss.ewm(com=13, adjust=False).mean()
+    rs    = ag / al.replace(0, np.nan)
+    df["rsi"] = 100 - 100 / (1 + rs)
+
+    # ── ATR 14 ────────────────────────────────────────
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(com=13, adjust=False).mean()
+
+    # ── MACD (12,26,9) ────────────────────────────────
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    df["macd"]   = ema12 - ema26
+    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
+    # ── Stochastic RSI (14,3) ─────────────────────────
+    rsi_ser = df["rsi"]
+    min_rsi = rsi_ser.rolling(14).min()
+    max_rsi = rsi_ser.rolling(14).max()
+    rng = (max_rsi - min_rsi).replace(0, np.nan)
+    stoch_raw = (rsi_ser - min_rsi) / rng * 100
+    df["stoch"] = stoch_raw.rolling(3).mean()
+
+    # ── Volume ratio ──────────────────────────────────
+    vol_ma = v.rolling(20).mean()
+    df["vol_ratio"] = v / vol_ma.replace(0, np.nan)
+
     return df
+
+
+def get_trend(series: pd.Series, idx: int, lookback: int = 8, thresh: float = 0.03) -> str:
+    """'up' | 'down' | 'flat' basado en pendiente de los últimos N cierres."""
+    start = max(0, idx - lookback)
+    chunk = series.iloc[start:idx + 1].dropna()
+    if len(chunk) < 3:
+        return "flat"
+    first = float(chunk.iloc[0])
+    last  = float(chunk.iloc[-1])
+    if first <= 0:
+        return "flat"
+    pct = (last - first) / first
+    if pct > thresh:
+        return "up"
+    if pct < -thresh:
+        return "down"
+    return "flat"
+
+
+def divergence(closes: pd.Series, rsi: pd.Series) -> str:
+    """
+    'bull' = precio hace mínimo más bajo pero RSI hace mínimo más alto → señal alcista
+    'bear' = precio hace máximo más alto pero RSI hace máximo más bajo → señal bajista
+    'none' = sin divergencia
+    """
+    closes = closes.dropna()
+    rsi    = rsi.dropna()
+    n = min(len(closes), len(rsi))
+    if n < 4:
+        return "none"
+    c = closes.iloc[-n:].values
+    r = rsi.iloc[-n:].values
+    # buscar mínimos (para divergencia alcista)
+    if c[-1] < c[0] and r[-1] > r[0] + 2:
+        return "bull"
+    # buscar máximos (para divergencia bajista)
+    if c[-1] > c[0] and r[-1] < r[0] - 2:
+        return "bear"
+    return "none"
+
+
+def volume_ok(df: pd.DataFrame, idx: int) -> bool:
+    """Volumen actual >= 60% de la media de 20 velas."""
+    if "vol_ratio" not in df.columns:
+        return True
+    vr = df["vol_ratio"].iloc[idx]
+    if pd.isna(vr):
+        return True
+    return float(vr) >= 0.6
+
+
+def momentum_bars(closes: pd.Series, idx: int, lookback: int = 5) -> int:
+    """Número de velas bajistas en las últimas N (para confirmar entrada LONG)."""
+    start = max(0, idx - lookback)
+    chunk = closes.iloc[start:idx + 1]
+    if len(chunk) < 2:
+        return 0
+    diffs = chunk.diff().dropna()
+    return int((diffs < 0).sum())
+
+
+def calc_score_long(rsi: float, div: str, macd_pos: bool,
+                    stoch: float, bear_bars: int) -> int:
+    score = 0
+    # RSI cuanto más bajo mejor
+    if rsi < 20:   score += 35
+    elif rsi < 25: score += 28
+    elif rsi < 30: score += 20
+    elif rsi < 35: score += 12
+    else:          score += 5
+
+    # Divergencia alcista
+    if div == "bull": score += 20
+
+    # MACD positivo o recuperándose
+    if macd_pos: score += 10
+
+    # Stoch oversold
+    if not pd.isna(stoch):
+        if stoch < 20:   score += 15
+        elif stoch < 35: score += 8
+
+    # Momentum bajista (señal de reversión inminente)
+    if bear_bars >= 4:   score += 15
+    elif bear_bars >= 3: score += 8
+    elif bear_bars >= 2: score += 3
+
+    return min(score, 100)
+
+
+def calc_score_short(rsi: float, div: str, macd_pos: bool,
+                     stoch: float, bull_bars: int) -> int:
+    score = 0
+    if rsi > 80:   score += 35
+    elif rsi > 75: score += 28
+    elif rsi > 70: score += 20
+    elif rsi > 65: score += 12
+    else:          score += 5
+
+    if div == "bear": score += 20
+    if not macd_pos:  score += 10
+
+    if not pd.isna(stoch):
+        if stoch > 80:   score += 15
+        elif stoch > 65: score += 8
+
+    if bull_bars >= 4:   score += 15
+    elif bull_bars >= 3: score += 8
+    elif bull_bars >= 2: score += 3
+
+    return min(score, 100)
