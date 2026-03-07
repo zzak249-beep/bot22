@@ -1,306 +1,620 @@
-#!/usr/bin/env python3
 """
-main.py — BingX Trading Bot v5.0 AGRESIVO
-Loop principal con circuit breaker, compound y auto-optimización
+main.py — BingX RSI+BB Bot v5.1 (Opción A — estable)
+Mejoras sobre v5.0 confirmadas por backtest:
+  - Partial TP: 50% en TP1 + SL a breakeven
+  - Trailing stop activo tras TP1
+  - Time-based exit: >8h sin resolver → cerrar
+  - Pares filtrados por backtest (PRIORITARIOS / BLOQUEADOS)
+  - PnL correcto (sin doble leverage)
+  - Sincronización con BingX
+  - Fill price real
 """
 
-import time
-import sys
-from datetime import datetime
+import sys, os, time, traceback
+from datetime import datetime, date, timezone
 
-import config
-import exchange
-import analizar
-import database
-import notifier
-import memoria
-import learner
-import config_pares
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s — %(message)s",
+    stream=sys.stdout, force=True,
+)
+log = logging.getLogger("main")
+log.info("=== ARRANQUE BOT v5.1 ===")
+
+try:
+    import config, exchange, analizar, notifier, memoria
+except Exception as e:
+    log.error(f"ERROR importando módulos: {e}")
+    log.error(traceback.format_exc())
+    sys.exit(1)
+
+try:
+    from config_pares import PARES as PARES_FIJOS
+except Exception:
+    PARES_FIJOS = []
+
+log.info(f"Módulos OK | {config.VERSION}")
+log.info(f"SCORE≥{config.SCORE_MIN} | LEV:{config.LEVERAGE}x | "
+         f"SL:{config.SL_ATR_MULT}×ATR | TP:{config.TP_ATR_MULT}×ATR | "
+         f"PARTIAL_TP:{getattr(config,'PARTIAL_TP_ACTIVO',True)} | "
+         f"TIME_EXIT:{getattr(config,'TIME_EXIT_HORAS',8)}h")
 
 
-def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+# ═══════════════════════════════════════════════════════
+# ESTADO
+# ═══════════════════════════════════════════════════════
 
+class Estado:
+    def __init__(self):
+        self.posiciones    = {}
+        self.pnl_hoy       = 0.0
+        self.perdidas_cons = 0
+        self.cb_activo     = False
+        self.dia_actual    = str(date.today())
+        self.wins = self.losses = 0
 
-def verificar_credenciales():
-    if not config.BINGX_API_KEY or not config.BINGX_SECRET_KEY:
-        log("❌ BINGX_API_KEY o BINGX_SECRET_KEY no configurados")
-        log("   Configura las variables en Railway → Variables")
-        sys.exit(1)
+    def reset_diario(self):
+        hoy = str(date.today())
+        if hoy != self.dia_actual:
+            self.dia_actual    = hoy
+            self.pnl_hoy       = 0.0
+            self.perdidas_cons = 0
+            self.cb_activo     = False
+            log.info(f"Reset diario — {hoy}")
 
-
-def circuit_breaker_check(balance_inicio: float, balance_actual: float,
-                          perdidas_consecutivas: int) -> bool:
-    """
-    Verifica si se debe activar el circuit breaker.
-    Returns True si el bot debe pausarse.
-    """
-    # Pérdida diaria máxima
-    if balance_inicio > 0:
-        perdida_pct = (balance_inicio - balance_actual) / balance_inicio
-        if perdida_pct >= config.CB_MAX_DAILY_LOSS_PCT:
-            notifier.notify_circuit_breaker(
-                f"Pérdida diaria {perdida_pct*100:.1f}%",
-                perdida_pct * 100
-            )
+    def check_circuit_breaker(self, balance):
+        if self.cb_activo:
             return True
+        if self.pnl_hoy <= -(balance * config.CB_MAX_DAILY_LOSS_PCT):
+            log.warning(f"CB: pérdida diaria ${self.pnl_hoy:.2f}")
+            self.cb_activo = True; return True
+        if self.perdidas_cons >= config.CB_MAX_CONSECUTIVE_LOSS:
+            log.warning(f"CB: {self.perdidas_cons} pérdidas seguidas")
+            self.cb_activo = True; return True
+        return False
 
-    # Pérdidas consecutivas
-    if perdidas_consecutivas >= config.CB_MAX_CONSECUTIVE_LOSS:
-        notifier.notify_circuit_breaker(
-            f"{perdidas_consecutivas} pérdidas consecutivas",
-            0.0
+    def registrar_cierre(self, pnl):
+        self.pnl_hoy += pnl
+        if pnl > 0:
+            self.wins += 1; self.perdidas_cons = 0
+        else:
+            self.losses += 1; self.perdidas_cons += 1
+
+estado = Estado()
+
+
+# ═══════════════════════════════════════════════════════
+# PARES — prioridad + bloqueos del backtest
+# ═══════════════════════════════════════════════════════
+
+def preparar_pares(pares_raw):
+    bloqueados   = set(getattr(config, "PARES_BLOQUEADOS", []))
+    prioritarios = getattr(config, "PARES_PRIORITARIOS", [])
+    limpios      = [p for p in pares_raw if p not in bloqueados]
+    top          = [p for p in prioritarios if p in set(limpios)]
+    resto        = [p for p in limpios if p not in set(top)]
+    log.info(f"Pares: {len(pares_raw)} brutos → {len(bloqueados)} bloqueados → "
+             f"{len(top)} prioritarios + {len(resto)} resto = {len(top+resto)} activos")
+    return top + resto
+
+
+# ═══════════════════════════════════════════════════════
+# TELEGRAM
+# ═══════════════════════════════════════════════════════
+
+def _notif(msg):
+    try:
+        import requests
+        tok = config.TELEGRAM_TOKEN.strip()
+        cid = config.TELEGRAM_CHAT_ID.strip()
+        if not tok or not cid: return
+        requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
         )
-        return True
+    except Exception as e:
+        log.error(f"Telegram: {e}")
 
+
+def _notif_senal(r, balance, ejecutado):
+    lado  = "🟢 LONG" if r["lado"] == "LONG" else "🔴 SHORT"
+    ex    = "✅ *Ejecutado*" if ejecutado else "⚠️ *No ejecutado*"
+    prior = getattr(config, "PARES_PRIORITARIOS", [])
+    star  = "⭐ " if r["par"] in prior else ""
+    tp1   = r.get("tp1", 0)
+    tp1_txt = f"🔶 TP1     : `{tp1:.6f}` (50%)\n" if tp1 > 0 else ""
+    _notif(
+        f"{lado} — {star}`{r['par']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Entrada : `{r['precio']:.6f}`\n"
+        f"{tp1_txt}"
+        f"✅ TP2     : `{r['tp']:.6f}`\n"
+        f"🛑 SL      : `{r['sl']:.6f}`\n"
+        f"📊 R:R     : `{r['rr']:.2f}x`\n"
+        f"🏅 Score   : `{r['score']}/100`\n"
+        f"📉 RSI     : `{r['rsi']:.1f}`\n"
+        f"💰 Balance : `${balance:.2f} USDT`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{ex}"
+    )
+
+
+def _notif_cierre(par, lado, entrada, salida, pnl, razon=""):
+    ico   = "✅" if pnl >= 0 else "❌"
+    r_txt = f" ({razon})" if razon else ""
+    _notif(
+        f"{ico} *CIERRE {lado}{r_txt}* — `{par}`\n"
+        f"`{entrada:.6f}` → `{salida:.6f}`\n"
+        f"PnL: `${pnl:+.2f} USDT`"
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# TRAILING STOP
+# ═══════════════════════════════════════════════════════
+
+def actualizar_trailing(par, pos, precio):
+    if not getattr(config, "TRAILING_ACTIVO", True):
+        return
+    lado      = pos["lado"]
+    atr       = pos.get("atr", 0)
+    activar   = getattr(config, "TRAILING_ACTIVAR",   1.5)
+    distancia = getattr(config, "TRAILING_DISTANCIA", 1.0)
+    entrada   = pos["entrada"]
+    if atr <= 0:
+        return
+    if lado == "LONG":
+        if precio - entrada < atr * activar:
+            return
+        nuevo = precio - atr * distancia
+        if nuevo > pos.get("sl_trailing", pos["sl"]):
+            pos["sl_trailing"] = nuevo
+            log.debug(f"[TRAIL] {par} LONG → SL={nuevo:.6f}")
+    else:
+        if entrada - precio < atr * activar:
+            return
+        nuevo = precio + atr * distancia
+        if nuevo < pos.get("sl_trailing", pos["sl"]):
+            pos["sl_trailing"] = nuevo
+            log.debug(f"[TRAIL] {par} SHORT → SL={nuevo:.6f}")
+
+
+# ═══════════════════════════════════════════════════════
+# PARTIAL TP
+# ═══════════════════════════════════════════════════════
+
+def gestionar_partial_tp(par, pos, precio):
+    if not getattr(config, "PARTIAL_TP_ACTIVO", True):
+        return
+    if pos.get("tp1_hit"):
+        return   # Ya en fase 2
+
+    tp1  = pos.get("tp1", 0)
+    lado = pos["lado"]
+    if tp1 <= 0:
+        return
+
+    alcanzado = (precio >= tp1) if lado == "LONG" else (precio <= tp1)
+    if not alcanzado:
+        return
+
+    qty     = pos["qty"]
+    qty_tp1 = round(qty * 0.5, 8)
+
+    if not config.MODO_DEMO:
+        res         = exchange.cerrar_posicion(par, qty_tp1, lado)
+        salida_real = (res or {}).get("precio_salida", precio) or precio
+    else:
+        salida_real = precio
+
+    entrada = pos["entrada"]
+    pnl_p   = qty_tp1 * ((salida_real - entrada) if lado == "LONG"
+                          else (entrada - salida_real))
+    estado.pnl_hoy += pnl_p
+
+    # SL a breakeven
+    be = entrada * 1.0005 if lado == "LONG" else entrada * 0.9995
+    pos["sl"]          = be
+    pos["sl_trailing"] = be
+    pos["qty"]         = round(qty - qty_tp1, 8)
+    pos["tp1_hit"]     = True
+
+    log.info(f"[TP1] {par} 50% @ {salida_real:.6f} PnL_p={pnl_p:+.4f} SL→BE={be:.6f}")
+    _notif(
+        f"🔶 *TP1 ALCANZADO* — `{par}` {lado}\n"
+        f"50% cerrado @ `{salida_real:.6f}`\n"
+        f"PnL parcial: `${pnl_p:+.2f}` USDT\n"
+        f"🔄 SL → breakeven `{be:.6f}`\n"
+        f"▶️ Resto a TP2: `{pos['tp']:.6f}`"
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# TIME-BASED EXIT
+# ═══════════════════════════════════════════════════════
+
+def check_time_exit(par, pos):
+    horas_max = getattr(config, "TIME_EXIT_HORAS", 8)
+    ts_str    = pos.get("ts", "")
+    if not ts_str:
+        return False
+    try:
+        ts    = datetime.fromisoformat(ts_str)
+        ahora = datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        horas = (ahora - ts).total_seconds() / 3600
+        if horas >= horas_max:
+            log.warning(f"[TIME_EXIT] {par} lleva {horas:.1f}h — cerrando")
+            return True
+    except Exception:
+        pass
     return False
 
 
-def monitorear_posiciones_abiertas():
-    """Monitorea posiciones abiertas y las cierra si es necesario"""
-    posiciones_db = database.get_posiciones_activas()
-    if not posiciones_db:
+# ═══════════════════════════════════════════════════════
+# SINCRONIZACIÓN CON BINGX
+# ═══════════════════════════════════════════════════════
+
+def sincronizar_posiciones():
+    if not estado.posiciones or config.MODO_DEMO:
         return
+    try:
+        pos_reales = exchange.get_posiciones_abiertas()
+        reales     = set()
+        for p in pos_reales:
+            s = p.get("symbol", "")
+            reales.add(s)
+            reales.add(s.replace("-", ""))
+            if "USDT" in s and "-" not in s:
+                reales.add(s.replace("USDT", "-USDT"))
 
-    for pos in posiciones_db:
-        symbol = pos["symbol"]
-        lado = pos["lado"]
-        precio_entrada = pos["precio_entrada"]
-        sl = pos["sl"]
-        tp = pos["tp"]
+        cerradas = [
+            par for par in estado.posiciones
+            if par not in reales and par.replace("-", "") not in reales
+        ]
 
-        precio_actual = exchange.get_precio(symbol)
-        if precio_actual <= 0:
-            continue
+        for par in cerradas:
+            pos     = estado.posiciones[par]
+            lado    = pos["lado"]
+            entrada = pos["entrada"]
+            qty     = pos["qty"]
+            sl_ef   = pos.get("sl_trailing", pos["sl"])
+            tp      = pos["tp"]
+            precio  = exchange.get_precio(par)
 
-        # Verificar si SL o TP fue tocado
-        cerrar = False
-        resultado = "ABIERTO"
-        pnl = 0.0
-
-        if lado == "LONG":
-            if precio_actual <= sl:
-                cerrar = True
-                resultado = "LOSS"
-                pnl = (precio_actual - precio_entrada) * pos["cantidad"]
-            elif precio_actual >= tp:
-                cerrar = True
-                resultado = "WIN"
-                pnl = (precio_actual - precio_entrada) * pos["cantidad"]
-
-        elif lado == "SHORT":
-            if precio_actual >= sl:
-                cerrar = True
-                resultado = "LOSS"
-                pnl = (precio_entrada - precio_actual) * pos["cantidad"]
-            elif precio_actual <= tp:
-                cerrar = True
-                resultado = "WIN"
-                pnl = (precio_entrada - precio_actual) * pos["cantidad"]
-
-        if cerrar:
-            log(f"{'✅' if resultado=='WIN' else '❌'} Cerrando {lado} {symbol}: {resultado} ${pnl:+.2f}")
-            exchange.cerrar_posicion(symbol, lado)
-            database.cerrar_posicion_db(symbol, precio_actual, pnl, resultado)
-
-            if resultado == "WIN":
-                memoria.registrar_ganancia(symbol, pnl)
+            if lado == "LONG":
+                salida, razon = (tp, "TP") if precio >= tp * 0.98 else (sl_ef, "SL")
+                pnl = qty * (salida - entrada)
             else:
-                memoria.penalizar_par(symbol, pnl)
+                salida, razon = (tp, "TP") if precio <= tp * 1.02 else (sl_ef, "SL")
+                pnl = qty * (entrada - salida)
 
-            duracion = int((time.time() - pos["timestamp"]) / 60)
-            notifier.notify_cierre(symbol, lado, precio_entrada, precio_actual,
-                                   pnl, resultado, duracion)
+            estado.registrar_cierre(pnl)
+            memoria.registrar_resultado(par, pnl, lado)
+            del estado.posiciones[par]
+            log.info(f"[SYNC] {par} cerrado por BingX ({razon}) PnL≈{pnl:+.4f}")
+            _notif_cierre(par, lado, entrada, salida, pnl, f"BingX-{razon}")
+
+        if cerradas:
+            log.info(f"[SYNC] {len(cerradas)} posición(es) sincronizadas")
+    except Exception as e:
+        log.error(f"[SYNC] {e}")
 
 
-def escanear_oportunidades(posiciones_actuales: int) -> int:
-    """
-    Escanea pares en busca de señales.
-    Returns: número de nuevas posiciones abiertas
-    """
-    if posiciones_actuales >= config.MAX_POSICIONES:
-        return 0
+# ═══════════════════════════════════════════════════════
+# GESTIONAR POSICIONES ABIERTAS
+# ═══════════════════════════════════════════════════════
 
-    balance = exchange.get_balance()
-    if balance <= 0:
-        log("⚠️ Balance = 0, verificar API keys")
-        return 0
-
-    pares = config_pares.get_pares_por_prioridad()
-    posiciones_db = database.get_posiciones_activas()
-    simbolos_abiertos = {p["symbol"] for p in posiciones_db}
-    nuevas_posiciones = 0
-
-    for symbol in pares:
-        if posiciones_actuales + nuevas_posiciones >= config.MAX_POSICIONES:
-            break
-
-        if symbol in simbolos_abiertos:
-            continue
-
-        if memoria.esta_bloqueado(symbol):
-            continue
-
+def gestionar_posiciones(balance):
+    for par, pos in list(estado.posiciones.items()):
         try:
-            resultado = analizar.analizar_par(symbol)
+            precio = exchange.get_precio(par)
+            if precio <= 0:
+                continue
+            lado = pos["lado"]
+            qty  = pos["qty"]
 
-            if resultado["señal"] == "NONE":
+            # 1. Partial TP (fase 1)
+            gestionar_partial_tp(par, pos, precio)
+
+            # 2. Time exit
+            if check_time_exit(par, pos):
+                res         = exchange.cerrar_posicion(par, qty, lado)
+                salida_real = (res or {}).get("precio_salida", precio) or precio
+                pnl = qty * ((salida_real - pos["entrada"]) if lado == "LONG"
+                             else (pos["entrada"] - salida_real))
+                estado.registrar_cierre(pnl)
+                memoria.registrar_resultado(par, pnl, lado)
+                del estado.posiciones[par]
+                _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, "TIME")
                 continue
 
-            # Aplicar modificador de memoria
-            mod = memoria.get_score_modificador(symbol)
-            score_ajustado = int(resultado["score"] * mod)
+            # 3. Trailing stop
+            actualizar_trailing(par, pos, precio)
+            sl_ef = pos.get("sl_trailing", pos["sl"])
+            tp    = pos["tp"]
 
-            if score_ajustado < config.SCORE_MIN:
-                continue
+            sl_hit = (precio <= sl_ef) if lado == "LONG" else (precio >= sl_ef)
+            tp_hit = (precio >= tp)    if lado == "LONG" else (precio <= tp)
 
-            señal = resultado["señal"]
-            precio = resultado["precio"]
-            sl = resultado["sl"]
-            tp = resultado["tp"]
-            cantidad = exchange.calcular_cantidad(symbol, precio, balance)
+            razon = salida = None
+            if sl_hit:
+                razon  = "TRAIL" if pos.get("tp1_hit") else "SL"
+                salida = sl_ef
+            elif tp_hit:
+                razon, salida = "TP2", tp
 
-            if cantidad <= 0:
-                continue
-
-            log(f"🎯 Señal {señal} {symbol} score:{score_ajustado} precio:{precio:.4f}")
-
-            # Abrir posición
-            if señal == "LONG":
-                resp = exchange.abrir_long(symbol, cantidad, sl, tp)
-            else:
-                resp = exchange.abrir_short(symbol, cantidad, sl, tp)
-
-            if resp and (resp.get("demo") or resp.get("data") or resp.get("orderId")):
-                database.guardar_posicion(symbol, señal, precio, cantidad, sl, tp, score_ajustado)
-                notifier.notify_señal(symbol, señal, precio, sl, tp, score_ajustado, cantidad, balance)
-                nuevas_posiciones += 1
-                simbolos_abiertos.add(symbol)
-                log(f"✅ Posición abierta: {señal} {symbol}")
-            else:
-                log(f"⚠️ Error abriendo {symbol}: {resp}")
-                memoria.registrar_error_api(symbol)
+            if razon:
+                res         = exchange.cerrar_posicion(par, qty, lado)
+                salida_real = (res or {}).get("precio_salida", salida) or salida
+                pnl = qty * ((salida_real - pos["entrada"]) if lado == "LONG"
+                             else (pos["entrada"] - salida_real))
+                estado.registrar_cierre(pnl)
+                memoria.registrar_resultado(par, pnl, lado)
+                del estado.posiciones[par]
+                log.info(f"CIERRE {lado} {par} @ {salida_real:.6f} PnL={pnl:+.4f} ({razon})")
+                _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, razon)
 
         except Exception as e:
-            log(f"⚠️ Error analizando {symbol}: {e}")
-            if config.MODO_DEBUG:
-                import traceback
-                traceback.print_exc()
+            log.error(f"gestionar {par}: {e}")
+        time.sleep(0.3)
 
-        time.sleep(0.3)  # Rate limiting
 
-    return nuevas_posiciones
+# ═══════════════════════════════════════════════════════
+# EJECUTAR SEÑAL
+# ═══════════════════════════════════════════════════════
 
+def ejecutar_senal(r, balance):
+    par   = r["par"]
+    lado  = r["lado"]
+    precio = r["precio"]
+
+    if par in estado.posiciones:              return False
+    if memoria.esta_bloqueado(par):
+        log.info(f"[MEMORIA] {par} bloqueado"); return False
+    if len(estado.posiciones) >= config.MAX_POSICIONES:
+        return False
+    margen_min = getattr(config, "MARGEN_MIN", 3.0)
+    if balance < margen_min and not config.MODO_DEMO:
+        log.warning(f"Balance insuficiente: ${balance:.2f} < ${margen_min:.2f}"); return False
+
+    qty = exchange.calcular_cantidad(par, balance, precio)
+    if qty <= 0:
+        return False
+
+    res = exchange.abrir_long(par, qty, precio, r["sl"], r["tp"])  if lado == "LONG" \
+          else exchange.abrir_short(par, qty, precio, r["sl"], r["tp"])
+
+    if not res or "error" in res:
+        err = (res or {}).get("error", "vacío")
+        log.error(f"Orden fallida {lado} {par}: {err}")
+        memoria.registrar_error_api(par, 109400)
+        _notif(f"🚨 *Orden fallida {lado} `{par}`*\n❌ `{err}`")
+        return False
+
+    # Precio real de ejecución (fill price)
+    entrada_real = float(res.get("fill_price", 0) or 0)
+    if entrada_real <= 0:
+        entrada_real = exchange.get_precio(par)
+    if entrada_real <= 0:
+        entrada_real = precio
+
+    # Recalcular SL/TP desde precio real
+    atr = r.get("atr", 0)
+    if atr > 0:
+        sl_r  = (entrada_real - atr * config.SL_ATR_MULT) if lado == "LONG" \
+                else (entrada_real + atr * config.SL_ATR_MULT)
+        tp_r  = (entrada_real + atr * config.TP_ATR_MULT) if lado == "LONG" \
+                else (entrada_real - atr * config.TP_ATR_MULT)
+        tp1_r = (entrada_real + atr * getattr(config, "PARTIAL_TP1_MULT", 1.5)) if lado == "LONG" \
+                else (entrada_real - atr * getattr(config, "PARTIAL_TP1_MULT", 1.5))
+    else:
+        ratio = entrada_real / precio if precio > 0 else 1.0
+        sl_r  = r["sl"]  * ratio
+        tp_r  = r["tp"]  * ratio
+        tp1_r = r.get("tp1", tp_r) * ratio
+
+    qty_real = float(res.get("executedQty", qty) or qty)
+
+    estado.posiciones[par] = {
+        "lado":        lado,
+        "entrada":     entrada_real,
+        "qty":         qty_real,
+        "sl":          sl_r,
+        "tp":          tp_r,
+        "tp1":         tp1_r,
+        "atr":         atr,
+        "sl_trailing": sl_r,
+        "tp1_hit":     False,
+        "ts":          datetime.now(timezone.utc).isoformat(),
+    }
+
+    slip = abs(entrada_real - precio) / precio * 100 if precio > 0 else 0
+    slip_tag = f" ⚠️SLIP:{slip:.1f}%" if slip > 0.5 else ""
+    log.info(f"✅ {lado} {par} fill:{entrada_real:.6f}{slip_tag} "
+             f"SL:{sl_r:.6f} TP1:{tp1_r:.6f} TP2:{tp_r:.6f} score:{r['score']}")
+    return True
+
+
+# ═══════════════════════════════════════════════════════
+# REPORTE
+# ═══════════════════════════════════════════════════════
+
+def enviar_reporte(balance):
+    prior   = set(getattr(config, "PARES_PRIORITARIOS", []))
+    pos_txt = ""
+    for par, pos in estado.posiciones.items():
+        p_actual = exchange.get_precio(par)
+        pnl_est  = pos["qty"] * (
+            (p_actual - pos["entrada"]) if pos["lado"] == "LONG"
+            else (pos["entrada"] - p_actual)
+        )
+        sl_ef  = pos.get("sl_trailing", pos["sl"])
+        fase   = "🔶→TP2" if pos.get("tp1_hit") else "▶️TP1"
+        ico    = "🟢" if pos["lado"] == "LONG" else "🔴"
+        star   = "⭐" if par in prior else ""
+        ts_str = pos.get("ts", "")
+        horas  = ""
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                horas = f" {h:.1f}h"
+            except Exception:
+                pass
+        pos_txt += (f"  {ico}{star} `{par}` e:`{pos['entrada']:.4f}` "
+                    f"est:${pnl_est:+.2f} {fase}{horas}\n")
+
+    if not pos_txt:
+        pos_txt = "  _(sin posiciones)_\n"
+
+    w, l = estado.wins, estado.losses
+    wr   = f"{w/(w+l)*100:.1f}%" if (w+l) > 0 else "N/A"
+
+    _notif(
+        f"📊 *Reporte — {config.VERSION}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Balance  : `${balance:.2f} USDT`\n"
+        f"📈 Sesión   : `{w}W/{l}L` WR:`{wr}`\n"
+        f"PnL hoy     : `${estado.pnl_hoy:+.2f}` USDT\n"
+        f"🏅 Score≥`{config.SCORE_MIN}` | Lev:`{config.LEVERAGE}x`\n"
+        f"🔶 Partial TP | ⏱ Time exit `{getattr(config,'TIME_EXIT_HORAS',8)}h`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Posiciones:\n{pos_txt}"
+        f"{'⚠️ *CIRCUIT BREAKER ACTIVO*' if estado.cb_activo else ''}"
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════
 
 def main():
-    log("=" * 60)
-    log("  🤖 BOT BINGX v5.0 AGRESIVO INICIANDO")
-    log("=" * 60)
+    log.info("=" * 60)
+    log.info(f"{config.VERSION}")
+    log.info(f"SCORE≥{config.SCORE_MIN} | LEV:{config.LEVERAGE}x | MAX_POS:{config.MAX_POSICIONES}")
+    log.info(f"PARTIAL_TP:{getattr(config,'PARTIAL_TP_ACTIVO',True)} | "
+             f"TRAILING:{getattr(config,'TRAILING_ACTIVO',True)} | "
+             f"TIME_EXIT:{getattr(config,'TIME_EXIT_HORAS',8)}h")
+    log.info("=" * 60)
 
-    # Verificar credenciales
-    verificar_credenciales()
+    balance = exchange.get_balance()
+    log.info(f"Balance: ${balance:.2f} USDT | DEMO={config.MODO_DEMO}")
 
-    # Inicializar base de datos
-    database.init_db()
+    if balance <= 0 and not config.MODO_DEMO:
+        log.error("Balance = 0")
+        _notif("🚨 *Balance = $0.00*\nVerifica `BINGX_API_KEY` y `BINGX_SECRET_KEY` en Railway.")
 
-    # Balance inicial
-    balance_inicio_dia = exchange.get_balance()
-    log(f"💰 Balance inicial: ${balance_inicio_dia:.2f} USDT")
-    log(f"{'🔥 DINERO REAL' if not config.MODO_DEMO else '🧪 MODO DEMO'}")
-    log(f"⚙️  Leverage:{config.LEVERAGE}x | Score:{config.SCORE_MIN} | MaxPos:{config.MAX_POSICIONES}")
+    try:
+        from config_pares import PARES as CP_PARES
+        pares_raw = CP_PARES
+    except ImportError:
+        pares_raw = PARES_FIJOS or [
+            "BERA-USDT","PI-USDT","OP-USDT","NEAR-USDT","ARB-USDT",
+            "LINK-USDT","GRASS-USDT","MYX-USDT","KAITO-USDT","ONDO-USDT",
+            "LTC-USDT","POPCAT-USDT","AVAX-USDT","INJ-USDT",
+        ]
+    pares = preparar_pares(pares_raw)
+    prior = getattr(config, "PARES_PRIORITARIOS", [])
+    bloq  = getattr(config, "PARES_BLOQUEADOS",   [])
 
-    # Notificar inicio
-    notifier.notify_inicio(balance_inicio_dia)
+    _notif(
+        f"🤖 *{config.VERSION}* arrancado\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Balance: `${balance:.2f} USDT`\n"
+        f"📊 Pares: `{len(pares)}` activos\n"
+        f"⭐ Prioritarios: `{len(prior)}` | 🚫 Bloqueados: `{len(bloq)}`\n"
+        f"🏅 Score≥`{config.SCORE_MIN}` | Lev:`{config.LEVERAGE}x` | Max:`{config.MAX_POSICIONES}` pos\n"
+        f"🔶 Partial TP (50%@TP1 + SL→BE)\n"
+        f"🎯 Trailing stop activo\n"
+        f"⏱ Time exit: `{getattr(config,'TIME_EXIT_HORAS',8)}h`\n"
+        f"🔄 Sync BingX: activo\n"
+        f"🧠 Memoria: activa\n"
+        f"{'🔇 *DEMO*' if config.MODO_DEMO else '🟢 *LIVE — DINERO REAL*'}"
+    )
 
-    # Limpiar bloqueados viejos
-    memoria.limpiar_bloqueados_viejos()
-
-    ciclo = 0
-    ultimo_reporte = time.time()
-    ultimo_reset_dia = time.time()
-    circuit_activado = False
-    circuit_hasta = 0
+    ciclo        = 0
+    last_reporte = time.time()
 
     while True:
         try:
             ciclo += 1
-            ahora = time.time()
-
-            # Reset diario (cada 24h)
-            if (ahora - ultimo_reset_dia) >= 86400:
-                balance_inicio_dia = exchange.get_balance()
-                circuit_activado = False
-                ultimo_reset_dia = ahora
-                log(f"📅 Reset diario - Balance: ${balance_inicio_dia:.2f}")
-
-            # Circuit breaker - esperar si está activado
-            if circuit_activado:
-                if ahora < circuit_hasta:
-                    tiempo_restante = int((circuit_hasta - ahora) / 60)
-                    log(f"⏸️ Circuit breaker activo - {tiempo_restante} min restantes")
-                    time.sleep(60)
-                    continue
-                else:
-                    circuit_activado = False
-                    log("▶️ Circuit breaker desactivado - reanudando")
-
-            log(f"\n{'='*40}\n🔄 CICLO #{ciclo}")
-
-            # 1. Monitorear posiciones abiertas
-            monitorear_posiciones_abiertas()
-
-            # 2. Obtener estado actual
+            estado.reset_diario()
             balance = exchange.get_balance()
-            posiciones = database.get_posiciones_activas()
-            n_pos = len(posiciones)
-            perdidas_consec = database.get_perdidas_consecutivas()
 
-            log(f"💰 Balance: ${balance:.2f} | Posiciones: {n_pos}/{config.MAX_POSICIONES}")
+            log.info(
+                f"Ciclo {ciclo} | {datetime.now(timezone.utc).strftime('%H:%M UTC')} | "
+                f"Bal:${balance:.2f} | Pos:{len(estado.posiciones)} | "
+                f"PnL:${estado.pnl_hoy:+.2f}"
+            )
 
-            # 3. Circuit breaker check
-            if circuit_breaker_check(balance_inicio_dia, balance, perdidas_consec):
-                circuit_activado = True
-                circuit_hasta = ahora + 3600  # Pausar 1 hora
-                log("⛔ CIRCUIT BREAKER - Pausando 1 hora")
-                time.sleep(60)
+            # 1. Sincronizar con BingX
+            sincronizar_posiciones()
+
+            # 2. Circuit breaker
+            if estado.check_circuit_breaker(balance):
+                _notif(f"🚨 *Circuit Breaker*\nPnL hoy:`${estado.pnl_hoy:+.2f}`\nPausado hasta mañana.")
+                time.sleep(3600)
                 continue
 
-            # 4. Escanear nuevas oportunidades
-            if n_pos < config.MAX_POSICIONES:
-                nuevas = escanear_oportunidades(n_pos)
-                if nuevas > 0:
-                    log(f"📈 {nuevas} nueva(s) posición(es) abierta(s)")
-            else:
-                log(f"📊 Máximo de posiciones alcanzado ({n_pos}/{config.MAX_POSICIONES})")
+            # 3. Gestionar posiciones abiertas
+            if estado.posiciones:
+                gestionar_posiciones(balance)
+                balance = exchange.get_balance()
 
-            # 5. Learner - optimización automática
-            if learner.debe_ejecutar():
-                log("🧠 Ejecutando optimización automática...")
-                learner.optimizar()
+            # 4. Buscar señales nuevas
+            if len(estado.posiciones) < config.MAX_POSICIONES:
+                log.info(f"Escaneando {len(pares)} pares (score≥{config.SCORE_MIN})...")
+                senales = analizar.analizar_todos(pares)
 
-            # 6. Reporte periódico (cada hora)
-            if (ahora - ultimo_reporte) >= 3600:
-                stats = database.get_stats_hoy()
-                notifier.notify_reporte(stats, balance, n_pos)
-                log(memoria.get_resumen())
-                ultimo_reporte = ahora
+                if senales:
+                    log.info(f"✓ {len(senales)} señal(es):")
+                    for s in senales:
+                        star = "⭐" if s["par"] in prior else " "
+                        log.info(f"  {star}{s['lado']:5s} {s['par']:20s} "
+                                 f"score={s['score']} RSI={s['rsi']:.1f} R:R={s['rr']:.2f}")
+                else:
+                    log.info("Sin señales este ciclo")
 
-            # 7. Esperar siguiente ciclo
-            log(f"⏳ Esperando {config.CICLO_SEGUNDOS}s...")
-            time.sleep(config.CICLO_SEGUNDOS)
+                for s in senales:
+                    if len(estado.posiciones) >= config.MAX_POSICIONES:
+                        break
+                    if s["par"] in estado.posiciones:
+                        continue
+                    s["score"] = memoria.ajustar_score(s["par"], s["score"])
+                    if s["score"] < config.SCORE_MIN:
+                        log.info(f"[MEMORIA] {s['par']} score={s['score']} < {config.SCORE_MIN}")
+                        continue
+                    ejecutado = ejecutar_senal(s, balance)
+                    _notif_senal(s, balance, ejecutado)
+                    if ejecutado:
+                        balance = exchange.get_balance()
+                        time.sleep(2)
+
+            # 5. Reporte horario
+            if time.time() - last_reporte >= 3600:
+                enviar_reporte(balance)
+                _notif(memoria.resumen())
+                last_reporte = time.time()
 
         except KeyboardInterrupt:
-            log("\n👋 Bot detenido por usuario")
-            sys.exit(0)
-
+            log.info("Detenido manualmente")
+            _notif("🛑 *Bot detenido manualmente.*")
+            break
         except Exception as e:
-            log(f"❌ Error en ciclo principal: {e}")
-            if config.MODO_DEBUG:
-                import traceback
-                traceback.print_exc()
-            notifier.notify_error(str(e))
-            time.sleep(60)
+            log.error(f"ERROR CICLO {ciclo}: {e}")
+            log.error(traceback.format_exc())
+            try: _notif(f"🚨 *Error ciclo {ciclo}*\n`{str(e)[:200]}`")
+            except Exception: pass
+
+        log.info(f"Próximo ciclo en {config.LOOP_SECONDS}s — "
+                 f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+        log.info("-" * 55)
+        time.sleep(config.LOOP_SECONDS)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ MAX_POSICIONES = int(os.environ.get("MAX_POSICIONES", 2))
 #   $34 → $6.10/trade   $50 → $9/trade   $80+ → $12/trade (cap)
 # Esto protege el capital pequeño y crece con la cuenta
 MARGEN_PCT  = 0.18   # 18% del balance por trade
-MARGEN_MIN  = 5.0    # mínimo absoluto ($5 = mínimo BingX)
+MARGEN_MIN  = 3.0    # mínimo absoluto ($3 — balance bajo)
 MARGEN_MAX  = 12.0   # máximo absoluto (no arriesgar más de $12)
 
 # ── CIRCUIT BREAKER ──────────────────────────────────
@@ -118,4 +118,17 @@ try:
 except ImportError:
     pass  # fallback: se usan las listas definidas arriba
 
+
+# ── LEARNER (requerido por memoria.py) ───────────────
+LEARNER_PERSISTIR      = False
+LEARNER_CICLO_H        = 4
+LEARNER_MIN_TRADES     = 8
+LEARNER_MIN_WR         = 38.0
+LEARNER_MIN_PF         = 0.9
+LEARNER_PENALIZACION_H = 12
+
+# ── CIRCUIT BREAKER config alternativo (compatibilidad)
+MAX_DAILY_LOSS_PCT   = CB_MAX_DAILY_LOSS_PCT
+MAX_DRAWDOWN_PCT     = 0.20
+CIRCUIT_BREAKER_LOSS = CB_MAX_CONSECUTIVE_LOSS
 VERSION = "BingX-RSI+BB-v5.2"
