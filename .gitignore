@@ -1,7 +1,7 @@
 # Nunca subir a GitHub
 .env
 *.log
-stats.json
+memory.json
 
 # Python
 __pycache__/
