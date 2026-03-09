@@ -1,0 +1,18 @@
+# Nunca subir a GitHub
+.env
+*.log
+stats.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+
+# Sistema
+.DS_Store
+Thumbs.db
