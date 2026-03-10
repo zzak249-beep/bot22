@@ -464,11 +464,14 @@ class Bot:
                 notional = float(p.get("notional") or TRADE_AMOUNT_USDT)
                 lev    = int(p.get("leverage") or LEVERAGE)
                 if entry > 0 and qty > 0:
-                    already = any(x.symbol == sym and x.side == side for x in self.positions)
+                    # Solo carga UNA posición por símbolo (evita hedging heredado)
+                    already = any(x.symbol == sym for x in self.positions)
                     if not already:
                         pos = Position(sym, side, entry, qty, abs(notional) / lev, lev)
                         self.positions.append(pos)
                         log.info(f"📥 Posición sincronizada: {side.upper()} {sym} entry={entry} qty={qty}")
+                    else:
+                        log.warning(f"⚠️ Ignorando posición duplicada {side.upper()} {sym} (ya existe una posición en este símbolo)")
             if self.positions:
                 log.info(f"✅ {len(self.positions)} posiciones cargadas desde BingX")
         except Exception as e:
@@ -706,6 +709,9 @@ class Bot:
             return
 
         # Buscar señales
+        if len(self.positions) >= MAX_OPEN_POSITIONS:
+            return
+
         # Evita abrir en símbolo que ya tiene posición (long O short)
         open_syms = {p.symbol for p in self.positions}
         for symbol in WATCHLIST:
