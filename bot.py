@@ -492,51 +492,77 @@ class Bot:
         )
 
     async def manage_positions(self, current_prices: dict):
+        """
+        Gestión de posiciones con precios en tiempo real.
+        Siempre loguea estado de cada posición para debug.
+        """
         to_remove = []
 
         for pos in self.positions:
+            # Precio en tiempo real — fetch individual si no está en current_prices
             price = current_prices.get(pos.symbol)
             if not price:
-                continue
+                try:
+                    t = await self.ex.fetch_ticker(pos.symbol)
+                    price = float(t.get("last") or t.get("close") or 0)
+                    if price > 0:
+                        current_prices[pos.symbol] = price
+                except Exception as e:
+                    log.warning(f"No precio para {pos.symbol}: {e}")
+                    continue
 
             pnl = pos.pnl_pct(price)
             if pnl > pos.max_pnl:
                 pos.max_pnl = pnl
 
+            # Log estado de cada posición en cada ciclo
+            log.info(
+                f"📌 {pos.side.upper()} {pos.symbol} | "
+                f"entry={pos.entry:.4f} now={price:.4f} | "
+                f"PnL={pnl:+.2f}% max={pos.max_pnl:.2f}% | "
+                f"age={pos.age_min():.0f}min | "
+                f"TP1={'✅' if pos.tp1_done else f'{TP1_PCT*LEVERAGE:.1f}%'} "
+                f"SL=-{SL_PCT*LEVERAGE:.1f}%"
+            )
+
             reason = None
-            partial = 1.0
 
             # TP1 — cierra 50% al primer objetivo
             if not pos.tp1_done and pnl >= TP1_PCT * LEVERAGE:
                 pos.tp1_done = True
-                pos.qty     *= 0.5   # reduce la posición a la mitad
-                pos.usdt    *= 0.5
-                await self.close_position(pos, price, f"TP1 +{pnl:.2f}%", partial=1.0)
+                pos.qty      = round(pos.qty * 0.5, 6)
+                pos.usdt     = pos.usdt * 0.5
+                await self.close_position(pos, price, f"TP1 +{pnl:.2f}%")
+                log.info(f"✅ TP1 ejecutado {pos.symbol} — queda 50%")
                 continue
 
             # TP2 — cierra el resto
             if pos.tp1_done and pnl >= TP2_PCT * LEVERAGE:
                 reason = f"TP2 +{pnl:.2f}%"
 
-            # Stop Loss
+            # Stop Loss — prioridad máxima
             elif pnl <= -(SL_PCT * LEVERAGE):
                 reason = f"SL {pnl:.2f}%"
 
-            # Trailing Stop — si baja TRAIL_PCT% desde el máximo
+            # Trailing Stop
             elif pos.max_pnl >= TP1_PCT * LEVERAGE * 0.5 and pnl < pos.max_pnl - TRAIL_PCT * LEVERAGE:
-                reason = f"Trail (max={pos.max_pnl:.2f}% → {pnl:.2f}%)"
+                reason = f"Trail max={pos.max_pnl:.2f}%→{pnl:.2f}%"
 
-            # Timeout 45 minutos
-            elif pos.age_min() > 45:
-                reason = f"Timeout {pos.age_min():.0f}min PnL={pnl:.2f}%"
+            # Timeout 30 minutos (reducido de 45)
+            elif pos.age_min() > 30:
+                reason = f"Timeout {pos.age_min():.0f}min PnL={pnl:+.2f}%"
 
             if reason:
+                log.info(f"🔔 Cerrando {pos.symbol} — {reason}")
                 await self.close_position(pos, price, reason)
                 to_remove.append(pos)
 
         for p in to_remove:
             if p in self.positions:
                 self.positions.remove(p)
+
+        if to_remove:
+            log.info(f"🔄 Posiciones cerradas este ciclo: {len(to_remove)}")
 
     async def cycle(self):
         self.cycles += 1
