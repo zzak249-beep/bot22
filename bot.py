@@ -493,9 +493,10 @@ class Bot:
             log.info(f"🚫 {symbol} en blacklist — skip")
             return False
 
-        # Evita hedging — no abrir si ya hay posición en este símbolo
-        if any(p.symbol == symbol for p in self.positions):
-            log.info(f"⛔ {symbol} ya tiene posición abierta — skip")
+        # Evita hedging — no abrir si ya hay posición en este símbolo (long O short)
+        existing = [p for p in self.positions if p.symbol == symbol]
+        if existing:
+            log.info(f"⛔ HEDGE BLOQUEADO: {symbol} ya tiene {existing[0].side.upper()} abierto — skip")
             return False
 
         price  = sig.price
@@ -629,13 +630,11 @@ class Bot:
 
             reason = None
 
-            # TP1 — cierra 50% al primer objetivo
+            # TP1 — cierra posición completa al primer objetivo
             if not pos.tp1_done and pnl >= TP1_PCT * LEVERAGE:
-                pos.tp1_done = True
-                pos.qty      = round(pos.qty * 0.5, 6)
-                pos.usdt     = pos.usdt * 0.5
                 await self.close_position(pos, price, f"TP1 +{pnl:.2f}%")
-                log.info(f"✅ TP1 ejecutado {pos.symbol} — queda 50%")
+                to_remove.append(pos)
+                log.info(f"✅ TP1 ejecutado {pos.symbol} — cerrado 100%")
                 continue
 
             # TP2 — cierra el resto
@@ -708,17 +707,19 @@ class Bot:
                 log.warning(f"⛔ {reason}")
             return
 
-        # Buscar señales
+        # Buscar señales — reconstruye open_syms DESPUÉS de cerrar posiciones
         if len(self.positions) >= MAX_OPEN_POSITIONS:
             return
 
-        # Evita abrir en símbolo que ya tiene posición (long O short)
-        open_syms = {p.symbol for p in self.positions}
+        open_syms = {p.symbol for p in self.positions}  # fresco tras manage_positions
+
         for symbol in WATCHLIST:
-            if symbol in open_syms:
-                continue  # ya hay posición en este símbolo — no abrir la contraria
+            # Re-check límite en cada iteración
             if len(self.positions) >= MAX_OPEN_POSITIONS:
                 break
+            # Re-check símbolo ya abierto (incluyendo los abiertos en este mismo ciclo)
+            if symbol in open_syms:
+                continue
             price = current_prices.get(symbol)
             if not price:
                 continue
@@ -727,7 +728,10 @@ class Bot:
             sig     = self.engine.analyze(symbol, price, vol)
             if sig:
                 log.info(f"📡 {sig}")
-                await self.open_position(sig)
+                ok = await self.open_position(sig)
+                if ok:
+                    # Actualiza open_syms inmediatamente para este ciclo
+                    open_syms.add(symbol)
 
     async def maybe_report(self):
         if time.time() - self._last_report >= 1800:
