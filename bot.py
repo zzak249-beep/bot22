@@ -4,7 +4,7 @@
 ║   Estrategia: Multi-señal con confirmación                       ║
 ║   • RSI + EMA + Bollinger Bands + Volume Spike                   ║
 ║   • Leverage 10x-20x configurable                                ║
-║   • Long Y Short — opera en ambas direcciones                    ║
+║   • Solo LONG — máxima seguridad anti-hedging                    ║
 ║   • Take Profit escalonado (50% en TP1, 50% en TP2)             ║
 ║   • Trailing stop dinámico                                       ║
 ║   • Anti-liquidación: stop loss obligatorio siempre             ║
@@ -51,6 +51,7 @@ MIN_TRADE_USDT      = float(os.getenv("MIN_TRADE_USDT", "5"))     # mínimo por 
 MAX_TRADE_USDT      = float(os.getenv("MAX_TRADE_USDT", "50"))    # máximo por trade
 BLACKLIST_FAILS     = int(os.getenv("BLACKLIST_FAILS", "3"))       # fallos para blacklist
 BLACKLIST_MINUTES   = int(os.getenv("BLACKLIST_MINUTES", "60"))    # minutos bloqueado
+SYNC_ON_START       = os.getenv("SYNC_ON_START", "false").lower() == "true"  # NO sincronizar posiciones antiguas
 
 # Indicadores
 RSI_PERIOD      = int(os.getenv("RSI_PERIOD", "14"))
@@ -226,11 +227,9 @@ class SignalEngine:
             elif current_price > bb_mid * 1.005:
                 short_signals.append("MOM↑rev")
 
-        # Decide dirección
+        # Solo LONG — shorts desactivados para evitar hedging
         if len(long_signals) >= MIN_SIGNALS:
             return Signal(symbol, "long", current_price, len(long_signals), long_signals)
-        if len(short_signals) >= MIN_SIGNALS:
-            return Signal(symbol, "short", current_price, len(short_signals), short_signals)
         return None
 
 
@@ -448,9 +447,10 @@ class Bot:
     async def sync_positions_with_exchange(self):
         """
         Al arrancar, sincroniza posiciones reales de BingX con el bot.
-        Evita que el bot ignore posiciones ya abiertas.
+        Solo activo si SYNC_ON_START=true — por defecto OFF para empezar limpio.
         """
-        if DRY_RUN:
+        if DRY_RUN or not SYNC_ON_START:
+            log.info("🔄 Sync desactivado — empezando con posiciones limpias")
             return
         try:
             real = await self.ex.fetch_positions()
