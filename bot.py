@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   BINGX FUTURES BOT v5.1 — Apalancamiento Agresivo              ║
+║   BINGX FUTURES BOT v5.2 — Compounding + Brain Agresivo              ║
 ║   Estrategia: Multi-señal con confirmación                       ║
 ║   • RSI + EMA + Bollinger Bands + Volume Spike                   ║
 ║   • Leverage 10x-20x configurable                                ║
@@ -44,6 +44,13 @@ TP1_PCT   = float(os.getenv("TP1_PCT",  "0.4"))   # cierra 50% posición
 TP2_PCT   = float(os.getenv("TP2_PCT",  "0.9"))   # cierra resto
 SL_PCT    = float(os.getenv("SL_PCT",   "0.5"))   # stop loss fijo
 TRAIL_PCT = float(os.getenv("TRAIL_PCT","0.3"))   # trailing desde máximo
+
+# ─── COMPOUNDING & APRENDIZAJE ────────────────────────────────────
+COMPOUND_RATE       = float(os.getenv("COMPOUND_RATE", "0.5"))    # 50% ganancias → reinvierte
+MIN_TRADE_USDT      = float(os.getenv("MIN_TRADE_USDT", "5"))     # mínimo por trade
+MAX_TRADE_USDT      = float(os.getenv("MAX_TRADE_USDT", "50"))    # máximo por trade
+BLACKLIST_FAILS     = int(os.getenv("BLACKLIST_FAILS", "3"))       # fallos para blacklist
+BLACKLIST_MINUTES   = int(os.getenv("BLACKLIST_MINUTES", "60"))    # minutos bloqueado
 
 # Indicadores
 RSI_PERIOD      = int(os.getenv("RSI_PERIOD", "14"))
@@ -288,6 +295,59 @@ class RiskManager:
         return f"PnL hoy: ${self.daily_pnl:+.4f} | Trades: {self.trades}"
 
 
+
+# ─── SYMBOL BRAIN ─────────────────────────────────────────────────
+class SymbolBrain:
+    """
+    Aprende qué símbolos son rentables y cuáles fallan.
+    - Penaliza símbolos con muchas pérdidas → blacklist temporal
+    - Prioriza símbolos con historial ganador
+    """
+    def __init__(self):
+        self.data: dict = {}   # symbol → {wins, losses, pnl, blacklist_until}
+
+    def _get(self, sym: str) -> dict:
+        if sym not in self.data:
+            self.data[sym] = {"wins": 0, "losses": 0, "pnl": 0.0, "blacklist_until": 0.0}
+        return self.data[sym]
+
+    def is_blacklisted(self, sym: str) -> bool:
+        d = self._get(sym)
+        if time.time() < d["blacklist_until"]:
+            return True
+        d["blacklist_until"] = 0.0
+        return False
+
+    def on_win(self, sym: str, pnl: float):
+        d = self._get(sym)
+        d["wins"] += 1
+        d["pnl"]  += pnl
+
+    def on_loss(self, sym: str, pnl: float):
+        d = self._get(sym)
+        d["losses"] += 1
+        d["pnl"]    += pnl
+        total = d["wins"] + d["losses"]
+        if total >= BLACKLIST_FAILS:
+            fail_rate = d["losses"] / total
+            if fail_rate >= 0.7:   # 70%+ fallos → blacklist
+                d["blacklist_until"] = time.time() + BLACKLIST_MINUTES * 60
+                log.warning(f"🚫 BLACKLIST {sym} | fallos={d['losses']}/{total} | {BLACKLIST_MINUTES}min")
+
+    def score(self, sym: str) -> float:
+        d = self._get(sym)
+        total = d["wins"] + d["losses"]
+        if total < 2:
+            return 1.0
+        return (d["wins"] / total) * max(d["pnl"], 0.001)
+
+    def dump(self) -> dict:
+        return dict(self.data)
+
+    def load(self, data: dict):
+        self.data = data
+
+
 # ─── BOT ──────────────────────────────────────────────────────────
 class Bot:
     def __init__(self):
@@ -308,6 +368,7 @@ class Bot:
         self.wins      = 0
         self.losses    = 0
         self._last_report = time.time()
+        self.brain     = SymbolBrain()
         self._load()
 
     def _load(self):
@@ -318,7 +379,13 @@ class Bot:
             self.total_pnl = float(d.get("total_pnl", 0.0))
             self.wins      = int(d.get("wins",   0))
             self.losses    = int(d.get("losses", 0))
-            log.info(f"💾 Capital: ${self.capital:.4f} | PnL total: ${self.total_pnl:+.4f}")
+            self.brain.load(d.get("brain", {}))
+            log.info(
+                f"💾 Capital: ${self.capital:.4f} | "
+                f"PnL total: ${self.total_pnl:+.4f} | "
+                f"W/L: {self.wins}/{self.losses} | "
+                f"Brain: {len(self.brain.data)} símbolos"
+            )
         except Exception:
             pass
 
@@ -330,6 +397,7 @@ class Bot:
                     "total_pnl": round(self.total_pnl, 6),
                     "wins"     : self.wins,
                     "losses"   : self.losses,
+                    "brain"    : self.brain.dump(),
                     "updated"  : datetime.now().isoformat(),
                 }, f, indent=2)
         except Exception as e:
@@ -406,15 +474,35 @@ class Bot:
         except Exception as e:
             log.warning(f"sync_positions error: {e}")
 
+    @property
+    def trade_amount(self) -> float:
+        """Capital por trade con compounding — reinvierte % de ganancias."""
+        base = TRADE_AMOUNT_USDT
+        if self.total_pnl > 0:
+            base = base + self.total_pnl * COMPOUND_RATE
+        return round(max(MIN_TRADE_USDT, min(MAX_TRADE_USDT, base)), 4)
+
     async def open_position(self, sig: Signal) -> bool:
         symbol = sig.symbol
+
+        # Blacklist — no operar símbolos con mal historial
+        if self.brain.is_blacklisted(symbol):
+            log.info(f"🚫 {symbol} en blacklist — skip")
+            return False
+
+        # Evita hedging — no abrir si ya hay posición en este símbolo
+        if any(p.symbol == symbol for p in self.positions):
+            log.info(f"⛔ {symbol} ya tiene posición abierta — skip")
+            return False
+
         price  = sig.price
-        qty    = round((TRADE_AMOUNT_USDT * LEVERAGE) / price, 4)
+        amount = self.trade_amount
+        qty    = round((amount * LEVERAGE) / price, 4)
 
         log.info(f"🚀 {sig} | precio={price:.4f} qty={qty} lev={LEVERAGE}x")
 
         if DRY_RUN:
-            pos = Position(symbol, sig.side, price, qty, TRADE_AMOUNT_USDT, LEVERAGE)
+            pos = Position(symbol, sig.side, price, qty, amount, LEVERAGE)
             self.positions.append(pos)
             await self.tg.send(
                 f"{'🟢' if sig.side=='long' else '🔴'} *{'LONG' if sig.side=='long' else 'SHORT'}* "
@@ -423,7 +511,7 @@ class Bot:
                 f"Score     : `{sig.score}/5` — {', '.join(sig.reasons)}\n"
                 f"Cantidad  : `{qty}`\n"
                 f"Leverage  : `{LEVERAGE}x`\n"
-                f"Capital   : `${TRADE_AMOUNT_USDT}` → expuesto `${TRADE_AMOUNT_USDT*LEVERAGE}`\n"
+                f"Capital   : `${amount:.2f}` → expuesto `${amount*LEVERAGE:.2f}`\n"
                 f"TP1={TP1_PCT*LEVERAGE:.1f}% | TP2={TP2_PCT*LEVERAGE:.1f}% | SL=-{SL_PCT*LEVERAGE:.1f}%"
             )
             return True
@@ -436,7 +524,7 @@ class Bot:
                 order = await self.ex.create_market_sell_order(symbol, qty)
 
             filled = float(order.get("average") or order.get("price") or price)
-            pos = Position(symbol, sig.side, filled, qty, TRADE_AMOUNT_USDT, LEVERAGE)
+            pos = Position(symbol, sig.side, filled, qty, amount, LEVERAGE)
             self.positions.append(pos)
 
             await self.tg.send(
@@ -479,15 +567,26 @@ class Bot:
         self.risk.register(pnl_usdt)
         if pnl_usdt >= 0:
             self.wins += 1
+            self.brain.on_win(pos.symbol, pnl_usdt)
         else:
             self.losses += 1
+            self.brain.on_loss(pos.symbol, pnl_usdt)
         self._save()
+
+        # Log compounding
+        log.info(
+            f"  💰 Compounding | Capital: ${self.capital:.4f} | "
+            f"Próx trade: ${self.trade_amount:.4f} | "
+            f"PnL total: ${self.total_pnl:+.4f}"
+        )
 
         await self.tg.send(
             f"{'✅' if pnl_usdt >= 0 else '❌'} *Cerrado* `{pos.symbol}`\n"
-            f"Razón     : {reason}\n"
-            f"PnL       : `{pnl_pct:+.2f}%` (${pnl_usdt:+.4f})\n"
-            f"Capital   : `${self.capital:.4f}` USDT\n"
+            f"Razón       : {reason}\n"
+            f"PnL         : `{pnl_pct:+.2f}%` (${pnl_usdt:+.4f})\n"
+            f"Capital     : `${self.capital:.4f}` USDT\n"
+            f"Próx trade  : `${self.trade_amount:.4f}` USDT\n"
+            f"PnL total   : `${self.total_pnl:+.4f}` USDT\n"
             f"{self.risk.summary()}"
         )
 
@@ -607,10 +706,11 @@ class Bot:
             return
 
         # Buscar señales
+        # Evita abrir en símbolo que ya tiene posición (long O short)
         open_syms = {p.symbol for p in self.positions}
         for symbol in WATCHLIST:
             if symbol in open_syms:
-                continue
+                continue  # ya hay posición en este símbolo — no abrir la contraria
             if len(self.positions) >= MAX_OPEN_POSITIONS:
                 break
             price = current_prices.get(symbol)
@@ -630,7 +730,7 @@ class Bot:
             wr    = f"{self.wins/total*100:.1f}%" if total else "—"
             mode  = "🔵 DRY" if DRY_RUN else "🔴 LIVE"
             rep   = (
-                f"📊 *Bot v5.1* {mode}\n"
+                f"📊 *Bot v5.2* {mode}\n"
                 f"Capital   : `${self.capital:.4f}` USDT\n"
                 f"PnL total : `${self.total_pnl:+.4f}` USDT\n"
                 f"Trades    : {total} (✅{self.wins}/❌{self.losses}) {wr}\n"
@@ -658,7 +758,7 @@ class Bot:
             f"{'═'*60}"
         )
         await self.tg.send(
-            f"🤖 *Bot v5.1 iniciado* — BingX Futuros\n"
+            f"🤖 *Bot v5.2 iniciado* — BingX Futuros\n"
             f"Modo       : {'DRY RUN 🔵' if DRY_RUN else 'LIVE 🔴'}\n"
             f"Leverage   : `{LEVERAGE}x`\n"
             f"Trade      : `${TRADE_AMOUNT_USDT}` → expuesto `${TRADE_AMOUNT_USDT*LEVERAGE}`\n"
