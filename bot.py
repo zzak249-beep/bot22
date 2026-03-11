@@ -1,13 +1,10 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   BINGX FUTURES BOT v5.2 — Compounding + Brain Agresivo              ║
-║   Estrategia: Multi-señal con confirmación                       ║
-║   • RSI + EMA + Bollinger Bands + Volume Spike                   ║
-║   • Leverage 10x-20x configurable                                ║
-║   • Solo LONG — máxima seguridad anti-hedging                    ║
-║   • Take Profit escalonado (50% en TP1, 50% en TP2)             ║
-║   • Trailing stop dinámico                                       ║
-║   • Anti-liquidación: stop loss obligatorio siempre             ║
+║   BINGX FUTURES BOT v5.2 — Compounding + Brain Agresivo         ║
+║   FIX v5.2.1:                                                    ║
+║   • SYNC_ON_START siempre activo al arranque (anti-hedge)        ║
+║   • Bloqueo hedging robusto: chequea BingX real, no solo memoria ║
+║   • TP1 corregido: cierra 50% (no 100%) y pone SL a breakeven   ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -46,29 +43,31 @@ SL_PCT    = float(os.getenv("SL_PCT",   "0.5"))   # stop loss fijo
 TRAIL_PCT = float(os.getenv("TRAIL_PCT","0.3"))   # trailing desde máximo
 
 # ─── COMPOUNDING & APRENDIZAJE ────────────────────────────────────
-COMPOUND_RATE       = float(os.getenv("COMPOUND_RATE", "0.5"))    # 50% ganancias → reinvierte
-MIN_TRADE_USDT      = float(os.getenv("MIN_TRADE_USDT", "5"))     # mínimo por trade
-MAX_TRADE_USDT      = float(os.getenv("MAX_TRADE_USDT", "50"))    # máximo por trade
-BLACKLIST_FAILS     = int(os.getenv("BLACKLIST_FAILS", "3"))       # fallos para blacklist
-BLACKLIST_MINUTES   = int(os.getenv("BLACKLIST_MINUTES", "60"))    # minutos bloqueado
-SYNC_ON_START       = os.getenv("SYNC_ON_START", "false").lower() == "true"  # NO sincronizar posiciones antiguas
+COMPOUND_RATE     = float(os.getenv("COMPOUND_RATE", "0.5"))
+MIN_TRADE_USDT    = float(os.getenv("MIN_TRADE_USDT", "5"))
+MAX_TRADE_USDT    = float(os.getenv("MAX_TRADE_USDT", "50"))
+BLACKLIST_FAILS   = int(os.getenv("BLACKLIST_FAILS", "3"))
+BLACKLIST_MINUTES = int(os.getenv("BLACKLIST_MINUTES", "60"))
+
+# ── FIX: SYNC_ON_START siempre True — protege contra hedging tras reinicio ──
+# Ignoramos la variable de entorno: SIEMPRE sincronizamos al arranque
+SYNC_ON_START = True
 
 # Indicadores
 RSI_PERIOD      = int(os.getenv("RSI_PERIOD", "14"))
-RSI_OVERSOLD    = float(os.getenv("RSI_OVERSOLD",  "35"))  # señal long
-RSI_OVERBOUGHT  = float(os.getenv("RSI_OVERBOUGHT","65"))  # señal short
+RSI_OVERSOLD    = float(os.getenv("RSI_OVERSOLD",  "35"))
+RSI_OVERBOUGHT  = float(os.getenv("RSI_OVERBOUGHT","65"))
 EMA_FAST        = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW        = int(os.getenv("EMA_SLOW", "21"))
 BB_PERIOD       = int(os.getenv("BB_PERIOD", "20"))
 BB_STD          = float(os.getenv("BB_STD", "2.0"))
-VOL_SPIKE_MULT  = float(os.getenv("VOL_SPIKE_MULT", "1.5"))  # volumen X veces la media
-MIN_SIGNALS     = int(os.getenv("MIN_SIGNALS", "2"))  # señales mínimas para entrar
+VOL_SPIKE_MULT  = float(os.getenv("VOL_SPIKE_MULT", "1.5"))
+MIN_SIGNALS     = int(os.getenv("MIN_SIGNALS", "2"))
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MEMORY_FILE      = "memory.json"
 
-# Pares a monitorear — futuros perpetuos con más volumen en BingX
 WATCHLIST = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
     "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
@@ -154,10 +153,10 @@ class PriceHistory:
 class Signal:
     def __init__(self, symbol, side, price, score, reasons):
         self.symbol  = symbol
-        self.side    = side     # "long" | "short"
+        self.side    = side
         self.price   = price
-        self.score   = score    # 0-4 señales confirmadas
-        self.reasons = reasons  # lista de indicadores que confirmaron
+        self.score   = score
+        self.reasons = reasons
 
     def __str__(self):
         return (f"{'🟢 LONG' if self.side=='long' else '🔴 SHORT'} "
@@ -166,16 +165,6 @@ class Signal:
 
 # ─── MOTOR DE SEÑALES ─────────────────────────────────────────────
 class SignalEngine:
-    """
-    Genera señales combinando 4 indicadores:
-      1. RSI — sobrecompra/sobreventa
-      2. EMA crossover — tendencia
-      3. Bollinger Bands — precio en banda extrema
-      4. Volume spike — confirmación de movimiento
-
-    Necesita MIN_SIGNALS confirmaciones para disparar.
-    """
-
     def __init__(self, history: PriceHistory):
         self.history = history
 
@@ -187,7 +176,6 @@ class SignalEngine:
         long_signals  = []
         short_signals = []
 
-        # ── RSI ──────────────────────────────────────────────────
         rsi = calc_rsi(closes, RSI_PERIOD)
         if rsi is not None:
             if rsi <= RSI_OVERSOLD:
@@ -195,16 +183,14 @@ class SignalEngine:
             elif rsi >= RSI_OVERBOUGHT:
                 short_signals.append(f"RSI={rsi:.1f}")
 
-        # ── EMA Crossover ────────────────────────────────────────
         ema_f = calc_ema(closes, EMA_FAST)
         ema_s = calc_ema(closes, EMA_SLOW)
         if ema_f and ema_s:
-            if ema_f > ema_s * 1.001:   # EMA rápida por encima
+            if ema_f > ema_s * 1.001:
                 long_signals.append(f"EMA↑")
-            elif ema_f < ema_s * 0.999: # EMA rápida por debajo
+            elif ema_f < ema_s * 0.999:
                 short_signals.append(f"EMA↓")
 
-        # ── Bollinger Bands ──────────────────────────────────────
         bb_low, bb_mid, bb_high = calc_bb(closes, BB_PERIOD, BB_STD)
         if bb_low and bb_high:
             if current_price <= bb_low:
@@ -212,22 +198,19 @@ class SignalEngine:
             elif current_price >= bb_high:
                 short_signals.append(f"BB_high")
 
-        # ── Volume Spike ─────────────────────────────────────────
         if len(volumes) >= 10:
             avg_vol = sum(list(volumes)[-10:]) / 10
             if current_vol >= avg_vol * VOL_SPIKE_MULT:
-                # Volumen alto confirma la dirección dominante
                 long_signals.append(f"VOL×{current_vol/avg_vol:.1f}")
                 short_signals.append(f"VOL×{current_vol/avg_vol:.1f}")
 
-        # ── Momentum (precio vs EMA media) ───────────────────────
         if bb_mid:
             if current_price < bb_mid * 0.995:
                 long_signals.append("MOM↓rev")
             elif current_price > bb_mid * 1.005:
                 short_signals.append("MOM↑rev")
 
-        # Solo LONG — shorts desactivados para evitar hedging
+        # Solo LONG
         if len(long_signals) >= MIN_SIGNALS:
             return Signal(symbol, "long", current_price, len(long_signals), long_signals)
         return None
@@ -236,15 +219,16 @@ class SignalEngine:
 # ─── POSICIÓN ─────────────────────────────────────────────────────
 class Position:
     def __init__(self, symbol, side, entry, qty, usdt, leverage):
-        self.symbol     = symbol
-        self.side       = side       # "long" | "short"
-        self.entry      = entry
-        self.qty        = qty
-        self.usdt       = usdt
-        self.leverage   = leverage
-        self.opened_at  = time.time()
-        self.max_pnl    = 0.0
-        self.tp1_done   = False      # ya cerró 50% en TP1
+        self.symbol    = symbol
+        self.side      = side
+        self.entry     = entry
+        self.qty       = qty
+        self.usdt      = usdt
+        self.leverage  = leverage
+        self.opened_at = time.time()
+        self.max_pnl   = 0.0
+        self.tp1_done  = False
+        self.breakeven = False   # SL movido a breakeven tras TP1
 
     def pnl_pct(self, price: float) -> float:
         if self.entry == 0:
@@ -294,16 +278,10 @@ class RiskManager:
         return f"PnL hoy: ${self.daily_pnl:+.4f} | Trades: {self.trades}"
 
 
-
 # ─── SYMBOL BRAIN ─────────────────────────────────────────────────
 class SymbolBrain:
-    """
-    Aprende qué símbolos son rentables y cuáles fallan.
-    - Penaliza símbolos con muchas pérdidas → blacklist temporal
-    - Prioriza símbolos con historial ganador
-    """
     def __init__(self):
-        self.data: dict = {}   # symbol → {wins, losses, pnl, blacklist_until}
+        self.data: dict = {}
 
     def _get(self, sym: str) -> dict:
         if sym not in self.data:
@@ -329,7 +307,7 @@ class SymbolBrain:
         total = d["wins"] + d["losses"]
         if total >= BLACKLIST_FAILS:
             fail_rate = d["losses"] / total
-            if fail_rate >= 0.7:   # 70%+ fallos → blacklist
+            if fail_rate >= 0.7:
                 d["blacklist_until"] = time.time() + BLACKLIST_MINUTES * 60
                 log.warning(f"🚫 BLACKLIST {sym} | fallos={d['losses']}/{total} | {BLACKLIST_MINUTES}min")
 
@@ -354,7 +332,7 @@ class Bot:
             "apiKey"         : API_KEY,
             "secret"         : API_SECRET,
             "enableRateLimit": True,
-            "options"        : {"defaultType": "swap"},  # FUTUROS PERPETUOS
+            "options"        : {"defaultType": "swap"},
         })
         self.positions : list[Position] = []
         self.history   = PriceHistory()
@@ -411,7 +389,6 @@ class Bot:
             pass
 
     async def fetch_candles(self):
-        """Descarga velas de 1m para cada símbolo del watchlist."""
         for symbol in WATCHLIST:
             try:
                 ohlcv = await self.ex.fetch_ohlcv(symbol, "1m", limit=100)
@@ -422,10 +399,8 @@ class Bot:
                 log.debug(f"fetch_ohlcv {symbol}: {e}")
 
     async def fetch_live_prices(self) -> dict:
-        """Precios en TIEMPO REAL — imprescindible para SL/TP."""
         prices = {}
         try:
-            # Intenta todos a la vez
             syms = list({p.symbol for p in self.positions} | set(WATCHLIST))
             tickers = await self.ex.fetch_tickers(syms)
             for sym, t in tickers.items():
@@ -433,7 +408,6 @@ class Bot:
                 if p and float(p) > 0:
                     prices[sym] = float(p)
         except Exception:
-            # Fallback: uno a uno solo las posiciones abiertas
             for pos in self.positions:
                 try:
                     t = await self.ex.fetch_ticker(pos.symbol)
@@ -444,42 +418,79 @@ class Bot:
                     log.warning(f"fetch_ticker {pos.symbol}: {e}")
         return prices
 
+    # ══════════════════════════════════════════════════════════════
+    # FIX CRÍTICO: sync SIEMPRE al arranque, nunca desactivado
+    # ══════════════════════════════════════════════════════════════
     async def sync_positions_with_exchange(self):
         """
-        Al arrancar, sincroniza posiciones reales de BingX con el bot.
-        Solo activo si SYNC_ON_START=true — por defecto OFF para empezar limpio.
+        Carga posiciones reales de BingX en self.positions al arranque.
+        Esto es OBLIGATORIO — sin esto, tras un reinicio el bot no sabe
+        qué posiciones están abiertas y puede abrir el lado contrario
+        (hedging accidental).
+
+        En DRY_RUN también limpia self.positions para empezar limpio.
         """
-        if DRY_RUN or not SYNC_ON_START:
-            log.info("🔄 Sync desactivado — empezando con posiciones limpias")
+        if DRY_RUN:
+            self.positions.clear()
+            log.info("🔵 DRY RUN — posiciones reiniciadas a cero")
             return
+
         try:
             real = await self.ex.fetch_positions()
+            loaded = 0
+
             for p in real:
-                if float(p.get("contracts", 0)) == 0:
+                contracts = float(p.get("contracts", 0) or 0)
+                if contracts == 0:
                     continue
-                sym    = p["symbol"]
-                side   = "long" if p["side"] == "long" else "short"
-                entry  = float(p.get("entryPrice") or p.get("averagePrice") or 0)
-                qty    = float(p.get("contracts", 0))
+
+                sym   = p["symbol"]
+                side  = "long" if p.get("side", "long") == "long" else "short"
+                entry = float(p.get("entryPrice") or p.get("averagePrice") or 0)
+                qty   = abs(contracts)
                 notional = float(p.get("notional") or TRADE_AMOUNT_USDT)
-                lev    = int(p.get("leverage") or LEVERAGE)
-                if entry > 0 and qty > 0:
-                    # Solo carga UNA posición por símbolo (evita hedging heredado)
-                    already = any(x.symbol == sym for x in self.positions)
-                    if not already:
-                        pos = Position(sym, side, entry, qty, abs(notional) / lev, lev)
-                        self.positions.append(pos)
-                        log.info(f"📥 Posición sincronizada: {side.upper()} {sym} entry={entry} qty={qty}")
-                    else:
-                        log.warning(f"⚠️ Ignorando posición duplicada {side.upper()} {sym} (ya existe una posición en este símbolo)")
-            if self.positions:
-                log.info(f"✅ {len(self.positions)} posiciones cargadas desde BingX")
+                lev   = int(p.get("leverage") or LEVERAGE)
+
+                if entry <= 0 or qty <= 0:
+                    log.warning(f"[SYNC] {sym} datos inválidos (entry={entry} qty={qty}) — ignorado")
+                    continue
+
+                # ── FIX: solo UNA posición por símbolo ──
+                already = any(x.symbol == sym for x in self.positions)
+                if already:
+                    log.warning(
+                        f"[SYNC] ⚠️ {sym} ya cargado — "
+                        f"posición {side.upper()} duplicada ignorada (anti-hedge)"
+                    )
+                    continue
+
+                pos = Position(sym, side, entry, qty, abs(notional) / lev, lev)
+                self.positions.append(pos)
+                loaded += 1
+                log.info(
+                    f"[SYNC] ✅ {side.upper()} {sym} "
+                    f"entry={entry:.6f} qty={qty} lev={lev}x"
+                )
+
+            if loaded:
+                msg = (
+                    f"♻️ *Bot reiniciado — {loaded} posición(es) recuperada(s)*\n"
+                    + "\n".join(
+                        f"  {'🟢' if p.side=='long' else '🔴'} `{p.symbol}` "
+                        f"{p.side.upper()} @ `{p.entry:.6f}`"
+                        for p in self.positions
+                    )
+                )
+                log.warning(msg.replace("*","").replace("`",""))
+                await self.tg.send(msg)
+            else:
+                log.info("[SYNC] Sin posiciones abiertas en BingX — empezando limpio")
+
         except Exception as e:
-            log.warning(f"sync_positions error: {e}")
+            log.error(f"[SYNC] Error cargando posiciones: {e}", exc_info=True)
 
     @property
     def trade_amount(self) -> float:
-        """Capital por trade con compounding — reinvierte % de ganancias."""
         base = TRADE_AMOUNT_USDT
         if self.total_pnl > 0:
             base = base + self.total_pnl * COMPOUND_RATE
@@ -488,16 +499,37 @@ class Bot:
     async def open_position(self, sig: Signal) -> bool:
         symbol = sig.symbol
 
-        # Blacklist — no operar símbolos con mal historial
         if self.brain.is_blacklisted(symbol):
             log.info(f"🚫 {symbol} en blacklist — skip")
             return False
 
-        # Evita hedging — no abrir si ya hay posición en este símbolo (long O short)
+        # ── FIX: doble verificación anti-hedge ──
+        # 1) en memoria
         existing = [p for p in self.positions if p.symbol == symbol]
         if existing:
-            log.info(f"⛔ HEDGE BLOQUEADO: {symbol} ya tiene {existing[0].side.upper()} abierto — skip")
+            log.warning(
+                f"⛔ HEDGE BLOQUEADO [{symbol}]: "
+                f"ya hay {existing[0].side.upper()} en memoria — "
+                f"señal {sig.side.upper()} descartada"
+            )
             return False
+
+        # 2) en BingX real (extra seguridad, evita race conditions)
+        if not DRY_RUN:
+            try:
+                real = await self.ex.fetch_positions([symbol])
+                for rp in real:
+                    if float(rp.get("contracts", 0) or 0) != 0:
+                        log.warning(
+                            f"⛔ HEDGE BLOQUEADO [{symbol}]: "
+                            f"posición real en BingX detectada — "
+                            f"señal {sig.side.upper()} descartada"
+                        )
+                        return False
+            except Exception as e:
+                log.warning(f"[anti-hedge] No se pudo verificar BingX para {symbol}: {e}")
+                # Ante la duda, no operar
+                return False
 
         price  = sig.price
         amount = self.trade_amount
@@ -516,7 +548,7 @@ class Bot:
                 f"Cantidad  : `{qty}`\n"
                 f"Leverage  : `{LEVERAGE}x`\n"
                 f"Capital   : `${amount:.2f}` → expuesto `${amount*LEVERAGE:.2f}`\n"
-                f"TP1={TP1_PCT*LEVERAGE:.1f}% | TP2={TP2_PCT*LEVERAGE:.1f}% | SL=-{SL_PCT*LEVERAGE:.1f}%"
+                f"TP1=+{TP1_PCT*LEVERAGE:.1f}% (50%) | TP2=+{TP2_PCT*LEVERAGE:.1f}% | SL=-{SL_PCT*LEVERAGE:.1f}%"
             )
             return True
 
@@ -537,7 +569,7 @@ class Bot:
                 f"Precio    : `{filled:.4f}`\n"
                 f"Score     : `{sig.score}/5`\n"
                 f"Leverage  : `{LEVERAGE}x`\n"
-                f"TP1={TP1_PCT*LEVERAGE:.1f}% | TP2={TP2_PCT*LEVERAGE:.1f}% | SL=-{SL_PCT*LEVERAGE:.1f}%"
+                f"TP1=+{TP1_PCT*LEVERAGE:.1f}% (50%) | TP2=+{TP2_PCT*LEVERAGE:.1f}% | SL=-{SL_PCT*LEVERAGE:.1f}%"
             )
             return True
         except Exception as e:
@@ -552,8 +584,7 @@ class Bot:
         log.info(
             f"{'✅' if pnl_usdt >= 0 else '❌'} CIERRE {pos.symbol} [{reason}] | "
             f"entrada={pos.entry:.4f} salida={price:.4f} | "
-            f"PnL={pnl_pct:+.2f}% (${pnl_usdt:+.4f}) | "
-            f"partial={partial*100:.0f}%"
+            f"PnL={pnl_pct:+.2f}% (${pnl_usdt:+.4f}) | partial={partial*100:.0f}%"
         )
 
         if not DRY_RUN:
@@ -565,7 +596,6 @@ class Bot:
             except Exception as e:
                 log.error(f"close error {pos.symbol}: {e}")
 
-        # Actualiza capital y stats
         self.capital   += pnl_usdt
         self.total_pnl += pnl_usdt
         self.risk.register(pnl_usdt)
@@ -577,7 +607,6 @@ class Bot:
             self.brain.on_loss(pos.symbol, pnl_usdt)
         self._save()
 
-        # Log compounding
         log.info(
             f"  💰 Compounding | Capital: ${self.capital:.4f} | "
             f"Próx trade: ${self.trade_amount:.4f} | "
@@ -585,7 +614,7 @@ class Bot:
         )
 
         await self.tg.send(
-            f"{'✅' if pnl_usdt >= 0 else '❌'} *Cerrado* `{pos.symbol}`\n"
+            f"{'✅' if pnl_usdt >= 0 else '❌'} *Cerrado {'parcial 50%' if partial < 1 else ''}* `{pos.symbol}`\n"
             f"Razón       : {reason}\n"
             f"PnL         : `{pnl_pct:+.2f}%` (${pnl_usdt:+.4f})\n"
             f"Capital     : `${self.capital:.4f}` USDT\n"
@@ -595,14 +624,9 @@ class Bot:
         )
 
     async def manage_positions(self, current_prices: dict):
-        """
-        Gestión de posiciones con precios en tiempo real.
-        Siempre loguea estado de cada posición para debug.
-        """
         to_remove = []
 
         for pos in self.positions:
-            # Precio en tiempo real — fetch individual si no está en current_prices
             price = current_prices.get(pos.symbol)
             if not price:
                 try:
@@ -618,38 +642,49 @@ class Bot:
             if pnl > pos.max_pnl:
                 pos.max_pnl = pnl
 
-            # Log estado de cada posición en cada ciclo
             log.info(
                 f"📌 {pos.side.upper()} {pos.symbol} | "
                 f"entry={pos.entry:.4f} now={price:.4f} | "
                 f"PnL={pnl:+.2f}% max={pos.max_pnl:.2f}% | "
                 f"age={pos.age_min():.0f}min | "
-                f"TP1={'✅' if pos.tp1_done else f'{TP1_PCT*LEVERAGE:.1f}%'} "
+                f"TP1={'✅BE' if pos.tp1_done else f'+{TP1_PCT*LEVERAGE:.1f}%'} "
                 f"SL=-{SL_PCT*LEVERAGE:.1f}%"
             )
 
             reason = None
 
-            # TP1 — cierra posición completa al primer objetivo
+            # ── FIX TP1: cierra 50% (no 100%) y mueve SL a breakeven ──
             if not pos.tp1_done and pnl >= TP1_PCT * LEVERAGE:
-                await self.close_position(pos, price, f"TP1 +{pnl:.2f}%")
-                to_remove.append(pos)
-                log.info(f"✅ TP1 ejecutado {pos.symbol} — cerrado 100%")
+                await self.close_position(pos, price, f"TP1 +{pnl:.2f}% (50%)", partial=0.5)
+                pos.qty      = round(pos.qty * 0.5, 4)
+                pos.usdt     = pos.usdt * 0.5
+                pos.tp1_done = True
+                pos.breakeven = True
+                # SL efectivo ahora es el precio de entrada (breakeven)
+                log.info(f"🔶 TP1 {pos.symbol} — 50% cerrado, SL→breakeven @ {pos.entry:.4f}")
+                await self.tg.send(
+                    f"🔶 *TP1 alcanzado* `{pos.symbol}`\n"
+                    f"50% cerrado @ `{price:.4f}`\n"
+                    f"🔄 SL → breakeven `{pos.entry:.4f}`\n"
+                    f"▶️ Resto apunta a TP2: `+{TP2_PCT*LEVERAGE:.1f}%`"
+                )
                 continue
 
             # TP2 — cierra el resto
             if pos.tp1_done and pnl >= TP2_PCT * LEVERAGE:
                 reason = f"TP2 +{pnl:.2f}%"
 
-            # Stop Loss — prioridad máxima
-            elif pnl <= -(SL_PCT * LEVERAGE):
+            # SL — breakeven si TP1 ya ejecutado, normal si no
+            elif pos.breakeven and pnl <= 0:
+                reason = f"SL-Breakeven {pnl:.2f}%"
+            elif not pos.tp1_done and pnl <= -(SL_PCT * LEVERAGE):
                 reason = f"SL {pnl:.2f}%"
 
-            # Trailing Stop
+            # Trailing stop
             elif pos.max_pnl >= TP1_PCT * LEVERAGE * 0.5 and pnl < pos.max_pnl - TRAIL_PCT * LEVERAGE:
                 reason = f"Trail max={pos.max_pnl:.2f}%→{pnl:.2f}%"
 
-            # Timeout 30 minutos (reducido de 45)
+            # Timeout 30 minutos
             elif pos.age_min() > 30:
                 reason = f"Timeout {pos.age_min():.0f}min PnL={pnl:+.2f}%"
 
@@ -668,24 +703,18 @@ class Bot:
     async def cycle(self):
         self.cycles += 1
 
-        # Descarga velas
         await self.fetch_candles()
-
-        # Precios en TIEMPO REAL para gestión de posiciones (SL/TP)
         current_prices = await self.fetch_live_prices()
 
-        # Fallback a último cierre de vela si no hay precio live
         for sym in WATCHLIST:
             if sym not in current_prices:
                 closes, _ = self.history.get(sym)
                 if closes:
                     current_prices[sym] = closes[-1]
 
-        # Gestiona posiciones abiertas con precios reales
         await self.manage_positions(current_prices)
 
-        # Log periódico
-        if self.cycles % 12 == 0:  # cada ~2 minutos
+        if self.cycles % 12 == 0:
             total = self.wins + self.losses
             wr    = f"{self.wins/total*100:.1f}%" if total else "—"
             log.info(
@@ -697,7 +726,6 @@ class Bot:
                 f"{self.risk.summary()}"
             )
 
-        # No abrir si estamos al límite
         if len(self.positions) >= MAX_OPEN_POSITIONS:
             return
 
@@ -707,17 +735,11 @@ class Bot:
                 log.warning(f"⛔ {reason}")
             return
 
-        # Buscar señales — reconstruye open_syms DESPUÉS de cerrar posiciones
-        if len(self.positions) >= MAX_OPEN_POSITIONS:
-            return
-
-        open_syms = {p.symbol for p in self.positions}  # fresco tras manage_positions
+        open_syms = {p.symbol for p in self.positions}
 
         for symbol in WATCHLIST:
-            # Re-check límite en cada iteración
             if len(self.positions) >= MAX_OPEN_POSITIONS:
                 break
-            # Re-check símbolo ya abierto (incluyendo los abiertos en este mismo ciclo)
             if symbol in open_syms:
                 continue
             price = current_prices.get(symbol)
@@ -730,7 +752,6 @@ class Bot:
                 log.info(f"📡 {sig}")
                 ok = await self.open_position(sig)
                 if ok:
-                    # Actualiza open_syms inmediatamente para este ciclo
                     open_syms.add(symbol)
 
     async def maybe_report(self):
@@ -740,7 +761,7 @@ class Bot:
             wr    = f"{self.wins/total*100:.1f}%" if total else "—"
             mode  = "🔵 DRY" if DRY_RUN else "🔴 LIVE"
             rep   = (
-                f"📊 *Bot v5.2* {mode}\n"
+                f"📊 *Bot v5.2.1* {mode}\n"
                 f"Capital   : `${self.capital:.4f}` USDT\n"
                 f"PnL total : `${self.total_pnl:+.4f}` USDT\n"
                 f"Trades    : {total} (✅{self.wins}/❌{self.losses}) {wr}\n"
@@ -753,38 +774,39 @@ class Bot:
     async def run(self):
         log.info(
             f"\n{'═'*60}\n"
-            f"  BINGX FUTURES BOT v5.1 | "
+            f"  BINGX FUTURES BOT v5.2.1 | "
             f"{'DRY RUN 🔵' if DRY_RUN else 'LIVE 🔴'}\n"
             f"  Capital/trade : ${TRADE_AMOUNT_USDT} USDT\n"
             f"  Leverage      : {LEVERAGE}x\n"
             f"  Exposición    : ${TRADE_AMOUNT_USDT * LEVERAGE} USDT/trade\n"
-            f"  TP1           : +{TP1_PCT * LEVERAGE:.1f}% | TP2: +{TP2_PCT * LEVERAGE:.1f}%\n"
+            f"  TP1 (50%)     : +{TP1_PCT * LEVERAGE:.1f}% → SL a breakeven\n"
+            f"  TP2 (50%)     : +{TP2_PCT * LEVERAGE:.1f}%\n"
             f"  SL            : -{SL_PCT * LEVERAGE:.1f}%\n"
             f"  RSI umbrales  : {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
             f"  Señales min   : {MIN_SIGNALS}/5\n"
             f"  Watchlist     : {len(WATCHLIST)} pares\n"
             f"  Max pérd/día  : ${MAX_DAILY_LOSS_USDT}\n"
+            f"  Sync arranque : SIEMPRE ACTIVO (anti-hedge)\n"
             f"  Telegram      : {'✅' if self.tg.enabled else '❌'}\n"
             f"{'═'*60}"
         )
         await self.tg.send(
-            f"🤖 *Bot v5.2 iniciado* — BingX Futuros\n"
+            f"🤖 *Bot v5.2.1 iniciado* — BingX Futuros\n"
             f"Modo       : {'DRY RUN 🔵' if DRY_RUN else 'LIVE 🔴'}\n"
             f"Leverage   : `{LEVERAGE}x`\n"
             f"Trade      : `${TRADE_AMOUNT_USDT}` → expuesto `${TRADE_AMOUNT_USDT*LEVERAGE}`\n"
-            f"TP1/TP2/SL : `+{TP1_PCT*LEVERAGE:.1f}%` / `+{TP2_PCT*LEVERAGE:.1f}%` / `-{SL_PCT*LEVERAGE:.1f}%`\n"
+            f"TP1/TP2/SL : `+{TP1_PCT*LEVERAGE:.1f}%` (50%) / `+{TP2_PCT*LEVERAGE:.1f}%` / `-{SL_PCT*LEVERAGE:.1f}%`\n"
             f"Pares      : `{len(WATCHLIST)}`\n"
-            f"Calentando {50} velas..."
+            f"🔄 Sincronizando posiciones abiertas..."
         )
 
         try:
             await self.ex.load_markets()
             log.info("✅ Mercados cargados")
 
-            # Sincroniza posiciones reales existentes en BingX
+            # ── FIX: sincronización siempre activa al arranque ──
             await self.sync_positions_with_exchange()
 
-            # Calentamiento: descarga historial antes de operar
             log.info("⏳ Calentando indicadores (50 velas)...")
             for _ in range(3):
                 await self.fetch_candles()
