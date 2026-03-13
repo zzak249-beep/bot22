@@ -17,6 +17,15 @@ _DATA_PATH = (
     else "bot_memoria.json"
 )
 
+# Crear directorio si no existe (Railway Volume puede tardar en montarse)
+if config.MEMORY_DIR:
+    try:
+        os.makedirs(config.MEMORY_DIR, exist_ok=True)
+    except Exception as _e:
+        import logging as _log
+        _log.getLogger("memoria").warning(f"[MEM] No se pudo crear directorio {config.MEMORY_DIR}: {_e} — usando directorio actual")
+        _DATA_PATH = "bot_memoria.json"
+
 _DEFAULT: dict = {
     "trades":       [],
     "compounding":  {
