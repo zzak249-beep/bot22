@@ -168,7 +168,7 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
         f"✅ TP2     : `{s['tp']:.6f}`\n"
         f"🛑 SL      : `{s['sl']:.6f}`\n"
         f"📊 R:R     : `{s['rr']:.2f}x`\n"
-        f"🏅 Score   : `{s['score']}/14`\n"
+        f"🏅 Score   : `{s['score']}/16`\n"
         f"📉 RSI     : `{s['rsi']:.1f}`\n"
         f"🧩 Señales : `{motiv}`\n"
         f"{extras}"
@@ -556,7 +556,7 @@ def ejecutar_senal(s: dict) -> str:
         f"✅ {lado} {par} fill:{entrada_real:.6f} "
         f"{'⚠️ SLIP:'+str(round(slip,1))+'%' if slip > 0.5 else ''} "
         f"${trade_usdt:.2f}×{config.LEVERAGE}x "
-        f"SL:{sl_r:.6f} TP:{tp_r:.6f} score:{s['score']}/14 "
+        f"SL:{sl_r:.6f} TP:{tp_r:.6f} score:{s['score']}/16 "
         f"{'🏆OB+FVG' if s.get('ob_fvg_bull') or s.get('ob_fvg_bear') else ''}"
     )
     return "ok"
@@ -579,7 +579,7 @@ def enviar_reporte(balance: float):
         fase = "🔶→TP2" if pos.get("tp1_hit") else "▶️→TP1"
         ico  = "🟢" if pos["lado"] == "LONG" else "🔴"
         ob_tag = " 🏆" if pos.get("ob_fvg") else ""
-        pos_txt += f"  {ico} `{par}` est:${pnl_est:+.2f} {fase} [{pos.get('score','?')}/14]{ob_tag}\n"
+        pos_txt += f"  {ico} `{par}` est:${pnl_est:+.2f} {fase} [{pos.get('score','?')}/16]{ob_tag}\n"
     if not pos_txt:
         pos_txt = "  _(sin posiciones)_\n"
 
@@ -762,7 +762,7 @@ def main():
                         ob_tag = "🏆OB+FVG" if (s.get("ob_fvg_bull") or s.get("ob_fvg_bear")) else ""
                         log.info(
                             f"  {s['lado']:5s} {s['par']:15s} "
-                            f"score={s['score']}/14 RSI={s['rsi']:.1f} "
+                            f"score={s['score']}/16 RSI={s['rsi']:.1f} "
                             f"R:R={s['rr']:.2f} KZ={s['kz']} HTF={s.get('htf','?')} "
                             f"patron={s.get('patron','-')} {ob_tag}"
                         )
