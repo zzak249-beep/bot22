@@ -324,20 +324,31 @@ def actualizar_trailing(par, pos, precio):
     lado = pos["lado"]
     if atr <= 0:
         return
+
+    # Activar trailing solo cuando hay profit real (≥ TRAILING_ACTIVAR × ATR)
+    activar_dist = atr * max(config.TRAILING_ACTIVAR, 1.5)
+    # Distancia del trailing: 1.0 ATR mínimo para evitar ruido
+    trail_dist = atr * max(config.TRAILING_DISTANCIA, 1.0)
+
     if lado == "LONG":
-        if precio - pos["entrada"] < atr * config.TRAILING_ACTIVAR:
+        profit = precio - pos["entrada"]
+        if profit < activar_dist:
             return
-        nuevo = precio - atr * config.TRAILING_DISTANCIA
-        if nuevo > pos.get("sl_trailing", pos["sl"]):
+        nuevo = precio - trail_dist
+        # Nunca bajar el trailing (solo subir)
+        actual = pos.get("sl_trailing", pos["sl"])
+        if nuevo > actual:
             pos["sl_trailing"] = nuevo
-            log.debug(f"[TRAIL] {par} SL → {nuevo:.6f}")
+            log.debug(f"[TRAIL] {par} LONG SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
     else:
-        if pos["entrada"] - precio < atr * config.TRAILING_ACTIVAR:
+        profit = pos["entrada"] - precio
+        if profit < activar_dist:
             return
-        nuevo = precio + atr * config.TRAILING_DISTANCIA
-        if nuevo < pos.get("sl_trailing", pos["sl"]):
+        nuevo = precio + trail_dist
+        actual = pos.get("sl_trailing", pos["sl"])
+        if nuevo < actual:
             pos["sl_trailing"] = nuevo
-            log.debug(f"[TRAIL] {par} SL → {nuevo:.6f}")
+            log.debug(f"[TRAIL] {par} SHORT SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
 
 
 # ═══════════════════════════════════════════════════════
@@ -521,13 +532,30 @@ def ejecutar_senal(s: dict) -> str:
         return f"bloq:balance insuficiente (${balance:.2f})"
 
     trade_usdt = memoria.get_trade_amount()
-    qty        = exchange.calcular_cantidad(par, trade_usdt, s["precio"])
+
+    # Compounding real: si el balance supera el trade base, usar % del balance
+    # (máx 15% del balance por trade para gestión de riesgo)
+    if balance > config.TRADE_USDT_BASE * 2 and not config.MODO_DEMO:
+        trade_por_balance = balance * 0.12  # 12% del balance disponible
+        trade_usdt = min(max(trade_usdt, trade_por_balance), config.TRADE_USDT_MAX)
+        trade_usdt = round(trade_usdt, 2)
+
+    qty = exchange.calcular_cantidad(par, trade_usdt, s["precio"])
     if qty <= 0:
         return f"bloq:qty=0 precio={s['precio']:.8g}"
 
     if balance < trade_usdt and not config.MODO_DEMO:
-        log.warning(f"[{par}] Balance ${balance:.2f} < trade ${trade_usdt:.2f}")
-        return f"bloq:margen (${balance:.2f} < ${trade_usdt:.2f})"
+        # Reducir trade si balance insuficiente para el tamaño objetivo
+        trade_usdt_reducido = balance * 0.80
+        if trade_usdt_reducido >= config.TRADE_USDT_BASE:
+            trade_usdt = round(trade_usdt_reducido, 2)
+            qty = exchange.calcular_cantidad(par, trade_usdt, s["precio"])
+            if qty <= 0:
+                return f"bloq:margen (${balance:.2f} < ${trade_usdt:.2f})"
+            log.info(f"[{par}] Trade reducido a ${trade_usdt:.2f} (balance ${balance:.2f})")
+        else:
+            log.warning(f"[{par}] Balance ${balance:.2f} < trade ${trade_usdt:.2f}")
+            return f"bloq:margen (${balance:.2f} < ${trade_usdt:.2f})"
 
     if lado == "LONG":
         res = exchange.abrir_long(par, qty, s["precio"], s["sl"], s["tp"])
@@ -660,6 +688,12 @@ def main():
 
     # FIX v4.4: sync PRIMERO — get_balance usa timestamp firmado,
     # si el reloj local difiere del servidor BingX → data=null → balance=$0
+    # Crear directorio de memoria si no existe
+    if config.MEMORY_DIR:
+        import pathlib
+        pathlib.Path(config.MEMORY_DIR).mkdir(parents=True, exist_ok=True)
+        log.info(f"[MEM] Directorio memoria: {config.MEMORY_DIR}")
+
     log.info("Sincronizando tiempo con servidor BingX...")
     exchange.sync_server_time()
     exchange.diagnostico_balance()  # ← muestra RAW de todos los endpoints de balance
