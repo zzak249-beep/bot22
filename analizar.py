@@ -754,10 +754,17 @@ def analizar_par(par: str):
         # HTF multi-timeframe
         htf            = tendencia_htf(par)    # 1H
         htf_4h         = tendencia_4h(par)     # 4H (nueva)
-        # FIX: HTF 1H es filtro DURO — no entrar contra tendencia mayor
-        # Si ambos HTF (1H y 4H) contradicen la dirección → bloquear
-        htf_contra_long  = (htf == "BEAR" and htf_4h == "BEAR")
-        htf_contra_short = (htf == "BULL" and htf_4h == "BULL")
+        # FIX v5.5: HTF 1H es filtro DURO individual
+        # Si HTF 1H es BULL → no SHORT (regla estricta: no ir contra el 1H)
+        # Si HTF 1H es BEAR → no LONG (regla estricta)
+        # Excepción: si score muy alto (≥12) y 4H alineado, permitir contra-tendencia 1H
+        htf_contra_long  = (htf == "BEAR")  # 1H bajista → no LONG
+        htf_contra_short = (htf == "BULL")  # 1H alcista → no SHORT
+        # Excepción: score muy alto + 4H a favor = puede entrar contra 1H
+        if htf_4h == "BULL" and htf_contra_long:
+            htf_contra_long = False  # 4H alcista salva el LONG aunque 1H sea BEAR
+        if htf_4h == "BEAR" and htf_contra_short:
+            htf_contra_short = False  # 4H bajista salva el SHORT aunque 1H sea BULL
         trend_ok_long  = not htf_contra_long
         trend_ok_short = not htf_contra_short
 
@@ -1024,8 +1031,11 @@ def analizar_par(par: str):
         mom_long  = momentum_ok(candles, "LONG")
         mom_short = momentum_ok(candles, "SHORT")
 
-        rsi_ok_long  = rsi < config.RSI_BUY_MAX  or sl_long  >= 8
-        rsi_ok_short = rsi > config.RSI_SELL_MIN or sl_short >= 8
+        # RSI extremo contra la dirección = bloqueante duro (el score no lo salva)
+        # SHORT con RSI < 35 = oversold, riesgo de rebote brutal
+        # LONG con RSI > 75 = overbought, riesgo de caída brusca
+        rsi_ok_long  = rsi < 75.0  and (rsi < config.RSI_BUY_MAX  or sl_long  >= 10)
+        rsi_ok_short = rsi > 25.0  and (rsi > config.RSI_SELL_MIN or sl_short >= 10)
 
         # ── Elegir dirección ──
         lado = score = None
