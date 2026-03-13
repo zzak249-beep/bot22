@@ -17,15 +17,6 @@ _DATA_PATH = (
     else "bot_memoria.json"
 )
 
-# Crear directorio si no existe (Railway Volume puede tardar en montarse)
-if config.MEMORY_DIR:
-    try:
-        os.makedirs(config.MEMORY_DIR, exist_ok=True)
-    except Exception as _e:
-        import logging as _log
-        _log.getLogger("memoria").warning(f"[MEM] No se pudo crear directorio {config.MEMORY_DIR}: {_e} — usando directorio actual")
-        _DATA_PATH = "bot_memoria.json"
-
 _DEFAULT: dict = {
     "trades":       [],
     "compounding":  {
@@ -80,18 +71,36 @@ _load()
 # ═══════════════════════════════════════════════════════
 
 def get_trade_amount() -> float:
-    """Calcula el tamaño del próximo trade según compounding."""
-    base     = float(config.TRADE_USDT_BASE)
-    max_amt  = float(config.TRADE_USDT_MAX)
-    step     = float(config.COMPOUND_STEP_USDT)
-    add      = float(config.COMPOUND_ADD_USDT)
+    """
+    Calcula el tamaño del próximo trade con compounding real:
+    - Sube: cada COMPOUND_STEP_USDT ganados → +COMPOUND_ADD_USDT
+    - Baja: racha perdedora reduce el tamaño (máx -30% del base)
+    - Nunca supera TRADE_USDT_MAX ni baja de TRADE_USDT_BASE * 0.5
+    """
+    base      = float(config.TRADE_USDT_BASE)
+    max_amt   = float(config.TRADE_USDT_MAX)
+    step      = float(config.COMPOUND_STEP_USDT)
+    add       = float(config.COMPOUND_ADD_USDT)
     ganancias = float(_data["compounding"].get("ganancias", 0.0))
-    if step > 0:
-        niveles = int(ganancias // step)
+    perdidas  = float(_data["compounding"].get("total_perdido", 0.0))
+
+    # Subir según ganancias acumuladas
+    if step > 0 and ganancias > 0:
+        niveles  = int(ganancias // step)
         cantidad = base + niveles * add
     else:
         cantidad = base
-    return min(cantidad, max_amt)
+
+    # Bajar si hay racha perdedora reciente (últimos 5 trades)
+    trades_recientes = _data.get("trades", [])[-5:]
+    if len(trades_recientes) >= 3:
+        perdidas_recientes = sum(1 for t in trades_recientes if not t.get("ganado"))
+        if perdidas_recientes >= 4:          # 4+ perdidos de los últimos 5
+            cantidad = max(cantidad * 0.7, base * 0.5)
+        elif perdidas_recientes >= 3:        # 3 perdidos de los últimos 5
+            cantidad = max(cantidad * 0.85, base * 0.5)
+
+    return min(max(cantidad, base * 0.5), max_amt)
 
 
 def registrar_ganancia_compounding(pnl: float):
