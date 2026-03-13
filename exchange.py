@@ -457,3 +457,28 @@ def cerrar_posicion(par: str, qty: float, lado: str) -> Optional[dict]:
     except Exception as e:
         log.error(f"cerrar_posicion {par}: {e}")
         return {"precio_salida": precio_actual}
+
+
+# ═══════════════════════════════════════════════════════
+# DIAGNÓSTICO DE BALANCE AL ARRANQUE
+# ═══════════════════════════════════════════════════════
+
+def diagnostico_balance():
+    """Llama a todos los endpoints y loguea la respuesta RAW completa.
+    Llamar una vez al arrancar para identificar qué endpoint funciona."""
+    import json as _json
+    log.info("=" * 60)
+    log.info("[DIAG-BAL] Iniciando diagnóstico de balance BingX...")
+    endpoints = [
+        "/openApi/swap/v2/user/balance",
+        "/openApi/swap/v3/user/balance",
+        "/openApi/account/v1/balance",
+        "/openApi/swap/v2/user/margin",
+    ]
+    for ep in endpoints:
+        try:
+            data = _get(ep)
+            log.info(f"[DIAG-BAL] {ep} → {_json.dumps(data)[:500]}")
+        except Exception as e:
+            log.info(f"[DIAG-BAL] {ep} → ERROR: {e}")
+    log.info("=" * 60)
