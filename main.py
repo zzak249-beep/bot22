@@ -165,11 +165,15 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
         vwap_pos = "sobre" if s.get("sobre_vwap") else "bajo"
         extras += f"📊 VWAP: `{s['vwap']:.6f}` ({vwap_pos})\n"
 
+    # TP1 % según score
+    sc = s.get("score", 0)
+    tp1_pct = "25%" if sc >= 14 else ("30%" if sc >= 10 else "50%")
+
     _notif(
         f"{lado} — `{s['par']}` [{s.get('kz', '')}]\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 Entrada : `{s['precio']:.6f}`\n"
-        f"🔶 TP1     : `{s['tp1']:.6f}` (50%)\n"
+        f"🔶 TP1     : `{s['tp1']:.6f}` ({tp1_pct})\n"
         f"✅ TP2     : `{s['tp']:.6f}`\n"
         f"🛑 SL      : `{s['sl']:.6f}`\n"
         f"📊 R:R     : `{s['rr']:.2f}x`\n"
@@ -340,10 +344,6 @@ def actualizar_trailing(par, pos, precio):
         if nuevo > actual:
             pos["sl_trailing"] = nuevo
             log.debug(f"[TRAIL] {par} LONG SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
-            # ══ FIX CRÍTICO v5.1: Enviar nuevo SL a BingX ══════════
-            # Sin esto el trailing solo existe en memoria Python —
-            # BingX ejecutaría el SL original aunque el precio subiera 3 ATR
-            exchange.actualizar_sl_bingx(par, nuevo, lado)
     else:
         profit = pos["entrada"] - precio
         if profit < activar_dist:
@@ -353,8 +353,6 @@ def actualizar_trailing(par, pos, precio):
         if nuevo < actual:
             pos["sl_trailing"] = nuevo
             log.debug(f"[TRAIL] {par} SHORT SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
-            # ══ FIX CRÍTICO v5.1: Enviar nuevo SL a BingX ══════════
-            exchange.actualizar_sl_bingx(par, nuevo, lado)
 
 
 # ═══════════════════════════════════════════════════════
@@ -372,7 +370,26 @@ def gestionar_partial_tp(par, pos, precio):
     if not alcanzado:
         return
 
-    qty_tp1 = round(pos["qty"] * 0.5, 6)
+    # ── NUEVO v5.3: % de cierre en TP1 según score ─────────────────────
+    # Objetivo: dejar más cantidad correr al TP2 en setups de alta calidad.
+    # Score alto = más confianza en que el precio sigue → cerrar menos.
+    #
+    # Score 14-16: cerrar 25% en TP1, dejar 75% correr al TP2
+    # Score 10-13: cerrar 30% en TP1, dejar 70% correr
+    # Score  6-9 : cerrar 50% en TP1 (comportamiento anterior, conservador)
+    score_pos = pos.get("score", 0)
+    if score_pos >= 14:
+        pct_tp1 = 0.25   # 25% cierre en TP1
+        label   = "25%"
+    elif score_pos >= 10:
+        pct_tp1 = 0.30   # 30% cierre en TP1
+        label   = "30%"
+    else:
+        pct_tp1 = 0.50   # 50% (conservador, igual que antes)
+        label   = "50%"
+    # ────────────────────────────────────────────────────────────────────
+
+    qty_tp1 = round(pos["qty"] * pct_tp1, 6)
     if not config.MODO_DEMO:
         res         = exchange.cerrar_posicion(par, qty_tp1, lado)
         salida_real = (res or {}).get("precio_salida", precio) or precio
@@ -389,10 +406,11 @@ def gestionar_partial_tp(par, pos, precio):
     pos["qty"]     = round(pos["qty"] - qty_tp1, 6)
     pos["tp1_hit"] = True
 
-    log.info(f"[TP1] {par} 50% @ {salida_real:.6f} PnL_p={pnl_p:+.4f} SL→BE={be:.6f}")
+    log.info(f"[TP1] {par} {label} @ {salida_real:.6f} PnL_p={pnl_p:+.4f} SL→BE={be:.6f} (score={score_pos})")
     _notif(
         f"🔶 *TP1* — `{par}` {lado}\n"
-        f"50% @ `{salida_real:.6f}` | PnL: `${pnl_p:+.4f}`\n"
+        f"`{label}` cerrado @ `{salida_real:.6f}` | PnL: `${pnl_p:+.4f}`\n"
+        f"{'🏃 ' + str(round((1-pct_tp1)*100)) + '% sigue al TP2' if pct_tp1 < 0.5 else ''}\n"
         f"🔄 SL → `{be:.6f}` (breakeven)\n"
         f"📊 Pool: `${memoria._data['compounding']['ganancias']:.2f}` | "
         f"Próx: `${memoria.get_trade_amount():.2f} USDT`"
@@ -551,6 +569,44 @@ def ejecutar_senal(s: dict) -> str:
         trade_usdt = min(max(trade_usdt, trade_por_balance), config.TRADE_USDT_MAX)
         trade_usdt = round(trade_usdt, 2)
 
+    # ── NUEVO v5.3: Sizing dinámico por score ─────────────────────────────
+    # Con $100-200, apostar diferente en setup 14/16 vs 6/16 es la forma
+    # más directa de ganar más por trade sin aumentar el número de trades.
+    #
+    # Escala máxima: nunca más de TRADE_USDT_MAX ni más del 15% del balance
+    # para no concentrar demasiado riesgo en un solo trade.
+    score_trade  = s.get("score", 0)
+    ob_fvg_bonus = s.get("ob_fvg_bull") or s.get("ob_fvg_bear")  # Confluencia OB+FVG
+    kz_activa    = s.get("kz", "") not in ("", "FUERA")
+
+    if score_trade >= 14:
+        # Setup excepcional (14-16/16): 2.0x base — máxima apuesta
+        mult_score = 2.0
+    elif score_trade >= 12:
+        # Setup muy fuerte (12-13/16): 1.5x base
+        mult_score = 1.5
+    elif score_trade >= 10:
+        # Setup sólido (10-11/16): 1.25x base
+        mult_score = 1.25
+    else:
+        # Setup estándar (6-9/16): sin multiplicador
+        mult_score = 1.0
+
+    # Bonus adicional si hay OB+FVG confluencia Y killzone activa (setup institucional)
+    if ob_fvg_bonus and kz_activa and score_trade >= 10:
+        mult_score = min(mult_score + 0.25, 2.5)  # Extra +25%, máx 2.5x
+
+    if mult_score > 1.0:
+        trade_usdt_scaled = round(min(
+            trade_usdt * mult_score,
+            config.TRADE_USDT_MAX,
+            balance * 0.15,          # Nunca más del 15% del balance en un trade
+        ), 2)
+        if trade_usdt_scaled > trade_usdt:
+            log.info(f"[SIZING] {par} score={score_trade}/16 → ${trade_usdt:.2f}×{mult_score}= ${trade_usdt_scaled:.2f}")
+            trade_usdt = trade_usdt_scaled
+    # ──────────────────────────────────────────────────────────────────────
+
     qty = exchange.calcular_cantidad(par, trade_usdt, s["precio"])
     if qty <= 0:
         return f"bloq:qty=0 precio={s['precio']:.8g}"
@@ -585,28 +641,15 @@ def ejecutar_senal(s: dict) -> str:
 
     atr    = s.get("atr", 0)
     precio = s["precio"]
-
-    # FIX v5.1: Preservar SL/TP estructurales calculados en analizar_par
-    # Antes se sobreescribían con ATR simple, perdiendo la lógica de OB/Asia/swing
-    precio_senal = precio
-    slip_ratio   = entrada_real / precio_senal if precio_senal > 0 else 1.0
-
-    if abs(slip_ratio - 1.0) < 0.005:
-        # Slippage mínimo (<0.5%) → usar SL/TP estructurales directamente
-        sl_r  = s["sl"]
-        tp_r  = s["tp"]
-        tp1_r = s["tp1"]
-    else:
-        # Ajustar SL/TP proporcionalmente al slippage real
-        sl_r  = s["sl"]  * slip_ratio
-        tp_r  = s["tp"]  * slip_ratio
-        tp1_r = s["tp1"] * slip_ratio
-
-    # Fallback: si la señal no tiene SL/TP válidos, usar ATR
-    if atr > 0 and (sl_r <= 0 or tp_r <= 0):
+    if atr > 0:
         sl_r  = (entrada_real - atr * config.SL_ATR_MULT)  if lado == "LONG" else (entrada_real + atr * config.SL_ATR_MULT)
         tp_r  = (entrada_real + atr * config.TP_ATR_MULT)  if lado == "LONG" else (entrada_real - atr * config.TP_ATR_MULT)
-        tp1_r = (entrada_real + atr * 1.5)                 if lado == "LONG" else (entrada_real - atr * 1.5)
+        tp1_r = (entrada_real + atr * config.PARTIAL_TP1_MULT) if lado == "LONG" else (entrada_real - atr * config.PARTIAL_TP1_MULT)
+    else:
+        ratio = entrada_real / precio if precio > 0 else 1.0
+        sl_r  = s["sl"]  * ratio
+        tp_r  = s["tp"]  * ratio
+        tp1_r = s["tp1"] * ratio
 
     qty_real = float(res.get("executedQty", qty) or qty)
     memoria.registrar_inversion(trade_usdt)
