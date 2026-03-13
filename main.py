@@ -635,6 +635,7 @@ def main():
     # si el reloj local difiere del servidor BingX → data=null → balance=$0
     log.info("Sincronizando tiempo con servidor BingX...")
     exchange.sync_server_time()
+    exchange.diagnostico_balance()  # ← muestra RAW de todos los endpoints de balance
 
     # Con el reloj ya sincronizado, leer balance real
     balance = exchange.get_balance()
