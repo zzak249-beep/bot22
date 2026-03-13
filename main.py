@@ -549,19 +549,16 @@ def ejecutar_senal(s: dict) -> str:
     # pasaba porque margen_min=$2 < margen_libre=$4.77. BingX luego rechazaba.
     # Solución: bloquear si margen usado > 80% del balance ANTES de intentar.
     if balance_total > 0 and not config.MODO_DEMO:
-        if margen_libre < 0:
-            margen_libre = 0.0
         margen_usado_pct = (balance_total - margen_libre) / balance_total * 100
-        log.info(f"[MARGEN] Total=${balance_total:.2f} Libre=${margen_libre:.2f} Usado={margen_usado_pct:.0f}%")
         if margen_usado_pct > 75:
-            log.warning(f"[EXPOSICIÓN] {margen_usado_pct:.0f}% del balance en margen — bloqueando nuevas posiciones")
+            log.warning(f"[EXPOSICIÓN] {margen_usado_pct:.0f}% del balance en margen — bloqueando")
             return f"bloq:exposición alta ({margen_usado_pct:.0f}% margen usado)"
 
-    # Margen necesario = (trade_notional / leverage) + 20% buffer de seguridad
-    trade_estimado = max(config.TRADE_USDT_BASE, memoria.get_trade_amount())
-    margen_min = max((trade_estimado / config.LEVERAGE) * 1.5, 3.0)
+    # Check margen libre suficiente para el trade real (no el mínimo teórico)
+    # trade estimado ≈ TRADE_USDT_BASE, margen necesario = trade/leverage + buffer 30%
+    margen_min = max(config.TRADE_USDT_BASE / config.LEVERAGE * 1.3, 2.0)
     if margen_libre < margen_min and not config.MODO_DEMO:
-        log.warning(f"[MARGEN] Libre: ${margen_libre:.2f} < necesario: ${margen_min:.2f} (trade≈${trade_estimado:.0f}/lev{config.LEVERAGE})")
+        log.warning(f"[MARGEN] Libre: ${margen_libre:.2f} < necesario: ${margen_min:.2f}")
         return f"bloq:margen libre insuficiente (${margen_libre:.2f})"
     # ────────────────────────────────────────────────────────────────────────
 
