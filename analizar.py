@@ -691,8 +691,28 @@ def registrar_senal_ts(par: str):
 # SEÑAL PRINCIPAL v5.0 — Score máximo 16 puntos
 # ══════════════════════════════════════════════════════════════
 
+_NO_CRIPTO_PREFIJOS = ("NCC", "NCFX", "FOREX", "STOCK", "NCX", "INDEX")
+_NO_CRIPTO_SUFIJOS  = ("2USD", "2USDT", "2GBP", "2EUR", "2BTC")
+
+def _par_es_cripto(par: str) -> bool:
+    base = par.replace("-USDT", "").upper()
+    for p in _NO_CRIPTO_PREFIJOS:
+        if base.startswith(p):
+            return False
+    for s in _NO_CRIPTO_SUFIJOS:
+        if base.endswith(s):
+            return False
+    if "2USD" in base or "FOREX" in base:
+        return False
+    return True
+
+
 def analizar_par(par: str):
     try:
+        # Filtro: solo criptomonedas reales
+        if not _par_es_cripto(par):
+            return None
+
         candles = exchange.get_candles(par, config.TIMEFRAME, config.CANDLES_LIMIT)
         if len(candles) < 60 or not volumen_ok(candles):
             return None
@@ -734,8 +754,12 @@ def analizar_par(par: str):
         # HTF multi-timeframe
         htf            = tendencia_htf(par)    # 1H
         htf_4h         = tendencia_4h(par)     # 4H (nueva)
-        trend_ok_long  = htf != "BEAR"
-        trend_ok_short = htf != "BULL"
+        # FIX: HTF 1H es filtro DURO — no entrar contra tendencia mayor
+        # Si ambos HTF (1H y 4H) contradicen la dirección → bloquear
+        htf_contra_long  = (htf == "BEAR" and htf_4h == "BEAR")
+        htf_contra_short = (htf == "BULL" and htf_4h == "BULL")
+        trend_ok_long  = not htf_contra_long
+        trend_ok_short = not htf_contra_short
 
         # SMC core
         fvg   = detectar_fvg(candles)
@@ -809,6 +833,8 @@ def analizar_par(par: str):
 
         if sweep["sweep_bull"]:
             sl_long += 2; ml_long.append("SWEEP")
+            if kz["in_kz"]:
+                sl_long += 1; ml_long.append("SWEEP_KZ")  # Sweep en killzone = setup institucional
 
         if bos["bos_bull"]:
             sl_long += 1
@@ -843,8 +869,12 @@ def analizar_par(par: str):
         if bull_trend_5m:
             sl_long += 1; ml_long.append("EMA21")
 
-        if rsi <= config.RSI_BUY_MAX:
+        if rsi <= 40:
+            sl_long += 2; ml_long.append(f"RSI{rsi:.0f}")   # RSI oversold = mejor entrada
+        elif rsi <= config.RSI_BUY_MAX:
             sl_long += 1; ml_long.append(f"RSI{rsi:.0f}")
+        elif rsi > 65:
+            sl_long -= 1  # RSI alto = penalizar LONG (posible techo)
 
         if macd_bull and config.MACD_ACTIVO:
             sl_long += 1; ml_long.append("MACD")
@@ -882,6 +912,8 @@ def analizar_par(par: str):
 
         if sweep["sweep_bear"]:
             sl_short += 2; ml_short.append("SWEEP")
+            if kz["in_kz"]:
+                sl_short += 1; ml_short.append("SWEEP_KZ")
 
         if bos["bos_bear"]:
             sl_short += 1
@@ -915,8 +947,12 @@ def analizar_par(par: str):
         if bear_trend_5m:
             sl_short += 1; ml_short.append("EMA21")
 
-        if rsi >= config.RSI_SELL_MIN:
+        if rsi >= 65:
+            sl_short += 2; ml_short.append(f"RSI{rsi:.0f}")  # RSI overbought = mejor short
+        elif rsi >= config.RSI_SELL_MIN:
             sl_short += 1; ml_short.append(f"RSI{rsi:.0f}")
+        elif rsi < 35:
+            sl_short -= 1  # RSI bajo = penalizar SHORT (posible suelo)
 
         if macd_bear and config.MACD_ACTIVO:
             sl_short += 1; ml_short.append("MACD")
@@ -1020,27 +1056,34 @@ def analizar_par(par: str):
 
         # ── SL/TP dinámico basado en estructura ──
         atr_sl = atr7 if atr7 > 0 else atr
+        # SL mínimo garantizado: 1.2x ATR para evitar hits por ruido
+        sl_min_dist = atr_sl * max(config.SL_ATR_MULT, 1.2)
+
         if lado == "LONG":
-            # SL: por debajo del OB o del mínimo reciente (lo que sea más bajo pero < precio)
-            sl_ob   = ob["bull_ob_bottom"] * 0.998 if (ob["bull_ob"] and not ob["bull_ob_mitigado"]) else 0
-            sl_asia = asia["low"] * 0.998 if (asia["valido"] and asia["low"] < precio) else 0
-            sl_atr  = precio - atr_sl * config.SL_ATR_MULT
-            # Usar la estructura más cercana al precio que aún sea válida
-            sl_candidates = [x for x in [sl_ob, sl_asia, sl_atr] if 0 < x < precio]
-            sl   = max(sl_candidates) if sl_candidates else sl_atr
-            tp   = precio + atr_sl * config.TP_ATR_MULT
-            tp1  = precio + atr_sl * config.PARTIAL_TP1_MULT
-            # TP2 adicional (nuevo en v5.0)
-            tp2  = precio + atr_sl * (config.TP_ATR_MULT * 1.6)
+            # SL: usar estructura si está cerca, sino ATR con margen
+            sl_ob   = ob["bull_ob_bottom"] * 0.997 if (ob["bull_ob"] and not ob["bull_ob_mitigado"]) else 0
+            sl_asia = asia["low"] * 0.997 if (asia["valido"] and asia["low"] < precio) else 0
+            sl_low  = min(c["low"] for c in candles[-5:]) * 0.997  # Mínimo reciente de 5 velas
+            sl_atr  = precio - sl_min_dist
+            # Preferir estructura sobre ATR, pero respetar distancia mínima
+            sl_struct = max([x for x in [sl_ob, sl_asia, sl_low] if 0 < x < precio - atr_sl * 0.5], default=0)
+            sl = sl_struct if sl_struct > sl_atr else sl_atr
+            # TP: basado en R:R mínimo 2.5 sobre el SL real
+            dist_sl = precio - sl
+            tp   = precio + dist_sl * max(config.TP_ATR_MULT, 2.5)
+            tp1  = precio + dist_sl * 1.2
+            tp2  = precio + dist_sl * 4.0
         else:
-            sl_ob   = ob["bear_ob_top"] * 1.002 if (ob["bear_ob"] and not ob["bear_ob_mitigado"]) else 0
-            sl_asia = asia["high"] * 1.002 if (asia["valido"] and asia["high"] > precio) else 0
-            sl_atr  = precio + atr_sl * config.SL_ATR_MULT
-            sl_candidates = [x for x in [sl_ob, sl_asia, sl_atr] if x > precio]
-            sl   = min(sl_candidates) if sl_candidates else sl_atr
-            tp   = precio - atr_sl * config.TP_ATR_MULT
-            tp1  = precio - atr_sl * config.PARTIAL_TP1_MULT
-            tp2  = precio - atr_sl * (config.TP_ATR_MULT * 1.6)
+            sl_ob   = ob["bear_ob_top"] * 1.003 if (ob["bear_ob"] and not ob["bear_ob_mitigado"]) else 0
+            sl_asia = asia["high"] * 1.003 if (asia["valido"] and asia["high"] > precio) else 0
+            sl_high = max(c["high"] for c in candles[-5:]) * 1.003  # Máximo reciente de 5 velas
+            sl_atr  = precio + sl_min_dist
+            sl_struct = min([x for x in [sl_ob, sl_asia, sl_high] if x > precio + atr_sl * 0.5], default=float("inf"))
+            sl = sl_struct if sl_struct < sl_atr else sl_atr
+            dist_sl = sl - precio
+            tp   = precio - dist_sl * max(config.TP_ATR_MULT, 2.5)
+            tp1  = precio - dist_sl * 1.2
+            tp2  = precio - dist_sl * 4.0
 
         rr = abs(tp - precio) / abs(precio - sl) if abs(precio - sl) > 0 else 0
         if rr < config.MIN_RR:
