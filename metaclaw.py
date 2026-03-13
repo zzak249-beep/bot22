@@ -97,11 +97,28 @@ def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Op
             json={
                 "model":      "claude-haiku-4-5-20251001",
                 "max_tokens": max_tokens,
-                "system":     system_prompt,
-                "messages":   [{"role": "user", "content": user_msg}],
+                "messages":   [{"role": "user", "content": f"{system_prompt}\n\n{user_msg}"}],
             },
-            timeout=12,
+            timeout=15,
         )
+        if resp.status_code == 400:
+            # Fallback: intentar sin system prompt separado (algunos modelos lo requieren en messages)
+            log.warning(f"[MCL] 400 con model haiku — reintentando con sonnet")
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                json={
+                    "model":      "claude-sonnet-4-6",
+                    "max_tokens": max_tokens,
+                    "system":     system_prompt,
+                    "messages":   [{"role": "user", "content": user_msg}],
+                },
+                timeout=15,
+            )
         resp.raise_for_status()
         data = resp.json()
         return data["content"][0]["text"].strip()
