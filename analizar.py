@@ -812,6 +812,8 @@ def analizar_par(par: str):
         ob_fvg_bull = ob_fvg_confluencia_bull(ob, fvg, precio)
         ob_fvg_bear = ob_fvg_confluencia_bear(ob, fvg, precio)
 
+        score_min = config.SCORE_MIN  # FIX v5.4: definir antes de base_long/base_short
+
         # ──────────────────────────────────────────────────────
         # SCORING LONG v5.0 (máx 16)
         # ──────────────────────────────────────────────────────
@@ -982,14 +984,18 @@ def analizar_par(par: str):
         fvg_bull_valido = fvg["bull_fvg"] and not fvg.get("fvg_rellenado", True)
         fvg_bear_valido = fvg["bear_fvg"] and not fvg.get("fvg_rellenado", True)
 
-        # FIX v5.1: base también válida si hay OB válido en zona, o BOS con zona
+        # FIX v5.4: base también válida con score alto en zona.
+        # Un score ≥ SCORE_MIN+2 en zona premium/discount indica confluencia fuerte
+        # aunque no haya FVG explícito — HTF+EMA+MACD+KZ+pivot ya son suficiente señal.
+        score_min = config.SCORE_MIN
         base_long  = (
-            (fvg_bull_valido and zona_long)          # FVG no rellenado + zona
-            or ob_fvg_bull                            # OB+FVG confluencia
-            or sweep["sweep_bull"]                    # Liquidity sweep
-            or idm_l                                  # Inducement
-            or (ob_valido_bull(ob, precio) and zona_long)   # OB válido en zona
-            or (bos["bos_bull"] and zona_long)        # BOS + zona
+            (fvg_bull_valido and zona_long)                     # FVG no rellenado + zona
+            or ob_fvg_bull                                       # OB+FVG confluencia
+            or sweep["sweep_bull"]                               # Liquidity sweep
+            or idm_l                                             # Inducement
+            or (ob_valido_bull(ob, precio) and zona_long)        # OB válido en zona
+            or (bos["bos_bull"] and zona_long)                   # BOS + zona
+            or (zona_long and sl_long >= score_min + 2)          # Alta confluencia en zona
         )
         base_short = (
             (fvg_bear_valido and zona_short)
@@ -998,15 +1004,20 @@ def analizar_par(par: str):
             or idm_s
             or (ob_valido_bear(ob, precio) and zona_short)
             or (bos["bos_bear"] and zona_short)
+            or (zona_short and sl_short >= score_min + 2)        # Alta confluencia en zona
         )
 
         # Filtros de confirmación — respeta VELA_CONFIRMACION
+        # FIX v5.4: con score muy alto (≥ score_min+3), aceptar cierre por encima del 35% del rango
+        # como confirmación (vs 45% antes). Setup de alta calidad no necesita vela perfecta.
         rng_vela   = max(candles[-1]["high"] - candles[-1]["low"], 1e-10)
+        conf_umbral_long  = 0.35 if sl_long  >= score_min + 3 else 0.45
+        conf_umbral_short = 0.35 if sl_short >= score_min + 3 else 0.45
         if config.VELA_CONFIRMACION:
             conf_long  = (candles[-1]["close"] > candles[-1]["open"] or
-                          (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > 0.45)
+                          (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > conf_umbral_long)
             conf_short = (candles[-1]["close"] < candles[-1]["open"] or
-                          (candles[-1]["high"] - candles[-1]["close"]) / rng_vela > 0.45)
+                          (candles[-1]["high"] - candles[-1]["close"]) / rng_vela > conf_umbral_short)
         else:
             conf_long = conf_short = True
 
@@ -1015,8 +1026,6 @@ def analizar_par(par: str):
 
         rsi_ok_long  = rsi < config.RSI_BUY_MAX  or sl_long  >= 8
         rsi_ok_short = rsi > config.RSI_SELL_MIN or sl_short >= 8
-
-        score_min = config.SCORE_MIN
 
         # ── Elegir dirección ──
         lado = score = None
