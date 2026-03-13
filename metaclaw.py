@@ -86,9 +86,9 @@ def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Op
         log.debug("[MCL] ANTHROPIC_API_KEY no configurada — saltando MetaClaw")
         return None
 
-    # Modelos en orden de preferencia (más barato primero)
-    # haiku-4-5 es el string correcto per docs actuales
-    for model in ("claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"):
+    # FIX v5.2: Usar siempre el formato correcto con system separado
+    # El modelo haiku-4-5 requiere system como campo propio, no en messages
+    for model in ("claude-haiku-4-5", "claude-sonnet-4-6"):
         try:
             resp = requests.post(
                 "https://api.anthropic.com/v1/messages",
