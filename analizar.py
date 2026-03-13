@@ -1039,8 +1039,11 @@ def analizar_par(par: str):
         mom_long  = momentum_ok(candles, "LONG")
         mom_short = momentum_ok(candles, "SHORT")
 
-        rsi_ok_long  = rsi < config.RSI_BUY_MAX  or sl_long  >= 8
-        rsi_ok_short = rsi > config.RSI_SELL_MIN or sl_short >= 8
+        # RSI extremo = bloqueante duro (el score no lo salva)
+        # SHORT con RSI < 25 = mercado sobrevendido, riesgo de rebote
+        # LONG con RSI > 75 = mercado sobrecomprado, riesgo de caída
+        rsi_ok_long  = rsi < 75.0 and (rsi < config.RSI_BUY_MAX  or sl_long  >= 10)
+        rsi_ok_short = rsi > 25.0 and (rsi > config.RSI_SELL_MIN or sl_short >= 10)
 
         # ── Elegir dirección ──
         lado = score = None
