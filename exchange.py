@@ -199,10 +199,10 @@ def get_candles(par: str, tf: str, limit: int = 200) -> list:
 # BALANCE — debug completo para diagnosticar
 # ═══════════════════════════════════════════════════════
 
-def _try_balance_endpoint(path: str) -> float:
+def _try_balance_endpoint(path: str, extra: dict = None) -> float:
     """Intenta un endpoint de balance y loguea la respuesta completa."""
     try:
-        data = _get(path)
+        data = _get(path, extra or {})
         code = data.get("code", -1)
         msg  = data.get("msg", "")
         raw  = json.dumps(data)[:400]
@@ -278,18 +278,23 @@ def get_balance() -> float:
     if config.MODO_DEMO:
         return 200.0
 
-    # Probar endpoints conocidos — v3 primero (formato lista), luego v2 (dict)
+    # Intentar v3 y v2 con y sin recvWindow
     endpoints = [
         "/openApi/swap/v3/user/balance",
         "/openApi/swap/v2/user/balance",
-        "/openApi/swap/v2/user/margin",
     ]
 
     for ep in endpoints:
+        # Intento 1: sin recvWindow
         bal = _try_balance_endpoint(ep)
         if bal >= 0:
             log.info(f"[BAL] ✅ Balance: ${bal:.2f} desde {ep}")
             return bal
+        # Intento 2: con recvWindow=5000
+        bal2 = _try_balance_endpoint(ep, extra={"recvWindow": 5000})
+        if bal2 >= 0:
+            log.info(f"[BAL] ✅ Balance (recvWindow): ${bal2:.2f} desde {ep}")
+            return bal2
 
     log.warning("[BAL] Todos los endpoints fallaron — retornando 0")
     return 0.0
@@ -491,36 +496,65 @@ def cerrar_posicion(par: str, qty: float, lado: str) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════
 
 def diagnostico_balance():
-    """Diagnóstico completo: muestra query string firmado, headers, y respuestas RAW."""
+    """Diagnóstico profundo: hex de claves, test spot, test futuros."""
     import json as _json
     log.info("=" * 60)
-    log.info("[DIAG-BAL] Iniciando diagnóstico de balance BingX...")
+    log.info("[DIAG] ====== DIAGNÓSTICO COMPLETO BingX ======")
 
-    # Verificar que las API keys no estén vacías o con espacios
     ak = _api_key()
     sk = _secret_key()
-    log.info(f"[DIAG] API_KEY len={len(ak)} primeros4={ak[:4] if ak else 'VACÍO'}")
-    log.info(f"[DIAG] SECRET len={len(sk)} primeros4={sk[:4] if sk else 'VACÍO'}")
-    if not ak or not sk:
-        log.error("[DIAG] ❌ API KEY o SECRET VACÍOS — revisar variables Railway")
+
+    # ── 1. Verificar chars invisibles en las claves ──────────────
+    if not ak:
+        log.error("[DIAG] ❌ BINGX_API_KEY está VACÍA")
+        return
+    if not sk:
+        log.error("[DIAG] ❌ BINGX_SECRET_KEY está VACÍA")
         return
 
-    # Mostrar query string exacto que se firma
-    p = {"timestamp": _ts()}
-    q = _build_query(p)
-    sig = _sign(q)
-    log.info(f"[DIAG] Query firmado: '{q}'")
-    log.info(f"[DIAG] Firma: {sig[:16]}...")
+    # Mostrar hex de primeros y últimos 4 bytes para detectar \n \r \x00
+    ak_hex_start = ak[:4].encode().hex()
+    ak_hex_end   = ak[-4:].encode().hex()
+    sk_hex_start = sk[:4].encode().hex()
+    sk_hex_end   = sk[-4:].encode().hex()
+    log.info(f"[DIAG] API_KEY  len={len(ak)} inicio_hex={ak_hex_start} fin_hex={ak_hex_end}")
+    log.info(f"[DIAG] SECRET   len={len(sk)} inicio_hex={sk_hex_start} fin_hex={sk_hex_end}")
 
+    # ── 2. Mostrar query string + firma de prueba ────────────────
+    ts_test = _ts()
+    q_test  = f"timestamp={ts_test}"
+    sig_test = _sign(q_test)
+    log.info(f"[DIAG] Query ejemplo: '{q_test}'")
+    log.info(f"[DIAG] Firma ejemplo: {sig_test}")
+
+    # ── 3. Test SPOT (sin permisos de futuros) ───────────────────
+    # Si esto funciona → API key válida pero sin permiso futuros
+    try:
+        p = {"timestamp": _ts()}
+        q = _build_query(p)
+        sig = _sign(q)
+        url = f"{BASE_URL}/openApi/spot/v1/account/balance?{q}&signature={sig}"
+        r_spot = requests.get(url, headers=_headers(), timeout=10)
+        d_spot = r_spot.json()
+        log.info(f"[DIAG] SPOT balance code={d_spot.get('code')} msg={d_spot.get('msg','')[:80]}")
+    except Exception as e:
+        log.warning(f"[DIAG] SPOT test error: {e}")
+
+    # ── 4. Test endpoints FUTUROS ────────────────────────────────
     endpoints = [
         "/openApi/swap/v3/user/balance",
         "/openApi/swap/v2/user/balance",
-        "/openApi/swap/v2/user/margin",
     ]
     for ep in endpoints:
         try:
             data = _get(ep)
-            log.info(f"[DIAG-BAL] {ep} → {_json.dumps(data)[:500]}")
+            code = data.get("code", "?")
+            msg  = data.get("msg", "")[:100]
+            log.info(f"[DIAG] {ep} → code={code} msg={msg}")
+            if code == 0:
+                log.info(f"[DIAG] ✅ ÉXITO en {ep}: {_json.dumps(data)[:300]}")
         except Exception as e:
-            log.info(f"[DIAG-BAL] {ep} → ERROR: {e}")
+            log.info(f"[DIAG] {ep} → ERROR: {e}")
+
+    log.info("[DIAG] ====== FIN DIAGNÓSTICO ======")
     log.info("=" * 60)
