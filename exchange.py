@@ -347,6 +347,27 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         return {"fill_price": precio, "executedQty": qty}
     try:
         _set_leverage(par, "LONG")
+
+        # ── FIX: validar SL/TP contra precio REAL actual ──────────────
+        precio_real = get_precio(par) or precio
+        # Para LONG: SL debe ser < precio_real (y con margen mínimo del 0.3%)
+        if sl > 0 and sl >= precio_real * 0.997:
+            sl_original = sl
+            sl = precio_real * 0.992  # 0.8% por debajo del precio actual
+            log.warning(
+                f"[SL-FIX] {par} LONG sl={sl_original:.6f} >= precio={precio_real:.6f} "
+                f"→ ajustado a {sl:.6f}"
+            )
+        # Para LONG: TP debe ser > precio_real (y con margen mínimo del 0.3%)
+        if tp > 0 and tp <= precio_real * 1.003:
+            tp_original = tp
+            tp = precio_real * 1.025  # 2.5% por encima como mínimo
+            log.warning(
+                f"[TP-FIX] {par} LONG tp={tp_original:.6f} <= precio={precio_real:.6f} "
+                f"→ ajustado a {tp:.6f}"
+            )
+        # ─────────────────────────────────────────────────────────────
+
         params: dict = {
             "symbol": par, "side": "BUY",
             "positionSide": "LONG", "type": "MARKET", "quantity": qty,
@@ -393,6 +414,27 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         return {"fill_price": precio, "executedQty": qty}
     try:
         _set_leverage(par, "SHORT")
+
+        # ── FIX: validar SL/TP contra precio REAL actual ──────────────
+        precio_real = get_precio(par) or precio
+        # Para SHORT: SL debe ser > precio_real (y con margen mínimo del 0.3%)
+        if sl > 0 and sl <= precio_real * 1.003:
+            sl_original = sl
+            sl = precio_real * 1.008  # 0.8% por encima del precio actual
+            log.warning(
+                f"[SL-FIX] {par} SHORT sl={sl_original:.6f} <= precio={precio_real:.6f} "
+                f"→ ajustado a {sl:.6f}"
+            )
+        # Para SHORT: TP debe ser < precio_real (y con margen mínimo del 0.3%)
+        if tp > 0 and tp >= precio_real * 0.997:
+            tp_original = tp
+            tp = precio_real * 0.975  # 2.5% por debajo como mínimo
+            log.warning(
+                f"[TP-FIX] {par} SHORT tp={tp_original:.6f} >= precio={precio_real:.6f} "
+                f"→ ajustado a {tp:.6f}"
+            )
+        # ─────────────────────────────────────────────────────────────
+
         params: dict = {
             "symbol": par, "side": "SELL",
             "positionSide": "SHORT", "type": "MARKET", "quantity": qty,
