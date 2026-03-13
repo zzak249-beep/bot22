@@ -32,14 +32,26 @@ def _ts() -> int:
     return int(time.time() * 1000) + _time_offset
 
 
-def _sign(params: dict) -> str:
-    # BingX firma: parámetros en orden dado, SIN ordenar — HMAC-SHA256
-    # Excluir stopLoss/takeProfit del string de firma (van como JSON separado)
-    skip = {"stopLoss", "takeProfit"}
-    query = "&".join(f"{k}={v}" for k, v in params.items() if k not in skip)
+def _praseParam(params: dict) -> str:
+    """
+    Construye el query string para firmar — patrón oficial BingX.
+    stopLoss/takeProfit se serializan como JSON string dentro de la query.
+    """
+    parts = []
+    for k, v in params.items():
+        if isinstance(v, dict):
+            # Objetos como stopLoss/takeProfit → JSON string en la URL
+            parts.append(f"{k}={json.dumps(v, separators=(',', ':'))}")
+        else:
+            parts.append(f"{k}={v}")
+    return "&".join(parts)
+
+
+def _sign(query_string: str) -> str:
+    """Firma HMAC-SHA256 sobre el query string completo."""
     return hmac.new(
         config.BINGX_SECRET_KEY.encode("utf-8"),
-        query.encode("utf-8"),
+        query_string.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
@@ -47,16 +59,17 @@ def _sign(params: dict) -> str:
 def _headers() -> dict:
     return {
         "X-BX-APIKEY": config.BINGX_API_KEY,
-        "Content-Type": "application/json",
     }
 
 
 def _get(path: str, params: Optional[dict] = None) -> dict:
     p = dict(params or {})
     p["timestamp"] = _ts()
-    p["signature"] = _sign(p)
+    qs = _praseParam(p)
+    sig = _sign(qs)
+    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
     try:
-        r = requests.get(f"{BASE_URL}{path}", params=p, headers=_headers(), timeout=12)
+        r = requests.get(url, headers=_headers(), timeout=12)
         return r.json()
     except Exception as e:
         log.error(f"GET {path}: {e}")
@@ -65,45 +78,16 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
 
 def _post(path: str, params: Optional[dict] = None) -> dict:
     """
-    BingX perpetual orders: params simples van en query string (URL),
-    stopLoss/takeProfit van como objetos en el JSON body.
+    Patrón oficial BingX: todos los params van en la URL como query string.
+    El body está vacío. La firma se hace sobre el query string completo.
     """
     p = dict(params or {})
     p["timestamp"] = _ts()
-
-    # Separar campos que van en body JSON vs query string
-    body_fields = {}
-    for key in ("stopLoss", "takeProfit"):
-        if key in p:
-            val = p.pop(key)
-            # Si viene como string JSON, convertir a dict
-            if isinstance(val, str):
-                try:
-                    val = json.loads(val)
-                except Exception:
-                    pass
-            body_fields[key] = val
-
-    p["signature"] = _sign(p)
-
+    qs = _praseParam(p)
+    sig = _sign(qs)
+    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
     try:
-        if body_fields:
-            # Orden con SL/TP: query string + JSON body
-            r = requests.post(
-                f"{BASE_URL}{path}",
-                params=p,
-                json=body_fields,
-                headers=_headers(),
-                timeout=12,
-            )
-        else:
-            # Orden simple o leverage: todo en query string
-            r = requests.post(
-                f"{BASE_URL}{path}",
-                params=p,
-                headers=_headers(),
-                timeout=12,
-            )
+        r = requests.post(url, headers=_headers(), data={}, timeout=12)
         return r.json()
     except Exception as e:
         log.error(f"POST {path}: {e}")
@@ -365,7 +349,7 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         _set_leverage(par, "LONG")
         params: dict = {
             "symbol": par, "side": "BUY",
-            "positionSide": "LONG", "type": "MARKET", "quantity": str(qty),
+            "positionSide": "LONG", "type": "MARKET", "quantity": qty,
         }
         if sl > 0:
             params["stopLoss"] = {
@@ -411,7 +395,7 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         _set_leverage(par, "SHORT")
         params: dict = {
             "symbol": par, "side": "SELL",
-            "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty),
+            "positionSide": "SHORT", "type": "MARKET", "quantity": qty,
         }
         if sl > 0:
             params["stopLoss"] = {
