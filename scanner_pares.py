@@ -35,6 +35,46 @@ def get_pares_cached(vol_min: float = 200_000.0) -> list:
     return _cache_pares
 
 
+
+# Prefijos y patrones de pares NO-cripto en BingX (materias primas, índices, forex)
+_PREFIJOS_NO_CRIPTO = (
+    "NCC",      # Commodities: NCCONICKEL2USD, NCCGOLD2USD, NCCOIL2USD...
+    "FOREX",    # Forex pairs
+    "STOCK",    # Acciones tokenizadas
+)
+_SUFIJOS_NO_CRIPTO = (
+    "2USD",     # Patrón de materias primas: NICKEL2USD, GOLD2USD...
+    "2USDT",
+)
+_TOKENS_NO_CRIPTO = {
+    # Índices (no son cripto)
+    "SPX500", "NDX100", "DJI30", "FTSE100", "DAX40", "NKY225",
+    # Forex tokenizado (no son cripto)
+    "EURUSD", "GBPUSD", "JPYUSD", "AUDUSD", "USDCNH",
+    # Nota: GOLD/SILVER/OIL en BingX pueden ser tokens cripto reales
+    # Se bloquean por el prefijo NCC o patrón 2USD, no por nombre
+}
+
+def _es_no_cripto(base: str) -> bool:
+    """Devuelve True si el par base NO es una criptomoneda real."""
+    b = base.upper()
+    # Por prefijo
+    for p in _PREFIJOS_NO_CRIPTO:
+        if b.startswith(p):
+            return True
+    # Por sufijo
+    for s in _SUFIJOS_NO_CRIPTO:
+        if b.endswith(s):
+            return True
+    # Por nombre exacto conocido
+    if b in _TOKENS_NO_CRIPTO:
+        return True
+    # Contiene "2USD" en cualquier posición (patrón BingX para commodities)
+    if "2USD" in b:
+        return True
+    return False
+
+
 def _fetch_pares_bingx(vol_min: float) -> list:
     try:
         resp = requests.get(
@@ -61,6 +101,13 @@ def _fetch_pares_bingx(vol_min: float) -> list:
                 continue
             if sym in bloq:
                 continue
+            # ── Filtro: solo criptomonedas reales ─────────────
+            # BingX incluye materias primas (Nickel, Gold, Oil...)
+            # que empiezan con NCC o contienen "2USD" en el nombre
+            base = sym.replace("-USDT", "")
+            if _es_no_cripto(base):
+                continue
+            # ──────────────────────────────────────────────────
             # Filtro de volumen
             vol = float(
                 t.get("quoteVolume",
