@@ -44,9 +44,11 @@ log.info(f"Módulos OK | {config.VERSION}")
 
 GRUPOS_CORRELACION = [
     {"BTC-USDT", "ETH-USDT"},
-    {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT"},
+    {"SOL-USDT", "APT-USDT"},                    # L1 alta cap
+    {"AVAX-USDT", "SUI-USDT"},                   # L1 media cap (separados de SOL)
     {"ARB-USDT", "OP-USDT"},
-    {"DOGE-USDT", "PEPE-USDT", "WIF-USDT", "BONK-USDT"},
+    {"DOGE-USDT", "SHIB-USDT"},
+    {"PEPE-USDT", "WIF-USDT", "BONK-USDT"},
     {"BNB-USDT", "TRX-USDT"},
 ]
 
@@ -165,15 +167,11 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
         vwap_pos = "sobre" if s.get("sobre_vwap") else "bajo"
         extras += f"📊 VWAP: `{s['vwap']:.6f}` ({vwap_pos})\n"
 
-    # TP1 % según score
-    sc = s.get("score", 0)
-    tp1_pct = "25%" if sc >= 14 else ("30%" if sc >= 10 else "50%")
-
     _notif(
         f"{lado} — `{s['par']}` [{s.get('kz', '')}]\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 Entrada : `{s['precio']:.6f}`\n"
-        f"🔶 TP1     : `{s['tp1']:.6f}` ({tp1_pct})\n"
+        f"🔶 TP1     : `{s['tp1']:.6f}` (50%)\n"
         f"✅ TP2     : `{s['tp']:.6f}`\n"
         f"🛑 SL      : `{s['sl']:.6f}`\n"
         f"📊 R:R     : `{s['rr']:.2f}x`\n"
@@ -339,11 +337,11 @@ def actualizar_trailing(par, pos, precio):
         if profit < activar_dist:
             return
         nuevo = precio - trail_dist
-        # Nunca bajar el trailing (solo subir)
         actual = pos.get("sl_trailing", pos["sl"])
         if nuevo > actual:
             pos["sl_trailing"] = nuevo
             log.debug(f"[TRAIL] {par} LONG SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
+            exchange.actualizar_sl_bingx(par, nuevo, lado)
     else:
         profit = pos["entrada"] - precio
         if profit < activar_dist:
@@ -353,6 +351,7 @@ def actualizar_trailing(par, pos, precio):
         if nuevo < actual:
             pos["sl_trailing"] = nuevo
             log.debug(f"[TRAIL] {par} SHORT SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
+            exchange.actualizar_sl_bingx(par, nuevo, lado)
 
 
 # ═══════════════════════════════════════════════════════
@@ -370,24 +369,14 @@ def gestionar_partial_tp(par, pos, precio):
     if not alcanzado:
         return
 
-    # ── NUEVO v5.3: % de cierre en TP1 según score ─────────────────────
-    # Objetivo: dejar más cantidad correr al TP2 en setups de alta calidad.
-    # Score alto = más confianza en que el precio sigue → cerrar menos.
-    #
-    # Score 14-16: cerrar 25% en TP1, dejar 75% correr al TP2
-    # Score 10-13: cerrar 30% en TP1, dejar 70% correr
-    # Score  6-9 : cerrar 50% en TP1 (comportamiento anterior, conservador)
+    # Cierre adaptativo según score: más score = cerrar menos en TP1, dejar más correr
     score_pos = pos.get("score", 0)
     if score_pos >= 14:
-        pct_tp1 = 0.25   # 25% cierre en TP1
-        label   = "25%"
+        pct_tp1 = 0.25; label = "25%"   # 75% sigue al TP2
     elif score_pos >= 10:
-        pct_tp1 = 0.30   # 30% cierre en TP1
-        label   = "30%"
+        pct_tp1 = 0.30; label = "30%"   # 70% sigue al TP2
     else:
-        pct_tp1 = 0.50   # 50% (conservador, igual que antes)
-        label   = "50%"
-    # ────────────────────────────────────────────────────────────────────
+        pct_tp1 = 0.50; label = "50%"   # conservador
 
     qty_tp1 = round(pos["qty"] * pct_tp1, 6)
     if not config.MODO_DEMO:
@@ -406,11 +395,12 @@ def gestionar_partial_tp(par, pos, precio):
     pos["qty"]     = round(pos["qty"] - qty_tp1, 6)
     pos["tp1_hit"] = True
 
+    resto_pct = round((1 - pct_tp1) * 100)
     log.info(f"[TP1] {par} {label} @ {salida_real:.6f} PnL_p={pnl_p:+.4f} SL→BE={be:.6f} (score={score_pos})")
     _notif(
         f"🔶 *TP1* — `{par}` {lado}\n"
-        f"`{label}` cerrado @ `{salida_real:.6f}` | PnL: `${pnl_p:+.4f}`\n"
-        f"{'🏃 ' + str(round((1-pct_tp1)*100)) + '% sigue al TP2' if pct_tp1 < 0.5 else ''}\n"
+        f"`{label}` @ `{salida_real:.6f}` | PnL: `${pnl_p:+.4f}`\n"
+        f"{'🏃 ' + str(resto_pct) + '% sigue al TP2' if pct_tp1 < 0.5 else ''}\n"
         f"🔄 SL → `{be:.6f}` (breakeven)\n"
         f"📊 Pool: `${memoria._data['compounding']['ganancias']:.2f}` | "
         f"Próx: `${memoria.get_trade_amount():.2f} USDT`"
@@ -554,11 +544,23 @@ def ejecutar_senal(s: dict) -> str:
     balance_total = exchange.get_balance()
     margen_libre  = exchange.get_available_margin()
 
-    # Check: ¿hay margen libre suficiente para abrir el trade?
-    margen_min = max(config.TRADE_USDT_BASE / config.LEVERAGE * 1.5, 2.0)
+    # ── FIX CRÍTICO: Circuit breaker de exposición ─────────────────────────
+    # Problema: con $109 balance y $104 en margen (95%), el check anterior
+    # pasaba porque margen_min=$2 < margen_libre=$4.77. BingX luego rechazaba.
+    # Solución: bloquear si margen usado > 80% del balance ANTES de intentar.
+    if balance_total > 0 and not config.MODO_DEMO:
+        margen_usado_pct = (balance_total - margen_libre) / balance_total * 100
+        if margen_usado_pct > 80:
+            log.warning(f"[EXPOSICIÓN] {margen_usado_pct:.0f}% del balance en margen — bloqueando")
+            return f"bloq:exposición alta ({margen_usado_pct:.0f}% margen usado)"
+
+    # Check margen libre suficiente para el trade real (no el mínimo teórico)
+    # trade estimado ≈ TRADE_USDT_BASE, margen necesario = trade/leverage + buffer 30%
+    margen_min = max(config.TRADE_USDT_BASE / config.LEVERAGE * 1.3, 2.0)
     if margen_libre < margen_min and not config.MODO_DEMO:
-        log.warning(f"Margen libre insuficiente: ${margen_libre:.2f} (necesario: ${margen_min:.2f}) — balance total: ${balance_total:.2f}")
+        log.warning(f"[MARGEN] Libre: ${margen_libre:.2f} < necesario: ${margen_min:.2f}")
         return f"bloq:margen libre insuficiente (${margen_libre:.2f})"
+    # ────────────────────────────────────────────────────────────────────────
 
     trade_usdt = memoria.get_trade_amount()
 
@@ -569,38 +571,28 @@ def ejecutar_senal(s: dict) -> str:
         trade_usdt = min(max(trade_usdt, trade_por_balance), config.TRADE_USDT_MAX)
         trade_usdt = round(trade_usdt, 2)
 
-    # ── NUEVO v5.3: Sizing dinámico por score ─────────────────────────────
-    # Con $100-200, apostar diferente en setup 14/16 vs 6/16 es la forma
-    # más directa de ganar más por trade sin aumentar el número de trades.
-    #
-    # Escala máxima: nunca más de TRADE_USDT_MAX ni más del 15% del balance
-    # para no concentrar demasiado riesgo en un solo trade.
+    # ── Sizing dinámico por score ──────────────────────────────────────────
     score_trade  = s.get("score", 0)
-    ob_fvg_bonus = s.get("ob_fvg_bull") or s.get("ob_fvg_bear")  # Confluencia OB+FVG
+    ob_fvg_bonus = s.get("ob_fvg_bull") or s.get("ob_fvg_bear")
     kz_activa    = s.get("kz", "") not in ("", "FUERA")
 
     if score_trade >= 14:
-        # Setup excepcional (14-16/16): 2.0x base — máxima apuesta
         mult_score = 2.0
     elif score_trade >= 12:
-        # Setup muy fuerte (12-13/16): 1.5x base
         mult_score = 1.5
     elif score_trade >= 10:
-        # Setup sólido (10-11/16): 1.25x base
         mult_score = 1.25
     else:
-        # Setup estándar (6-9/16): sin multiplicador
         mult_score = 1.0
 
-    # Bonus adicional si hay OB+FVG confluencia Y killzone activa (setup institucional)
     if ob_fvg_bonus and kz_activa and score_trade >= 10:
-        mult_score = min(mult_score + 0.25, 2.5)  # Extra +25%, máx 2.5x
+        mult_score = min(mult_score + 0.25, 2.5)
 
     if mult_score > 1.0:
         trade_usdt_scaled = round(min(
             trade_usdt * mult_score,
             config.TRADE_USDT_MAX,
-            balance * 0.15,          # Nunca más del 15% del balance en un trade
+            balance * 0.15,
         ), 2)
         if trade_usdt_scaled > trade_usdt:
             log.info(f"[SIZING] {par} score={score_trade}/16 → ${trade_usdt:.2f}×{mult_score}= ${trade_usdt_scaled:.2f}")
@@ -924,21 +916,27 @@ def main():
                     if resultado == "skip":
                         continue
 
-                    # Error de API → loguear, Telegram solo primeros 3 por ciclo
+                    # Error de API → loguear, Telegram solo primeros 2 por ciclo
+                    # Silenciar "Insufficient margin" — el circuit breaker ya lo maneja
                     if resultado and resultado.startswith("error:"):
                         log.error(f"[API-ERR] {s['par']}: {resultado[6:]}")
                         if not exchange.par_es_soportado(s["par"]):
                             log.warning(f"[BLOCKED] {s['par']} bloqueado tras fallo")
-                        # FIX anti-spam: máx 3 notificaciones de error por ciclo
+                        # No notificar si es error de margen (ya bloqueado por circuit breaker)
+                        if "margin" in resultado.lower() or "insufficient" in resultado.lower():
+                            log.warning(f"[MARGEN-SKIP] {s['par']} — Insufficient margin, omitiendo notif")
+                            continue
+                        # FIX anti-spam: máx 2 notificaciones de error por ciclo
                         if not hasattr(main, '_errores_ciclo'):
                             main._errores_ciclo = 0
-                        if main._errores_ciclo < 3:
+                        if main._errores_ciclo < 2:
                             _notif(f"🚨 *Orden fallida {s['lado']} `{s['par']}`*\n❌ `{resultado[6:80]}`")
                             main._errores_ciclo += 1
                         continue
 
-                    # bloq:MAX_POSICIONES → no notificar señal (evitar spam)
-                    if resultado and "MAX_POSICIONES" in resultado:
+                    # bloq silenciosos — no notificar (evitar spam)
+                    bloq_silencioso = ("MAX_POSICIONES", "exposición alta", "margen libre", "correlacion")
+                    if resultado and any(x in resultado for x in bloq_silencioso):
                         log.info(f"[SKIP] {s['par']} — {resultado}")
                         continue
 
