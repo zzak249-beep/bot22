@@ -63,8 +63,13 @@ def hay_correlacion(par: str, lado: str, posiciones: dict) -> bool:
     return False
 
 def hay_hedge(par: str, lado: str, posiciones: dict) -> bool:
+    # Comprobar memoria local
     if par in posiciones and posiciones[par]["lado"] != lado:
-        log.info(f"[ANTI-HEDGE] {par} {lado} — ya hay {posiciones[par]['lado']}")
+        log.info(f"[ANTI-HEDGE] {par} {lado} — ya hay {posiciones[par]['lado']} (local)")
+        return True
+    # Comprobar también si hay posición abierta del mismo par en BingX (cualquier lado)
+    if par in posiciones:
+        log.info(f"[ANTI-HEDGE] {par} {lado} — par ya en posición")
         return True
     return False
 
@@ -190,6 +195,19 @@ def _notif_cierre(par, lado, entrada, salida, pnl, razon="", trade_usdt=0):
     )
 
 
+def _mcl_aprender(pos: dict, pnl: float):
+    """Llama a MetaClaw.aprender en todos los cierres de trade."""
+    if not config.METACLAW_ACTIVO:
+        return
+    try:
+        import os as _os
+        if _os.getenv("ANTHROPIC_API_KEY"):
+            metaclaw.aprender(pos, ganado=(pnl > 0), pnl=pnl)
+            log.debug(f"[MCL] aprender llamado PnL={pnl:+.4f}")
+    except Exception as e:
+        log.debug(f"[MCL] aprender error: {e}")
+
+
 # ═══════════════════════════════════════════════════════
 # CARGAR POSICIONES AL ARRANQUE
 # ═══════════════════════════════════════════════════════
@@ -287,13 +305,7 @@ def sincronizar_posiciones():
             memoria.registrar_resultado(par, pnl, lado,
                 kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
             # ── MetaClaw: aprender del resultado ────────────────
-            if config.METACLAW_ACTIVO:
-                try:
-                    import os as _os
-                    if _os.getenv("ANTHROPIC_API_KEY"):
-                        metaclaw.aprender(pos, ganado=(pnl > 0), pnl=pnl)
-                except Exception:
-                    pass
+            _mcl_aprender(pos, pnl)
             del estado.posiciones[par]
             _notif_cierre(par, lado, entry, salida, pnl, f"BingX-{razon}")
             log.info(f"[SYNC] {par} cerrado ({razon}) PnL≈{pnl:+.4f}")
@@ -410,6 +422,7 @@ def gestionar_posiciones():
                 estado.registrar_cierre(pnl)
                 memoria.registrar_resultado(par, pnl, lado,
                     kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
+                _mcl_aprender(pos, pnl)
                 del estado.posiciones[par]
                 _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, "TIME")
                 continue
@@ -435,6 +448,7 @@ def gestionar_posiciones():
                 estado.registrar_cierre(pnl)
                 memoria.registrar_resultado(par, pnl, lado,
                     kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
+                _mcl_aprender(pos, pnl)
                 del estado.posiciones[par]
                 log.info(f"CIERRE {lado} {par} @ {salida_real:.6f} PnL={pnl:+.4f} ({razon})")
                 _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, razon,
@@ -461,6 +475,19 @@ def ejecutar_senal(s: dict) -> str:
 
     if par in estado.posiciones:
         return "skip"
+    # Anti-hedge: verificar posiciones reales en BingX (no solo RAM)
+    if not config.MODO_DEMO:
+        try:
+            pos_reales = exchange.get_posiciones_abiertas()
+            for p in pos_reales:
+                sym = p.get("symbol", "")
+                par_norm = sym if "-" in sym else sym.replace("USDT", "-USDT")
+                amt = float(p.get("positionAmt", 0) or 0)
+                if par_norm == par and amt != 0:
+                    log.info(f"[ANTI-HEDGE] {par} bloqueado — posición real ya abierta en BingX")
+                    return "skip"
+        except Exception:
+            pass
     if hay_hedge(par, lado, estado.posiciones):
         return "bloq:anti-hedge activo"
     if hay_correlacion(par, lado, estado.posiciones):
@@ -814,17 +841,7 @@ def main():
                         log.info(f"[SKIP] {s['par']} — {resultado}")
                         continue
 
-                    # ── FILTRO TELEGRAM: solo buenas señales ──────────────────
-                    # Ejecutado siempre notifica
-                    # Bloqueado solo si score >= SCORE_NOTIF_MIN (no balance ni correlación)
-                    _score_notif_min = getattr(config, "SCORE_NOTIF_MIN", 7)
-                    es_bloqueo_tecnico = resultado and resultado.startswith("bloq:") and any(
-                        x in resultado for x in ("balance", "correlacion", "MAX_POSICIONES", "anti-hedge")
-                    )
-                    if resultado != "ok" and (s["score"] < _score_notif_min or es_bloqueo_tecnico):
-                        log.info(f"[NOTIF-SKIP] {s['par']} score={s['score']} resultado={resultado}")
-                        continue
-
+                    # Para cualquier otro resultado: notificar (ejecutado o bloqueado con razón)
                     _notif_entrada(s, memoria.get_trade_amount(), resultado)
                     if resultado == "ok":
                         balance = exchange.get_balance()
