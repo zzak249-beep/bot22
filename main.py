@@ -25,7 +25,7 @@ log = logging.getLogger("main")
 log.info("=== ARRANQUE SMC BOT v4.2 ===")
 
 try:
-    import config, exchange, analizar, memoria, scanner_pares, metaclaw, optimizador
+    import config, exchange, analizar, memoria, scanner_pares, metaclaw
     from config_pares import PARES as PARES_FIJOS
 except Exception as e:
     log.error(f"ERROR importando módulos: {e}\n{traceback.format_exc()}")
@@ -769,6 +769,9 @@ def main():
         log.info(f"Balance reintento: ${balance:.2f} USDT")
         if balance <= 0:
             _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
+
+    # Agente de auto-optimización en segundo plano
+    optimizador.iniciar()
 
     # FIX v4.4: wrap startup en try/except para evitar crash por fallo de red
     try:
