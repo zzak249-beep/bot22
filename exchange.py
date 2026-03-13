@@ -197,8 +197,12 @@ def get_candles(par: str, tf: str, limit: int = 200) -> list:
 # BALANCE — debug completo para diagnosticar
 # ═══════════════════════════════════════════════════════
 
-def _try_balance_endpoint(path: str) -> float:
-    """Intenta un endpoint de balance y loguea la respuesta completa."""
+def _try_balance_endpoint(path: str) -> tuple:
+    """
+    Retorna (balance_total, margen_disponible) desde el endpoint.
+    balance_total  = campo 'balance' o 'equity' (dinero total en la cuenta)
+    margen_disponible = campo 'availableMargin' (libre para nuevas órdenes)
+    """
     try:
         data = _get(path)
         code = data.get("code", -1)
@@ -207,72 +211,70 @@ def _try_balance_endpoint(path: str) -> float:
         log.info(f"[BAL-RAW] {path} code={code} msg={msg} → {raw}")
 
         if code != 0:
-            return -1.0
+            return -1.0, -1.0
 
-        d = data.get("data", {})
+        d   = data.get("data", {})
+        bal = d.get("balance") if isinstance(d, dict) else None
 
-        # Caso 1: data.balance es dict
-        bal = d.get("balance")
+        total_val = -1.0
+        avail_val = -1.0
+
         if isinstance(bal, dict):
-            for k in ("availableMargin", "freeMargin", "available", "crossWalletBalance",
-                      "crossUnPnl", "balance", "equity", "maxWithdrawAmount"):
+            # balance total: preferir 'balance' → 'equity'
+            for k in ("balance", "equity"):
                 v = bal.get(k)
                 if v is not None:
                     try:
                         f = float(v)
-                        log.info(f"[BAL] {path} campo '{k}' = {f}")
                         if f >= 0:
-                            return f
+                            total_val = f
+                            break
                     except Exception:
                         pass
+            # margen disponible
+            for k in ("availableMargin", "freeMargin", "available", "maxWithdrawAmount"):
+                v = bal.get(k)
+                if v is not None:
+                    try:
+                        f = float(v)
+                        if f >= 0:
+                            avail_val = f
+                            break
+                    except Exception:
+                        pass
+            if total_val >= 0:
+                log.info(f"[BAL] {path} total={total_val:.2f} disponible={avail_val:.2f}")
+                return total_val, avail_val
 
         # Caso 2: data es dict directo
         if isinstance(d, dict) and "availableMargin" in d:
-            return float(d["availableMargin"])
+            avail = float(d.get("availableMargin", 0))
+            total = float(d.get("balance", d.get("equity", avail)))
+            return total, avail
 
         # Caso 3: data es lista
         if isinstance(d, list):
             for item in d:
                 asset = str(item.get("asset", item.get("currency", ""))).upper()
                 if asset in ("USDT", ""):
-                    for k in ("availableMargin", "freeMargin", "available", "balance"):
-                        v = item.get(k)
-                        if v is not None:
-                            try:
-                                f = float(v)
-                                if f >= 0:
-                                    return f
-                            except Exception:
-                                pass
-
-        # Caso 4: d.balance es lista
-        if isinstance(d, dict):
-            for key_outer in ("balance", "assets", "data"):
-                inner = d.get(key_outer)
-                if isinstance(inner, list):
-                    for item in inner:
-                        asset = str(item.get("asset", "")).upper()
-                        if asset in ("USDT", ""):
-                            v = item.get("availableMargin", item.get("balance"))
-                            if v is not None:
-                                try:
-                                    return float(v)
-                                except Exception:
-                                    pass
+                    t = item.get("balance", item.get("equity"))
+                    a = item.get("availableMargin", item.get("freeMargin", item.get("available")))
+                    if t is not None:
+                        return float(t), float(a) if a is not None else float(t)
 
         log.warning(f"[BAL] {path} no se encontró campo de balance en: {raw}")
-        return -1.0
+        return -1.0, -1.0
 
     except Exception as e:
         log.warning(f"[BAL] {path} excepción: {e}")
-        return -1.0
+        return -1.0, -1.0
 
 
 def get_balance() -> float:
+    """Balance TOTAL de la cuenta (para display y reporte). Incluye margen en uso."""
     if config.MODO_DEMO:
         return 200.0
 
-    # Probar todos los endpoints conocidos de BingX futuros perpetuos
     endpoints = [
         "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
@@ -280,12 +282,34 @@ def get_balance() -> float:
     ]
 
     for ep in endpoints:
-        bal = _try_balance_endpoint(ep)
-        if bal >= 0:
-            log.info(f"[BAL] ✅ Balance: ${bal:.2f} desde {ep}")
-            return bal
+        total, avail = _try_balance_endpoint(ep)
+        if total >= 0:
+            log.info(f"[BAL] ✅ Balance total: ${total:.2f} | Disponible: ${avail:.2f} desde {ep}")
+            return total
 
     log.warning("[BAL] Todos los endpoints fallaron — retornando 0")
+    return 0.0
+
+
+def get_available_margin() -> float:
+    """
+    Margen DISPONIBLE para abrir nuevas posiciones.
+    Usar SOLO en ejecutar_senal() para verificar si hay fondos libres.
+    """
+    if config.MODO_DEMO:
+        return 200.0
+
+    endpoints = [
+        "/openApi/swap/v2/user/balance",
+        "/openApi/swap/v3/user/balance",
+        "/openApi/account/v1/balance",
+    ]
+
+    for ep in endpoints:
+        total, avail = _try_balance_endpoint(ep)
+        if total >= 0:
+            # Si no se pudo leer availableMargin, asumir conservadoramente
+            return avail if avail >= 0 else total
     return 0.0
 
 
@@ -347,27 +371,6 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         return {"fill_price": precio, "executedQty": qty}
     try:
         _set_leverage(par, "LONG")
-
-        # ── FIX: validar SL/TP contra precio REAL actual ──────────────
-        precio_real = get_precio(par) or precio
-        # Para LONG: SL debe ser < precio_real (y con margen mínimo del 0.3%)
-        if sl > 0 and sl >= precio_real * 0.997:
-            sl_original = sl
-            sl = precio_real * 0.992  # 0.8% por debajo del precio actual
-            log.warning(
-                f"[SL-FIX] {par} LONG sl={sl_original:.6f} >= precio={precio_real:.6f} "
-                f"→ ajustado a {sl:.6f}"
-            )
-        # Para LONG: TP debe ser > precio_real (y con margen mínimo del 0.3%)
-        if tp > 0 and tp <= precio_real * 1.003:
-            tp_original = tp
-            tp = precio_real * 1.025  # 2.5% por encima como mínimo
-            log.warning(
-                f"[TP-FIX] {par} LONG tp={tp_original:.6f} <= precio={precio_real:.6f} "
-                f"→ ajustado a {tp:.6f}"
-            )
-        # ─────────────────────────────────────────────────────────────
-
         params: dict = {
             "symbol": par, "side": "BUY",
             "positionSide": "LONG", "type": "MARKET", "quantity": qty,
@@ -414,27 +417,6 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         return {"fill_price": precio, "executedQty": qty}
     try:
         _set_leverage(par, "SHORT")
-
-        # ── FIX: validar SL/TP contra precio REAL actual ──────────────
-        precio_real = get_precio(par) or precio
-        # Para SHORT: SL debe ser > precio_real (y con margen mínimo del 0.3%)
-        if sl > 0 and sl <= precio_real * 1.003:
-            sl_original = sl
-            sl = precio_real * 1.008  # 0.8% por encima del precio actual
-            log.warning(
-                f"[SL-FIX] {par} SHORT sl={sl_original:.6f} <= precio={precio_real:.6f} "
-                f"→ ajustado a {sl:.6f}"
-            )
-        # Para SHORT: TP debe ser < precio_real (y con margen mínimo del 0.3%)
-        if tp > 0 and tp >= precio_real * 0.997:
-            tp_original = tp
-            tp = precio_real * 0.975  # 2.5% por debajo como mínimo
-            log.warning(
-                f"[TP-FIX] {par} SHORT tp={tp_original:.6f} >= precio={precio_real:.6f} "
-                f"→ ajustado a {tp:.6f}"
-            )
-        # ─────────────────────────────────────────────────────────────
-
         params: dict = {
             "symbol": par, "side": "SELL",
             "positionSide": "SHORT", "type": "MARKET", "quantity": qty,
