@@ -946,15 +946,33 @@ def analizar_par(par: str):
         fvg_bull_valido = fvg["bull_fvg"] and not fvg.get("fvg_rellenado", True)
         fvg_bear_valido = fvg["bear_fvg"] and not fvg.get("fvg_rellenado", True)
 
-        base_long  = (fvg_bull_valido and zona_long) or ob_fvg_bull or sweep["sweep_bull"] or idm_l
-        base_short = (fvg_bear_valido and zona_short) or ob_fvg_bear or sweep["sweep_bear"] or idm_s
+        # FIX v5.1: base también válida si hay OB válido en zona, o BOS con zona
+        base_long  = (
+            (fvg_bull_valido and zona_long)          # FVG no rellenado + zona
+            or ob_fvg_bull                            # OB+FVG confluencia
+            or sweep["sweep_bull"]                    # Liquidity sweep
+            or idm_l                                  # Inducement
+            or (ob_valido_bull(ob, precio) and zona_long)   # OB válido en zona
+            or (bos["bos_bull"] and zona_long)        # BOS + zona
+        )
+        base_short = (
+            (fvg_bear_valido and zona_short)
+            or ob_fvg_bear
+            or sweep["sweep_bear"]
+            or idm_s
+            or (ob_valido_bear(ob, precio) and zona_short)
+            or (bos["bos_bear"] and zona_short)
+        )
 
-        # Filtros de confirmación
+        # Filtros de confirmación — respeta VELA_CONFIRMACION
         rng_vela   = max(candles[-1]["high"] - candles[-1]["low"], 1e-10)
-        conf_long  = (candles[-1]["close"] > candles[-1]["open"] or
-                      (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > 0.55)
-        conf_short = (candles[-1]["close"] < candles[-1]["open"] or
-                      (candles[-1]["high"] - candles[-1]["close"]) / rng_vela > 0.55)
+        if config.VELA_CONFIRMACION:
+            conf_long  = (candles[-1]["close"] > candles[-1]["open"] or
+                          (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > 0.45)
+            conf_short = (candles[-1]["close"] < candles[-1]["open"] or
+                          (candles[-1]["high"] - candles[-1]["close"]) / rng_vela > 0.45)
+        else:
+            conf_long = conf_short = True
 
         mom_long  = momentum_ok(candles, "LONG")
         mom_short = momentum_ok(candles, "SHORT")
