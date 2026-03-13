@@ -473,6 +473,72 @@ def _colocar_sl_tp_separados(par: str, sl: float, tp: float, lado: str, qty: flo
 
 
 # ═══════════════════════════════════════════════════════
+# TRAILING STOP REAL — actualizar SL en BingX
+# ═══════════════════════════════════════════════════════
+
+def actualizar_sl_bingx(par: str, nuevo_sl: float, lado: str) -> bool:
+    """
+    Actualiza el Stop Loss de una posición abierta en BingX.
+
+    CRÍTICO: Sin esta función el trailing stop solo vive en memoria Python —
+    BingX sigue ejecutando el SL original aunque el precio haya subido 3 ATR.
+
+    Intenta primero con /profitloss (endpoint moderno).
+    Si falla, cancela la orden SL existente y coloca una nueva.
+    Retorna True si la actualización fue exitosa.
+    """
+    if config.MODO_DEMO or nuevo_sl <= 0:
+        return True
+    try:
+        pos_side = "LONG" if lado == "LONG" else "SHORT"
+        params = {
+            "symbol":       par,
+            "positionSide": pos_side,
+            "stopLoss": {
+                "type":        "STOP_MARKET",
+                "stopPrice":   round(nuevo_sl, 8),
+                "price":       round(nuevo_sl, 8),
+                "workingType": "MARK_PRICE",
+            },
+        }
+        data = _post("/openApi/swap/v2/trade/profitloss", params)
+        ok = data.get("code", -1) == 0
+        if ok:
+            log.debug(f"[TRAIL-BINGX] ✅ {par} {lado} SL → {nuevo_sl:.6f}")
+        else:
+            log.debug(f"[TRAIL-BINGX] profitloss falló ({data.get('msg')}) — cancel+replace")
+            _actualizar_sl_cancel_replace(par, nuevo_sl, lado)
+        return ok
+    except Exception as e:
+        log.debug(f"actualizar_sl_bingx {par}: {e}")
+        return False
+
+
+def _actualizar_sl_cancel_replace(par: str, nuevo_sl: float, lado: str):
+    """
+    Fallback: cancela órdenes pendientes del par y coloca nuevo SL.
+    """
+    try:
+        cl_side  = "SELL" if lado == "LONG" else "BUY"
+        pos_side = "LONG" if lado == "LONG" else "SHORT"
+        # Cancelar todas las stop orders abiertas del par
+        _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
+        # Colocar nuevo SL (closePosition cierra toda la posición)
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol":        par,
+            "side":          cl_side,
+            "positionSide":  pos_side,
+            "type":          "STOP_MARKET",
+            "stopPrice":     round(nuevo_sl, 8),
+            "workingType":   "MARK_PRICE",
+            "reduceOnly":    "true",
+            "closePosition": "true",
+        })
+    except Exception as e:
+        log.debug(f"_actualizar_sl_cancel_replace {par}: {e}")
+
+
+# ═══════════════════════════════════════════════════════
 # CERRAR POSICIÓN
 # ═══════════════════════════════════════════════════════
 
