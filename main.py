@@ -340,6 +340,10 @@ def actualizar_trailing(par, pos, precio):
         if nuevo > actual:
             pos["sl_trailing"] = nuevo
             log.debug(f"[TRAIL] {par} LONG SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
+            # ══ FIX CRÍTICO v5.1: Enviar nuevo SL a BingX ══════════
+            # Sin esto el trailing solo existe en memoria Python —
+            # BingX ejecutaría el SL original aunque el precio subiera 3 ATR
+            exchange.actualizar_sl_bingx(par, nuevo, lado)
     else:
         profit = pos["entrada"] - precio
         if profit < activar_dist:
@@ -349,6 +353,8 @@ def actualizar_trailing(par, pos, precio):
         if nuevo < actual:
             pos["sl_trailing"] = nuevo
             log.debug(f"[TRAIL] {par} SHORT SL → {nuevo:.6f} (+{profit/atr:.1f}ATR)")
+            # ══ FIX CRÍTICO v5.1: Enviar nuevo SL a BingX ══════════
+            exchange.actualizar_sl_bingx(par, nuevo, lado)
 
 
 # ═══════════════════════════════════════════════════════
@@ -579,15 +585,28 @@ def ejecutar_senal(s: dict) -> str:
 
     atr    = s.get("atr", 0)
     precio = s["precio"]
-    if atr > 0:
+
+    # FIX v5.1: Preservar SL/TP estructurales calculados en analizar_par
+    # Antes se sobreescribían con ATR simple, perdiendo la lógica de OB/Asia/swing
+    precio_senal = precio
+    slip_ratio   = entrada_real / precio_senal if precio_senal > 0 else 1.0
+
+    if abs(slip_ratio - 1.0) < 0.005:
+        # Slippage mínimo (<0.5%) → usar SL/TP estructurales directamente
+        sl_r  = s["sl"]
+        tp_r  = s["tp"]
+        tp1_r = s["tp1"]
+    else:
+        # Ajustar SL/TP proporcionalmente al slippage real
+        sl_r  = s["sl"]  * slip_ratio
+        tp_r  = s["tp"]  * slip_ratio
+        tp1_r = s["tp1"] * slip_ratio
+
+    # Fallback: si la señal no tiene SL/TP válidos, usar ATR
+    if atr > 0 and (sl_r <= 0 or tp_r <= 0):
         sl_r  = (entrada_real - atr * config.SL_ATR_MULT)  if lado == "LONG" else (entrada_real + atr * config.SL_ATR_MULT)
         tp_r  = (entrada_real + atr * config.TP_ATR_MULT)  if lado == "LONG" else (entrada_real - atr * config.TP_ATR_MULT)
-        tp1_r = (entrada_real + atr * config.PARTIAL_TP1_MULT) if lado == "LONG" else (entrada_real - atr * config.PARTIAL_TP1_MULT)
-    else:
-        ratio = entrada_real / precio if precio > 0 else 1.0
-        sl_r  = s["sl"]  * ratio
-        tp_r  = s["tp"]  * ratio
-        tp1_r = s["tp1"] * ratio
+        tp1_r = (entrada_real + atr * 1.5)                 if lado == "LONG" else (entrada_real - atr * 1.5)
 
     qty_real = float(res.get("executedQty", qty) or qty)
     memoria.registrar_inversion(trade_usdt)
