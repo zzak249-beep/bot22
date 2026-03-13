@@ -526,17 +526,22 @@ def ejecutar_senal(s: dict) -> str:
         log.warning("[BLOQUEO] Max perdida diaria")
         return f"bloq:circuit-breaker PnL={estado.pnl_hoy:.2f}"
 
-    balance = exchange.get_balance()
-    if balance < 5.0 and not config.MODO_DEMO:
-        log.warning(f"Balance insuficiente: ${balance:.2f}")
-        return f"bloq:balance insuficiente (${balance:.2f})"
+    # FIX v5.3: separar balance TOTAL (para compounding) de margen DISPONIBLE (para ejecutar)
+    balance_total = exchange.get_balance()
+    margen_libre  = exchange.get_available_margin()
+
+    # Check: ¿hay margen libre suficiente para abrir el trade?
+    margen_min = max(config.TRADE_USDT_BASE / config.LEVERAGE * 1.5, 2.0)
+    if margen_libre < margen_min and not config.MODO_DEMO:
+        log.warning(f"Margen libre insuficiente: ${margen_libre:.2f} (necesario: ${margen_min:.2f}) — balance total: ${balance_total:.2f}")
+        return f"bloq:margen libre insuficiente (${margen_libre:.2f})"
 
     trade_usdt = memoria.get_trade_amount()
 
-    # Compounding real: si el balance supera el trade base, usar % del balance
-    # (máx 15% del balance por trade para gestión de riesgo)
+    # Compounding basado en balance TOTAL (no margen libre)
+    balance = balance_total  # alias para compatibilidad con el resto del bloque
     if balance > config.TRADE_USDT_BASE * 2 and not config.MODO_DEMO:
-        trade_por_balance = balance * 0.12  # 12% del balance disponible
+        trade_por_balance = balance * 0.12  # 12% del balance total disponible
         trade_usdt = min(max(trade_usdt, trade_por_balance), config.TRADE_USDT_MAX)
         trade_usdt = round(trade_usdt, 2)
 
