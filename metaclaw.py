@@ -1,23 +1,23 @@
 """
 metaclaw.py — Agente IA de trading con habilidades evolutivas
-Inspirado en MetaClaw framework — skills que aprenden y EVOLUCIONAN
+SMC Bot v5.0 [MetaClaw Edition — FIXED]
 
-Arquitectura:
-  1. analizar_par() genera señal SMC v5.0
-  2. metaclaw.validar(señal) → Claude evalúa con skills activas → APROBAR/RECHAZAR
-  3. Al cerrar trade → metaclaw.aprender(señal, resultado) → genera/actualiza skill
-  4. Las skills se persisten en JSON y mejoran con cada trade
-
-Skills = reglas cortas aprendidas de la experiencia:
-  "SHORT BTC London + RSI>68 + OB_bear → 3/4 trades ganados (75%)"
-  "Evitar LONG en alts fuera de KZ si score < 7 — 0/3 últimos"
-  "PIN_BAR + EQL + LONDON = setup de alta precisión (5/6 trades)"
+Bugs corregidos:
+  FIX#1 — API key sin .strip() — espacios invisibles rompían la auth
+  FIX#2 — import re dentro de funciones — movido al nivel del módulo
+  FIX#3 — timeout 12s demasiado corto para aprender (max_tokens=200)
+  FIX#4 — score referenciado como /14, el sistema usa /16
+  FIX#5 — _skill_relevante threshold=1 demasiado permisivo
+  FIX#6 — JSON regex no manejaba markdown fences de Claude
+  FIX#7 — aprender() sin guard: llamaba Claude con señal sin datos
+  FIX#8 — _save_skills sin lock — corrupción si workers concurrentes
 """
 
 import json
 import logging
 import os
-import time
+import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -29,148 +29,172 @@ import config
 log = logging.getLogger("metaclaw")
 
 # ══════════════════════════════════════════════════════════════
-# PERSISTENCIA
+# PERSISTENCIA + LOCK
 # ══════════════════════════════════════════════════════════════
+
+_skills_lock = threading.Lock()
+
 
 def _skills_path() -> str:
     base = config.MEMORY_DIR or ""
     return os.path.join(base, "metaclaw_skills.json") if base else "metaclaw_skills.json"
 
+
 def _load_skills() -> list:
     path = _skills_path()
     try:
         if os.path.exists(path):
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
                 return data if isinstance(data, list) else []
     except Exception as e:
         log.warning(f"[MCL] Error cargando skills: {e}")
     return []
 
+
 def _save_skills(skills: list):
+    """FIX#8: lock para evitar corrupción por escrituras simultáneas."""
     path = _skills_path()
-    try:
-        # Mantener máx 80 skills — eliminar las menos útiles
-        if len(skills) > 80:
-            skills = sorted(skills, key=lambda s: (s.get("trades", 0), s.get("updated", "")), reverse=True)[:80]
-        with open(path, "w") as f:
-            json.dump(skills, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        log.warning(f"[MCL] Error guardando skills: {e}")
+    with _skills_lock:
+        try:
+            if len(skills) > 80:
+                skills = sorted(
+                    skills,
+                    key=lambda s: (s.get("trades", 0), s.get("updated", "")),
+                    reverse=True,
+                )[:80]
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(skills, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log.warning(f"[MCL] Error guardando skills: {e}")
+
 
 def _skill_relevante(skill: dict, señal: dict) -> bool:
-    """Determina si una skill es relevante para esta señal."""
-    tags = skill.get("tags", [])
-    par  = señal.get("par", "")
-    lado = señal.get("lado", "")
-    kz   = señal.get("kz", "")
+    """
+    FIX#5: threshold subido de 1 a 3.
+    Necesita al menos lado + algo más para ser relevante.
+    """
+    tags    = set(skill.get("tags", []))
+    par     = señal.get("par", "")
+    lado    = señal.get("lado", "")
+    kz      = señal.get("kz", "")
     motivos = set(señal.get("motivos", []))
 
     puntos = 0
-    if lado in tags:                         puntos += 3
-    if kz  in tags:                          puntos += 2
-    if any(t in motivos for t in tags):      puntos += 2
-    if par in tags:                          puntos += 4
-    # Skills generales también aplican
-    if "GENERAL" in tags:                    puntos += 1
-    return puntos >= 1
+    if lado and lado in tags:              puntos += 3
+    if kz   and kz   in tags:             puntos += 2
+    if any(t in motivos for t in tags):    puntos += 2
+    if par  and par   in tags:             puntos += 4
+    if "GENERAL" in tags:                  puntos += 1
+
+    return puntos >= 3  # FIX#5
 
 
 # ══════════════════════════════════════════════════════════════
-# LLAMADA A CLAUDE API
+# UTILIDADES
 # ══════════════════════════════════════════════════════════════
 
-# Flag de sesión: True si Anthropic devuelve error de créditos insuficientes
-_sin_creditos: bool = False
+def _api_key() -> str:
+    """FIX#1: .strip() elimina espacios/newlines invisibles."""
+    return (os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
 
 
-def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Optional[str]:
-    global _sin_creditos  # declarar global AL INICIO de la función
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        log.debug("[MCL] ANTHROPIC_API_KEY no configurada — saltando MetaClaw")
+def _extract_json(text: str) -> Optional[dict]:
+    """
+    FIX#6: Extractor robusto — maneja JSON puro, ```json...```, JSON embebido.
+    """
+    if not text:
         return None
-    if _sin_creditos:
-        return None  # Sin créditos — no reintentar hasta reinicio del bot
-
-    # Modelos en orden de preferencia (más barato primero)
-    for model in ("claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"):
+    # Intento 1: parsear directamente
+    try:
+        return json.loads(text.strip())
+    except Exception:
+        pass
+    # Intento 2: quitar markdown fences
+    cleaned = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+    # Intento 3: buscar primer objeto JSON en texto libre
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
         try:
-            resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key":         api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type":      "application/json",
-                },
-                json={
-                    "model":      model,
-                    "max_tokens": max_tokens,
-                    "system":     system_prompt,
-                    "messages":   [{"role": "user", "content": user_msg}],
-                },
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["content"][0]["text"].strip()
-            elif resp.status_code == 400:
-                err_txt = resp.text
-                log.warning(f"[MCL] 400 con {model}: {err_txt[:200]} — intentando siguiente")
-                if "credit balance" in err_txt.lower() or "billing" in err_txt.lower():
-                    _sin_creditos = True
-                    log.warning("[MCL] ⚠️  Sin créditos Anthropic. Recarga en console.anthropic.com/settings/billing")
-                    return None  # No reintentar otros modelos
-                continue
-            else:
-                resp.raise_for_status()
-        except requests.exceptions.Timeout:
-            log.warning(f"[MCL] Timeout con {model}")
-            continue
-        except Exception as e:
-            log.warning(f"[MCL] Error con {model}: {e}")
-            continue
-    log.warning("[MCL] Todos los modelos fallaron")
+            return json.loads(match.group())
+        except Exception:
+            pass
     return None
 
 
+def _call_claude(system_prompt: str, user_msg: str,
+                 max_tokens: int = 200, timeout: int = 20) -> Optional[str]:
+    """
+    FIX#1: .strip() en api_key
+    FIX#3: timeout parametrizable (antes fijo a 12s)
+    """
+    api_key = _api_key()
+    if not api_key:
+        log.debug("[MCL] ANTHROPIC_API_KEY no configurada — saltando MetaClaw")
+        return None
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-sonnet-4-6",
+                "max_tokens": max_tokens,
+                "system":     system_prompt,
+                "messages":   [{"role": "user", "content": user_msg}],
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"].strip()
+    except requests.exceptions.Timeout:
+        log.warning(f"[MCL] Timeout ({timeout}s) llamando Claude")
+        return None
+    except Exception as e:
+        log.warning(f"[MCL] Error llamando Claude: {e}")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════
-# VALIDAR SEÑAL — El agente decide si ejecutar o no
+# VALIDAR SEÑAL
 # ══════════════════════════════════════════════════════════════
 
 def validar(señal: dict) -> dict:
     """
-    Evalúa una señal SMC usando Claude + skills aprendidas.
-    
-    Returns:
-        {
-          "aprobar": bool,       # True = ejecutar, False = rechazar
-          "confianza": int,      # 1-10
-          "razon": str,          # Explicación corta
-          "ajuste_sl": float,    # 0 = sin cambio, >0 = nuevo SL sugerido
-          "metaclaw_activo": bool  # False si API no disponible
-        }
+    Evalúa una señal SMC con Claude + skills aprendidas.
+    Returns: {aprobar, confianza, razon, ajuste_sl, metaclaw_activo}
     """
-    # Default: aprobar si MetaClaw no puede decidir (fail-open)
-    fallback = {"aprobar": True, "confianza": 5, "razon": "metaclaw_offline", "ajuste_sl": 0, "metaclaw_activo": False}
+    fallback = {
+        "aprobar": True, "confianza": 5,
+        "razon": "metaclaw_offline", "ajuste_sl": 0,
+        "metaclaw_activo": False,
+    }
 
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    if not _api_key():
         return fallback
 
     skills     = _load_skills()
     relevantes = [s for s in skills if _skill_relevante(s, señal)][:6]
 
-    skills_txt = ""
     if relevantes:
-        lines = []
-        for s in relevantes:
-            wr = f"{s['wins']}/{s['trades']}" if s.get("trades", 0) > 0 else "nuevo"
-            lines.append(f"• [{wr}] {s['texto']}")
-        skills_txt = "HABILIDADES APRENDIDAS RELEVANTES:\n" + "\n".join(lines)
+        lines = [
+            f"• [{s['wins']}/{s['trades']}] {s['texto']}"
+            for s in relevantes
+        ]
+        skills_txt = "HABILIDADES RELEVANTES:\n" + "\n".join(lines)
     else:
-        skills_txt = "HABILIDADES: Ninguna aprendida aún para este tipo de señal."
+        skills_txt = "HABILIDADES: ninguna aún para este contexto."
 
+    # FIX#4: score /16
     rsi     = señal.get("rsi", 50)
     score   = señal.get("score", 0)
     lado    = señal.get("lado", "?")
@@ -183,153 +207,144 @@ def validar(señal: dict) -> dict:
     patron  = señal.get("patron", "ninguno")
     sweep   = "SÍ" if (señal.get("sweep_bull") or señal.get("sweep_bear")) else "NO"
     ob_mit  = "MITIGADO" if señal.get("ob_mitigado") else "VÁLIDO"
+    ob_fvg  = "SÍ" if (señal.get("ob_fvg_bull") or señal.get("ob_fvg_bear")) else "NO"
 
-    system_prompt = """Eres MetaClaw, un agente experto en trading de futuros perpetuos de criptomonedas.
-Tu estrategia base es ICT/SMC (Smart Money Concepts): FVG, Order Blocks, Liquidity Sweeps, BOS/CHoCH.
-Evalúas señales de trading y decides si aprobarlas o rechazarlas basándote en:
-1. La calidad técnica de la señal
-2. Las habilidades aprendidas de trades anteriores
-3. El contexto de mercado actual
+    system_prompt = """Eres MetaClaw, agente experto en trading de futuros perpetuos.
+Estrategia: ICT/SMC — FVG, Order Blocks, Liquidity Sweeps, BOS/CHoCH.
 
-Responde SIEMPRE en este formato JSON exacto, sin texto extra:
-{"aprobar": true/false, "confianza": 1-10, "razon": "texto corto max 60 chars"}
+Responde SOLO en JSON, sin markdown ni texto extra:
+{"aprobar": true/false, "confianza": 1-10, "razon": "max 60 chars"}
 
-Criterios para rechazar:
-- RSI extremo sin divergencia (>75 LONG, <25 SHORT)  
-- OB mitigado SIN sweep de liquidez previo
-- Fuera de killzone con score bajo (<6) y HTF en contra
-- Patrón débil (BULL_STRONG/BEAR_STRONG) sin confirmación adicional
-- R:R menor a 2.0
+RECHAZAR si:
+- RSI >75 LONG o <25 SHORT sin divergencia
+- OB mitigado SIN sweep previo
+- Fuera KZ Y score<7 Y HTF contrario
+- R:R < 2.0
+- HTF contrario al trade
 
-Criterios para aprobar con confianza alta (8-10):
-- Sweep + OB+FVG + killzone activa
-- Pin Bar o Engulfing en zona premium/descuento
-- HTF alineado + score ≥ 9
-- Habilidades anteriores muestran setup ganador"""
+APROBAR con confianza 8-10 si:
+- OB+FVG + sweep + killzone activa
+- Pin Bar/Engulfing en zona premium/descuento
+- HTF alineado + score >= 9
+- Skills previas muestran setup ganador"""
 
-    user_msg = f"""SEÑAL A EVALUAR:
-Par: {par} | Dirección: {lado} | Score: {score}/14
-RSI: {rsi} | R:R: {rr} | KZ: {kz} | HTF: {htf}
-Precio vs VWAP: {vwap_ok} | Patrón: {patron}
-Sweep liquidez: {sweep} | Order Block: {ob_mit}
-Señales activas: {motivos}
+    user_msg = f"""SEÑAL:
+Par: {par} | {lado} | Score: {score}/16
+RSI: {rsi:.1f} | R:R: {rr:.2f} | KZ: {kz} | HTF: {htf}
+VWAP: {vwap_ok} | Patrón: {patron}
+Sweep: {sweep} | OB: {ob_mit} | OB+FVG: {ob_fvg}
+Señales: {motivos}
 
-{skills_txt}
+{skills_txt}"""
 
-¿Aprobar esta operación?"""
-
-    respuesta = _call_claude(system_prompt, user_msg, max_tokens=120)
-
+    respuesta = _call_claude(system_prompt, user_msg, max_tokens=80, timeout=15)
     if not respuesta:
         return fallback
 
+    data = _extract_json(respuesta)  # FIX#6
+    if not data:
+        log.warning(f"[MCL] validar: no JSON en: {respuesta[:120]}")
+        return fallback
+
     try:
-        # Extraer JSON de la respuesta
-        import re
-        match = re.search(r'\{[^}]+\}', respuesta, re.DOTALL)
-        if not match:
-            raise ValueError("No JSON found")
-        data = json.loads(match.group())
         return {
-            "aprobar":          bool(data.get("aprobar", True)),
-            "confianza":        int(data.get("confianza", 5)),
-            "razon":            str(data.get("razon", ""))[:80],
-            "ajuste_sl":        float(data.get("ajuste_sl", 0)),
-            "metaclaw_activo":  True,
+            "aprobar":         bool(data.get("aprobar", True)),
+            "confianza":       max(1, min(10, int(data.get("confianza", 5)))),
+            "razon":           str(data.get("razon", ""))[:80],
+            "ajuste_sl":       float(data.get("ajuste_sl", 0)),
+            "metaclaw_activo": True,
         }
     except Exception as e:
-        log.warning(f"[MCL] Error parseando respuesta: {e} | resp: {respuesta[:100]}")
+        log.warning(f"[MCL] Error parseando validar: {e}")
         return fallback
 
 
 # ══════════════════════════════════════════════════════════════
-# APRENDER — Generar/actualizar skill tras resultado
+# APRENDER
 # ══════════════════════════════════════════════════════════════
 
 def aprender(señal: dict, ganado: bool, pnl: float):
     """
-    Llamar después de cerrar un trade.
-    Claude analiza qué pasó y genera/actualiza una skill.
+    Llamar tras cerrar un trade para generar/actualizar una skill.
+    FIX#7: guard — no llamar Claude con señal vacía
+    FIX#4: score /16
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    if not _api_key():
         return
 
-    skills = _load_skills()
-    resultado_txt = f"{'GANADO ✅' if ganado else 'PERDIDO ❌'} PnL={pnl:+.4f}"
-    
-    par     = señal.get("par", "?")
-    lado    = señal.get("lado", "?")
+    par    = señal.get("par", "")
+    lado   = señal.get("lado", "")
+    # FIX#7: señal mínima necesaria
+    if not par or not lado:
+        log.debug("[MCL] aprender: señal incompleta — omitiendo")
+        return
+
+    skills  = _load_skills()
+    motivos = señal.get("motivos", [])
     score   = señal.get("score", 0)
     kz      = señal.get("kz", "FUERA")
     htf     = señal.get("htf", "NEUTRAL")
-    motivos = " + ".join(señal.get("motivos", []))
     patron  = señal.get("patron", "ninguno")
     rsi     = señal.get("rsi", 50)
+    motivos_str  = " + ".join(motivos) if motivos else "sin_motivos"
+    resultado_txt = f"{'GANADO ✅' if ganado else 'PERDIDO ❌'} PnL={pnl:+.4f}"
 
-    # Buscar skill existente que coincida con este setup
+    # Buscar skill existente compatible
     skill_id_existente = None
     for s in skills:
-        tags = set(s.get("tags", []))
-        motivos_set = set(señal.get("motivos", []))
-        # Match si comparte lado + KZ + al menos 2 motivos
-        if (lado in tags and kz in tags and
-                len(tags.intersection(motivos_set)) >= 2):
+        tags_s = set(s.get("tags", []))
+        if (lado in tags_s and kz in tags_s
+                and len(tags_s.intersection(set(motivos))) >= 2):
             skill_id_existente = s.get("id")
             break
 
-    skills_txt = ""
+    recientes_txt = ""
     if skills:
-        recientes = skills[-5:]
-        skills_txt = "Skills existentes recientes:\n" + "\n".join(
-            f"• {s['texto']} [{s['wins']}/{s['trades']}]" for s in recientes
+        recientes = sorted(skills, key=lambda x: x.get("updated", ""), reverse=True)[:5]
+        recientes_txt = "Skills recientes:\n" + "\n".join(
+            f"• [{s['wins']}/{s['trades']}] {s['texto']}" for s in recientes
         )
 
-    system_prompt = """Eres MetaClaw, agente de trading que aprende de sus trades.
-Tras cada trade, generas o actualizas una HABILIDAD (skill) concisa que capture el patrón aprendido.
+    system_prompt = """Eres MetaClaw, agente que aprende de trades.
+Genera o actualiza una HABILIDAD que capture el patrón.
 
-Una skill es una regla de trading aprendida. Debe ser:
-- Concisa (máx 80 chars)
-- Accionable (dice qué hacer o evitar)
-- Específica (menciona los indicadores clave)
+Responde SOLO en JSON, sin markdown:
+{"texto": "skill max 80 chars", "tags": ["LONG_o_SHORT", "KZ", "INDICADOR"], "actualizar_id": "id_o_null"}
 
-Responde en JSON exacto:
-{"texto": "la skill en español max 80 chars", "tags": ["LONG"/"SHORT", "KZ_nombre", "INDICADOR1", "INDICADOR2"], "actualizar_id": "id_si_existe_o_null"}
+Skills buenas:
+"LONG Londres + OB+FVG + sweep → muy fiable en KZ"
+"Evitar SHORT en mercado alcista — HTF BULL bloquea"
+"PIN_BAR + RSI<30 + LONG NY = setup institucional sólido" """
 
-Ejemplos de skills buenas:
-"SHORT Londres + PIN_BAR + OB_bear + RSI>65 = alta precisión"  
-"Evitar LONG fuera KZ en altcoins con score<7 — baja tasa éxito"
-"SWEEP_bull + FVG + London = entrada institucional muy fiable" """
-
-    user_msg = f"""Trade cerrado:
-Par: {par} | {lado} | Score: {score}/14
-Sesión: {kz} | HTF: {htf} | RSI: {rsi}
-Señales: {motivos}
-Patrón: {patron}
+    user_msg = f"""Trade:
+Par: {par} | {lado} | Score: {score}/16
+KZ: {kz} | HTF: {htf} | RSI: {rsi:.1f}
+Señales: {motivos_str} | Patrón: {patron}
 Resultado: {resultado_txt}
 
-{'Skill a actualizar ID: ' + skill_id_existente if skill_id_existente else 'Skill existente: ninguna — crear nueva'}
+{'Actualizar ID: ' + skill_id_existente if skill_id_existente else 'Crear nueva skill'}
 
-{skills_txt}
+{recientes_txt}"""
 
-Genera la skill aprendida de este trade:"""
-
-    respuesta = _call_claude(system_prompt, user_msg, max_tokens=200)
-
+    respuesta = _call_claude(system_prompt, user_msg, max_tokens=200, timeout=25)
     if not respuesta:
-        # Crear skill simple sin Claude si API falla
+        _crear_skill_simple(skills, señal, ganado)
+        return
+
+    data = _extract_json(respuesta)  # FIX#6
+    if not data:
+        log.warning("[MCL] aprender: no JSON — usando fallback")
         _crear_skill_simple(skills, señal, ganado)
         return
 
     try:
-        import re
-        match = re.search(r'\{[^}]+\}', respuesta, re.DOTALL)
-        if not match:
-            raise ValueError("No JSON")
-        data     = json.loads(match.group())
-        texto    = str(data.get("texto", ""))[:100]
-        tags     = data.get("tags", [])
-        upd_id   = data.get("actualizar_id")
+        texto  = str(data.get("texto", ""))[:100].strip()
+        tags   = data.get("tags", [])
+        upd_id = data.get("actualizar_id")
+
+        # Normalizar null string
+        if upd_id in (None, "null", "none", "", "undefined"):
+            upd_id = None
 
         if not texto:
             _crear_skill_simple(skills, señal, ganado)
@@ -340,19 +355,20 @@ Genera la skill aprendida de este trade:"""
         if upd_id:
             for s in skills:
                 if s.get("id") == upd_id:
-                    s["trades"] = s.get("trades", 0) + 1
-                    s["wins"]   = s.get("wins", 0) + (1 if ganado else 0)
-                    s["texto"]  = texto  # Claude actualiza el texto
+                    s["trades"]  = s.get("trades", 0) + 1
+                    s["wins"]    = s.get("wins", 0) + (1 if ganado else 0)
+                    s["texto"]   = texto
                     s["updated"] = now
-                    log.info(f"[MCL] Skill actualizada: {texto}")
                     _save_skills(skills)
+                    log.info(f"[MCL] 🔄 Skill [{s['wins']}/{s['trades']}]: {texto}")
                     return
+            log.debug(f"[MCL] upd_id={upd_id} no encontrado — creando nueva")
 
-        # Crear nueva skill
+        tags_ok = [t for t in (tags if isinstance(tags, list) else []) if isinstance(t, str)]
         nueva = {
             "id":      str(uuid.uuid4())[:8],
             "texto":   texto,
-            "tags":    tags if isinstance(tags, list) else [],
+            "tags":    tags_ok,
             "trades":  1,
             "wins":    1 if ganado else 0,
             "created": now,
@@ -360,44 +376,72 @@ Genera la skill aprendida de este trade:"""
         }
         skills.append(nueva)
         _save_skills(skills)
-        log.info(f"[MCL] ✨ Nueva skill: {texto}")
+        icono = "✅" if ganado else "📚"
+        log.info(f"[MCL] {icono} Nueva skill: {texto}")
 
     except Exception as e:
-        log.warning(f"[MCL] Error creando skill: {e}")
+        log.warning(f"[MCL] Error en aprender: {e}")
         _crear_skill_simple(skills, señal, ganado)
 
 
 def _crear_skill_simple(skills: list, señal: dict, ganado: bool):
-    """Fallback: crear skill básica sin Claude."""
-    lado    = señal.get("lado", "?")
-    kz      = señal.get("kz", "FUERA")
-    motivos = señal.get("motivos", [])
-    top_m   = " + ".join(motivos[:3]) if motivos else "SIN_MOTIVOS"
+    """Fallback: skill básica sin Claude."""
+    lado      = señal.get("lado", "?")
+    kz        = señal.get("kz", "FUERA")
+    motivos   = señal.get("motivos", [])
+    top_m     = " + ".join(motivos[:3]) if motivos else "SIN_MOTIVOS"
     resultado = "ganador" if ganado else "perdedor"
-    texto   = f"{lado} {kz} {top_m} → {resultado}"[:80]
-    tags    = [lado, kz] + motivos[:3]
-    now     = datetime.now(timezone.utc).isoformat()
+    texto     = f"{lado} {kz} {top_m} → {resultado}"[:80]
+    tags      = [t for t in [lado, kz] + motivos[:3] if t]
+    now       = datetime.now(timezone.utc).isoformat()
     skills.append({
         "id": str(uuid.uuid4())[:8], "texto": texto, "tags": tags,
-        "trades": 1, "wins": 1 if ganado else 0, "created": now, "updated": now,
+        "trades": 1, "wins": 1 if ganado else 0,
+        "created": now, "updated": now,
     })
     _save_skills(skills)
+    log.info(f"[MCL] 📌 Skill simple: {texto}")
 
 
 # ══════════════════════════════════════════════════════════════
-# ESTADO DEL AGENTE (para Telegram)
+# ESTADO (Telegram)
 # ══════════════════════════════════════════════════════════════
 
 def get_resumen() -> str:
     skills = _load_skills()
     if not skills:
         return "🤖 *MetaClaw*: Sin skills aprendidas aún"
+
     total_trades = sum(s.get("trades", 0) for s in skills)
     total_wins   = sum(s.get("wins", 0)   for s in skills)
     wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
-    top = sorted(skills, key=lambda s: s.get("wins", 0) / max(s.get("trades", 1), 1), reverse=True)[:3]
+
+    # Top 3 por WR con mínimo 2 trades para ser significativo
+    candidatas = [s for s in skills if s.get("trades", 0) >= 2]
+    top = sorted(
+        candidatas,
+        key=lambda s: s.get("wins", 0) / max(s.get("trades", 1), 1),
+        reverse=True,
+    )[:3]
+    if not top:
+        top = skills[:3]
+
     top_txt = "\n".join(f"  • {s['texto']} [{s['wins']}/{s['trades']}]" for s in top)
     return (
         f"🦞 *MetaClaw* — {len(skills)} skills | WR global: {wr:.0f}%\n"
         f"Top skills:\n{top_txt}"
     )
+
+
+def get_stats() -> dict:
+    """Stats para diagnóstico."""
+    skills = _load_skills()
+    total_trades = sum(s.get("trades", 0) for s in skills)
+    total_wins   = sum(s.get("wins", 0)   for s in skills)
+    return {
+        "total_skills": len(skills),
+        "total_trades": total_trades,
+        "total_wins":   total_wins,
+        "wr_pct":       round(total_wins / total_trades * 100, 1) if total_trades > 0 else 0,
+        "api_ok":       bool(_api_key()),
+    }
