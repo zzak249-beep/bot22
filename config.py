@@ -53,7 +53,7 @@ TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.8)
 TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)
 MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 
-SCORE_MIN    = _int("SCORE_MIN",       5)
+SCORE_MIN    = _int("SCORE_MIN",       6)   # FIX v5.4: default 6 — Railway puede sobrescribir con SCORE_MIN=7/8
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
