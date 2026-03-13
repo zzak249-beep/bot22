@@ -86,24 +86,10 @@ def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Op
         log.debug("[MCL] ANTHROPIC_API_KEY no configurada — saltando MetaClaw")
         return None
 
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": max_tokens,
-                "messages":   [{"role": "user", "content": f"{system_prompt}\n\n{user_msg}"}],
-            },
-            timeout=15,
-        )
-        if resp.status_code == 400:
-            # Fallback: intentar sin system prompt separado (algunos modelos lo requieren en messages)
-            log.warning(f"[MCL] 400 con model haiku — reintentando con sonnet")
+    # FIX v5.2: Usar siempre el formato correcto con system separado
+    # El modelo haiku-4-5 requiere system como campo propio, no en messages
+    for model in ("claude-haiku-4-5-20251001", "claude-sonnet-4-6"):
+        try:
             resp = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -112,19 +98,29 @@ def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Op
                     "content-type":      "application/json",
                 },
                 json={
-                    "model":      "claude-sonnet-4-6",
+                    "model":      model,
                     "max_tokens": max_tokens,
                     "system":     system_prompt,
                     "messages":   [{"role": "user", "content": user_msg}],
                 },
                 timeout=15,
             )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["content"][0]["text"].strip()
-    except Exception as e:
-        log.warning(f"[MCL] Error llamando Claude: {e}")
-        return None
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["content"][0]["text"].strip()
+            elif resp.status_code == 400:
+                log.warning(f"[MCL] 400 con {model}: {resp.text[:200]} — intentando siguiente")
+                continue
+            else:
+                resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            log.warning(f"[MCL] Timeout con {model}")
+            continue
+        except Exception as e:
+            log.warning(f"[MCL] Error con {model}: {e}")
+            continue
+    log.warning("[MCL] Todos los modelos fallaron")
+    return None
 
 
 # ══════════════════════════════════════════════════════════════
