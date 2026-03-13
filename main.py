@@ -814,7 +814,17 @@ def main():
                         log.info(f"[SKIP] {s['par']} — {resultado}")
                         continue
 
-                    # Para cualquier otro resultado: notificar (ejecutado o bloqueado con razón)
+                    # ── FILTRO TELEGRAM: solo buenas señales ──────────────────
+                    # Ejecutado siempre notifica
+                    # Bloqueado solo si score >= SCORE_NOTIF_MIN (no balance ni correlación)
+                    _score_notif_min = getattr(config, "SCORE_NOTIF_MIN", 7)
+                    es_bloqueo_tecnico = resultado and resultado.startswith("bloq:") and any(
+                        x in resultado for x in ("balance", "correlacion", "MAX_POSICIONES", "anti-hedge")
+                    )
+                    if resultado != "ok" and (s["score"] < _score_notif_min or es_bloqueo_tecnico):
+                        log.info(f"[NOTIF-SKIP] {s['par']} score={s['score']} resultado={resultado}")
+                        continue
+
                     _notif_entrada(s, memoria.get_trade_amount(), resultado)
                     if resultado == "ok":
                         balance = exchange.get_balance()
