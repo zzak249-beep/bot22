@@ -33,8 +33,9 @@ def _ts() -> int:
 
 
 def _sign(params: dict) -> str:
-    # BingX firma: ordenar alfabéticamente y HMAC-SHA256
-    query = urlencode(sorted(params.items()))
+    # BingX firma: concatenar RAW sin urlencode ni sort — igual que SDK oficial BingX
+    # urlencode() encodifica {} y : en stopLoss/takeProfit JSON → firma incorrecta
+    query = "&".join(f"{k}={v}" for k, v in params.items())
     return hmac.new(
         config.BINGX_SECRET_KEY.encode("utf-8"),
         query.encode("utf-8"),
@@ -224,20 +225,24 @@ def _try_balance_endpoint(path: str) -> float:
                             except Exception:
                                 pass
 
-        # Caso 4: d.balance es lista
+        # Caso 4: d.balance es lista (formato v3)
         if isinstance(d, dict):
             for key_outer in ("balance", "assets", "data"):
                 inner = d.get(key_outer)
                 if isinstance(inner, list):
                     for item in inner:
-                        asset = str(item.get("asset", "")).upper()
+                        asset = str(item.get("asset", item.get("currency", ""))).upper()
                         if asset in ("USDT", ""):
-                            v = item.get("availableMargin", item.get("balance"))
-                            if v is not None:
-                                try:
-                                    return float(v)
-                                except Exception:
-                                    pass
+                            for k in ("availableMargin", "freeMargin", "available", "balance"):
+                                v = item.get(k)
+                                if v is not None:
+                                    try:
+                                        f = float(v)
+                                        if f >= 0:
+                                            log.info(f"[BAL] {path} v-list campo '{k}' = {f}")
+                                            return f
+                                    except Exception:
+                                        pass
 
         log.warning(f"[BAL] {path} no se encontró campo de balance en: {raw}")
         return -1.0
@@ -251,11 +256,11 @@ def get_balance() -> float:
     if config.MODO_DEMO:
         return 200.0
 
-    # Probar todos los endpoints conocidos de BingX futuros perpetuos
+    # Probar endpoints conocidos — v3 primero (formato lista), luego v2 (dict)
     endpoints = [
-        "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
-        "/openApi/account/v1/balance",
+        "/openApi/swap/v2/user/balance",
+        "/openApi/swap/v2/user/margin",
     ]
 
     for ep in endpoints:
@@ -470,9 +475,8 @@ def diagnostico_balance():
     log.info("=" * 60)
     log.info("[DIAG-BAL] Iniciando diagnóstico de balance BingX...")
     endpoints = [
-        "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
-        "/openApi/account/v1/balance",
+        "/openApi/swap/v2/user/balance",
         "/openApi/swap/v2/user/margin",
     ]
     for ep in endpoints:
