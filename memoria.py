@@ -17,6 +17,15 @@ _DATA_PATH = (
     else "bot_memoria.json"
 )
 
+# ── FIX: crear el directorio ANTES de intentar leer/escribir ──────────────
+if config.MEMORY_DIR:
+    try:
+        import pathlib
+        pathlib.Path(config.MEMORY_DIR).mkdir(parents=True, exist_ok=True)
+    except Exception as _e:
+        log.warning(f"[MEM] No se pudo crear directorio {config.MEMORY_DIR}: {_e}")
+# ─────────────────────────────────────────────────────────────────────────
+
 _DEFAULT: dict = {
     "trades":       [],
     "compounding":  {
