@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from typing import Optional
 from urllib.parse import urlencode
@@ -32,30 +33,48 @@ def _ts() -> int:
     return int(time.time() * 1000) + _time_offset
 
 
-def _sign(params: dict) -> str:
-    # BingX firma: concatenar RAW sin urlencode ni sort — igual que SDK oficial BingX
-    # urlencode() encodifica {} y : en stopLoss/takeProfit JSON → firma incorrecta
-    query = "&".join(f"{k}={v}" for k, v in params.items())
+def _api_key() -> str:
+    return (os.getenv("BINGX_API_KEY", config.BINGX_API_KEY) or "").strip()
+
+def _secret_key() -> str:
+    return (os.getenv("BINGX_SECRET_KEY", config.BINGX_SECRET_KEY) or "").strip()
+
+
+def _sign(query_string: str) -> str:
+    """Firma el query string exacto (ya construido) con HMAC-SHA256."""
+    secret = _secret_key()
     return hmac.new(
-        config.BINGX_SECRET_KEY.encode("utf-8"),
-        query.encode("utf-8"),
+        secret.encode("utf-8"),
+        query_string.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
 
+def _build_query(params: dict) -> str:
+    """
+    Construye query string SIN urlencode de valores —
+    BingX firma y envía los valores raw (sin %xx encoding).
+    Los parámetros se ordenan alfabéticamente por clave.
+    """
+    return "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+
 def _headers() -> dict:
     return {
-        "X-BX-APIKEY": config.BINGX_API_KEY,
+        "X-BX-APIKEY": _api_key(),
         "Content-Type": "application/json",
     }
 
 
 def _get(path: str, params: Optional[dict] = None) -> dict:
+    """GET firmado — construye URL manualmente para que firma == URL enviada."""
     p = dict(params or {})
     p["timestamp"] = _ts()
-    p["signature"] = _sign(p)
+    query = _build_query(p)
+    sig   = _sign(query)
+    url   = f"{BASE_URL}{path}?{query}&signature={sig}"
     try:
-        r = requests.get(f"{BASE_URL}{path}", params=p, headers=_headers(), timeout=12)
+        r = requests.get(url, headers=_headers(), timeout=12)
         return r.json()
     except Exception as e:
         log.error(f"GET {path}: {e}")
@@ -63,11 +82,14 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
 
 
 def _post(path: str, params: Optional[dict] = None) -> dict:
+    """POST firmado — query en URL (BingX perpetual swap requiere params en query string)."""
     p = dict(params or {})
     p["timestamp"] = _ts()
-    p["signature"] = _sign(p)
+    query = _build_query(p)
+    sig   = _sign(query)
+    url   = f"{BASE_URL}{path}?{query}&signature={sig}"
     try:
-        r = requests.post(f"{BASE_URL}{path}", params=p, headers=_headers(), timeout=12)
+        r = requests.post(url, headers=_headers(), timeout=12)
         return r.json()
     except Exception as e:
         log.error(f"POST {path}: {e}")
@@ -469,11 +491,27 @@ def cerrar_posicion(par: str, qty: float, lado: str) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════
 
 def diagnostico_balance():
-    """Llama a todos los endpoints y loguea la respuesta RAW completa.
-    Llamar una vez al arrancar para identificar qué endpoint funciona."""
+    """Diagnóstico completo: muestra query string firmado, headers, y respuestas RAW."""
     import json as _json
     log.info("=" * 60)
     log.info("[DIAG-BAL] Iniciando diagnóstico de balance BingX...")
+
+    # Verificar que las API keys no estén vacías o con espacios
+    ak = _api_key()
+    sk = _secret_key()
+    log.info(f"[DIAG] API_KEY len={len(ak)} primeros4={ak[:4] if ak else 'VACÍO'}")
+    log.info(f"[DIAG] SECRET len={len(sk)} primeros4={sk[:4] if sk else 'VACÍO'}")
+    if not ak or not sk:
+        log.error("[DIAG] ❌ API KEY o SECRET VACÍOS — revisar variables Railway")
+        return
+
+    # Mostrar query string exacto que se firma
+    p = {"timestamp": _ts()}
+    q = _build_query(p)
+    sig = _sign(q)
+    log.info(f"[DIAG] Query firmado: '{q}'")
+    log.info(f"[DIAG] Firma: {sig[:16]}...")
+
     endpoints = [
         "/openApi/swap/v3/user/balance",
         "/openApi/swap/v2/user/balance",
