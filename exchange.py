@@ -333,6 +333,10 @@ def get_posiciones_abiertas() -> list:
 # CANTIDAD Y LEVERAGE
 # ═══════════════════════════════════════════════════════
 
+# Límite de notional por par (qty × precio). BingX varía por par y leverage.
+# Si BingX rechaza con "maximum position value", se reduce qty automáticamente.
+_MAX_NOTIONAL: dict = {}   # par → max_notional_usdt (aprendido dinámicamente)
+
 def calcular_cantidad(par: str, usdt: float, precio: float) -> float:
     if precio <= 0:
         return 0.0
@@ -342,10 +346,40 @@ def calcular_cantidad(par: str, usdt: float, precio: float) -> float:
         factor  = 10 ** prec
         qty     = float(int(raw_qty * factor)) / factor
         min_q   = _MIN_QTY.get(par, 0.0001)
-        return qty if qty >= min_q else 0.0
+        if qty < min_q:
+            return 0.0
+
+        # Respetar límite de notional conocido para este par
+        max_notional = _MAX_NOTIONAL.get(par, 0)
+        if max_notional > 0:
+            # notional real = qty × precio (sin leverage, es el valor de la posición)
+            notional = qty * precio
+            if notional > max_notional * 0.90:  # 10% de margen
+                qty_limitada = float(int((max_notional * 0.88 / precio) * factor)) / factor
+                if qty_limitada >= min_q:
+                    log.info(f"[QTY] {par} notional limitado a ${max_notional:.0f} → qty={qty_limitada}")
+                    return qty_limitada
+                return 0.0
+
+        return qty
     except Exception as e:
         log.error(f"calcular_cantidad {par}: {e}")
         return 0.0
+
+
+def registrar_max_notional(par: str, max_usdt: float):
+    """Registrar límite aprendido de error de BingX."""
+    _MAX_NOTIONAL[par] = max_usdt
+    log.info(f"[QTY] {par} límite notional aprendido: ${max_usdt:.0f}")
+
+
+def _detectar_limite_notional(par: str, err_msg: str):
+    """Detecta el error 'maximum position value is X USDT' y lo aprende."""
+    import re
+    m = re.search(r'maximum position value for this leverage is (\d+(?:\.\d+)?)\s*USDT', err_msg, re.I)
+    if m:
+        limite = float(m.group(1))
+        registrar_max_notional(par, limite)
 
 
 def _set_leverage(par: str, lado: str):
@@ -390,11 +424,15 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         if data.get("code", -1) != 0:
             err = data.get("msg", str(data))
             log.warning(f"abrir_long {par}: {err}")
+            _detectar_limite_notional(par, err)
             # Retry sin SL/TP
             params.pop("stopLoss", None); params.pop("takeProfit", None)
             data = _post("/openApi/swap/v2/trade/order", params)
             if data.get("code", -1) != 0:
-                return {"error": data.get("msg", str(data))}
+                err2 = data.get("msg", str(data))
+                _detectar_limite_notional(par, err2)
+                log.error(f"[API-ERR] {par}: {err2}")
+                return {"error": err2}
             _colocar_sl_tp_separados(par, sl, tp, "LONG", qty)
 
         order = data.get("data", {}).get("order", {})
@@ -436,6 +474,7 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         if data.get("code", -1) != 0:
             err = data.get("msg", str(data))
             log.warning(f"abrir_short {par}: {err}")
+            _detectar_limite_notional(par, err)
             params.pop("stopLoss", None); params.pop("takeProfit", None)
             data = _post("/openApi/swap/v2/trade/order", params)
             if data.get("code", -1) != 0:
