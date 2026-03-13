@@ -18,7 +18,8 @@ def _bool(var, default):
     return raw.strip().lower().split()[0] in ("true", "1", "yes")
 
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_SECRET_KEY = (os.getenv("BINGX_SECRET_KEY", "")
+                    or os.getenv("BINGX_API_SECRET", ""))  # Railway usa BINGX_API_SECRET
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -53,7 +54,6 @@ TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)
 MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 
 SCORE_MIN    = _int("SCORE_MIN",       5)
-SCORE_NOTIF_MIN = _int("SCORE_NOTIF_MIN", 7)   # score mínimo para notificar en Telegram
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
