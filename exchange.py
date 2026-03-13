@@ -197,12 +197,15 @@ def get_candles(par: str, tf: str, limit: int = 200) -> list:
 # ═══════════════════════════════════════════════════════
 
 def _try_balance_endpoint(path: str) -> float:
-    """Intenta un endpoint de balance y loguea la respuesta completa."""
+    """
+    Intenta un endpoint de balance — cubre TODOS los formatos de BingX.
+    Loguea la respuesta RAW completa para diagnóstico.
+    """
     try:
         data = _get(path)
         code = data.get("code", -1)
         msg  = data.get("msg", "")
-        raw  = json.dumps(data)[:400]
+        raw  = json.dumps(data)[:600]
         log.info(f"[BAL-RAW] {path} code={code} msg={msg} → {raw}")
 
         if code != 0:
@@ -210,56 +213,80 @@ def _try_balance_endpoint(path: str) -> float:
 
         d = data.get("data", {})
 
-        # Caso 1: data.balance es dict
-        bal = d.get("balance")
-        if isinstance(bal, dict):
-            for k in ("availableMargin", "freeMargin", "available", "crossWalletBalance",
-                      "crossUnPnl", "balance", "equity", "maxWithdrawAmount"):
-                v = bal.get(k)
+        # ── Campos candidatos en orden de prioridad ──────────
+        CAMPOS = ("availableMargin", "available", "freeMargin",
+                  "crossWalletBalance", "maxWithdrawAmount",
+                  "walletBalance", "equity", "balance")
+
+        def _extraer(obj) -> float:
+            """Extrae el primer valor numérico positivo de un dict."""
+            if not isinstance(obj, dict):
+                return -1.0
+            for k in CAMPOS:
+                v = obj.get(k)
                 if v is not None:
                     try:
                         f = float(v)
-                        log.info(f"[BAL] {path} campo '{k}' = {f}")
                         if f >= 0:
+                            log.info(f"[BAL] campo '{k}' = {f}")
                             return f
                     except Exception:
                         pass
+            return -1.0
 
-        # Caso 2: data es dict directo
-        if isinstance(d, dict) and "availableMargin" in d:
-            return float(d["availableMargin"])
+        # Caso A: data es dict directo con campos de balance
+        if isinstance(d, dict):
+            r = _extraer(d)
+            if r >= 0:
+                return r
 
-        # Caso 3: data es lista
+            # Caso B: data.balance es dict  {"balance": {"availableMargin": "14.24"}}
+            inner = d.get("balance")
+            if isinstance(inner, dict):
+                r = _extraer(inner)
+                if r >= 0:
+                    return r
+
+            # Caso C: data.balance es string directo  {"balance": "14.24"}
+            if inner is not None and not isinstance(inner, dict):
+                try:
+                    f = float(inner)
+                    if f >= 0:
+                        log.info(f"[BAL] data.balance string = {f}")
+                        return f
+                except Exception:
+                    pass
+
+            # Caso D: data contiene lista en "balance", "assets" o "data"
+            for key_outer in ("balance", "assets", "data"):
+                lista = d.get(key_outer)
+                if isinstance(lista, list):
+                    for item in lista:
+                        asset = str(item.get("asset",
+                                    item.get("currency",
+                                    item.get("coin", "")))).upper()
+                        if asset in ("USDT", ""):
+                            r = _extraer(item)
+                            if r >= 0:
+                                return r
+
+        # Caso E: data es lista directamente  [{"asset":"USDT","availableMargin":"14.24"}]
         if isinstance(d, list):
             for item in d:
-                asset = str(item.get("asset", item.get("currency", ""))).upper()
+                asset = str(item.get("asset",
+                            item.get("currency",
+                            item.get("coin", "")))).upper()
                 if asset in ("USDT", ""):
-                    for k in ("availableMargin", "freeMargin", "available", "balance"):
-                        v = item.get(k)
-                        if v is not None:
-                            try:
-                                f = float(v)
-                                if f >= 0:
-                                    return f
-                            except Exception:
-                                pass
+                    r = _extraer(item)
+                    if r >= 0:
+                        return r
+            # Si no hay asset USDT, probar el primer elemento
+            if d:
+                r = _extraer(d[0])
+                if r >= 0:
+                    return r
 
-        # Caso 4: d.balance es lista
-        if isinstance(d, dict):
-            for key_outer in ("balance", "assets", "data"):
-                inner = d.get(key_outer)
-                if isinstance(inner, list):
-                    for item in inner:
-                        asset = str(item.get("asset", "")).upper()
-                        if asset in ("USDT", ""):
-                            v = item.get("availableMargin", item.get("balance"))
-                            if v is not None:
-                                try:
-                                    return float(v)
-                                except Exception:
-                                    pass
-
-        log.warning(f"[BAL] {path} no se encontró campo de balance en: {raw}")
+        log.warning(f"[BAL] {path} — ningún caso coincidió. RAW: {raw}")
         return -1.0
 
     except Exception as e:
@@ -276,15 +303,19 @@ def get_balance() -> float:
         "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
         "/openApi/account/v1/balance",
+        "/openApi/swap/v2/user/margin",
     ]
 
     for ep in endpoints:
         bal = _try_balance_endpoint(ep)
-        if bal >= 0:
-            log.info(f"[BAL] ✅ Balance: ${bal:.2f} desde {ep}")
+        if bal > 0:
+            log.info(f"[BAL] ✅ Balance: ${bal:.2f} USDT desde {ep}")
             return bal
+        elif bal == 0:
+            # bal=0 puede ser real (cuenta vacía) — anotar pero continuar probando
+            log.info(f"[BAL] {ep} devolvió 0 — probando siguiente endpoint")
 
-    log.warning("[BAL] Todos los endpoints fallaron — retornando 0")
+    log.warning("[BAL] ⚠️  Todos los endpoints retornaron 0 o error — balance=0")
     return 0.0
 
 
