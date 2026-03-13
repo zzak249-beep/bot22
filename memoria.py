@@ -205,18 +205,26 @@ def get_top_pares(n: int = 10) -> list:
 
 
 def ajustar_score(par: str, score: int, kz: str = "", motivos: list = None) -> int:
-    """Ajusta score ±1 según historial del par."""
+    """Ajusta score ±2 según historial real del par (WR + PnL)."""
     stats = _data["pares_stats"].get(par, {})
     trades = stats.get("trades", 0)
     wins   = stats.get("wins", 0)
+    pnl    = stats.get("pnl_total", 0.0)
     if trades < 3:
         return score
     wr = wins / trades
-    if wr >= 0.70:
-        return score + 1
-    if wr <= 0.30:
-        return max(score - 1, 0)
-    return score
+    ajuste = 0
+    # WR alto y PnL positivo = par ganador → boost
+    if wr >= 0.65 and pnl > 0:
+        ajuste = +2
+    elif wr >= 0.55 and pnl > 0:
+        ajuste = +1
+    # WR bajo o PnL negativo = par perdedor → penalizar
+    elif wr <= 0.30 or (trades >= 5 and pnl < -5.0):
+        ajuste = -2
+    elif wr <= 0.40:
+        ajuste = -1
+    return max(score + ajuste, 0)
 
 
 # ═══════════════════════════════════════════════════════
