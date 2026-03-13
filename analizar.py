@@ -1063,36 +1063,66 @@ def analizar_par(par: str):
                 )
             return None
 
-        # ── SL/TP dinámico basado en estructura ──
+        # ── SL/TP dinámico — v5.1 (score-adaptive + swing targets) ──
         atr_sl = atr7 if atr7 > 0 else atr
         # SL mínimo garantizado: 1.2x ATR para evitar hits por ruido
         sl_min_dist = atr_sl * max(config.SL_ATR_MULT, 1.2)
+
+        # ── TP adaptativo según score (FIX v5.1) ──────────────────
+        # Alta confluencia = más recorrido permitido al trade
+        if score >= 14:
+            tp_mult  = max(config.TP_ATR_MULT, 3.5)   # Score 14-16 → 3.5x
+            tp2_mult = max(config.TP2_ATR_MULT, 5.0)
+        elif score >= 10:
+            tp_mult  = max(config.TP_ATR_MULT, 3.0)   # Score 10-13 → 3.0x
+            tp2_mult = max(config.TP2_ATR_MULT, 4.5)
+        else:
+            tp_mult  = max(config.TP_ATR_MULT, 2.5)   # Score 6-9 → 2.5x
+            tp2_mult = max(config.TP2_ATR_MULT, 4.0)
+        # Displacement institucional = tendencia fuerte, más recorrido
+        if disp.get("bull_disp") or disp.get("bear_disp"):
+            tp_mult  += 0.5
+            tp2_mult += 0.5
 
         if lado == "LONG":
             # SL: usar estructura si está cerca, sino ATR con margen
             sl_ob   = ob["bull_ob_bottom"] * 0.997 if (ob["bull_ob"] and not ob["bull_ob_mitigado"]) else 0
             sl_asia = asia["low"] * 0.997 if (asia["valido"] and asia["low"] < precio) else 0
-            sl_low  = min(c["low"] for c in candles[-5:]) * 0.997  # Mínimo reciente de 5 velas
+            sl_low  = min(c["low"] for c in candles[-5:]) * 0.997
             sl_atr  = precio - sl_min_dist
-            # Preferir estructura sobre ATR, pero respetar distancia mínima
             sl_struct = max([x for x in [sl_ob, sl_asia, sl_low] if 0 < x < precio - atr_sl * 0.5], default=0)
             sl = sl_struct if sl_struct > sl_atr else sl_atr
-            # TP: basado en R:R mínimo 2.5 sobre el SL real
             dist_sl = precio - sl
-            tp   = precio + dist_sl * max(config.TP_ATR_MULT, 2.5)
-            tp1  = precio + dist_sl * 1.2
-            tp2  = precio + dist_sl * 4.0
+            # TP1: 1.5x riesgo (FIX v5.1: antes 1.2x → R:R insuficiente)
+            tp1  = precio + dist_sl * 1.5
+            # TP principal: adaptativo por score
+            tp   = precio + dist_sl * tp_mult
+            # TP2: apuntar al swing high estructural si es alcanzable
+            swing_high = pd_zone.get("swing_high", 0)
+            tp2_base   = precio + dist_sl * tp2_mult
+            if swing_high > tp and swing_high <= tp2_base * 1.2:
+                tp2 = swing_high * 0.998  # ligeramente bajo el swing para asegurar fill
+            else:
+                tp2 = tp2_base
         else:
             sl_ob   = ob["bear_ob_top"] * 1.003 if (ob["bear_ob"] and not ob["bear_ob_mitigado"]) else 0
             sl_asia = asia["high"] * 1.003 if (asia["valido"] and asia["high"] > precio) else 0
-            sl_high = max(c["high"] for c in candles[-5:]) * 1.003  # Máximo reciente de 5 velas
+            sl_high = max(c["high"] for c in candles[-5:]) * 1.003
             sl_atr  = precio + sl_min_dist
             sl_struct = min([x for x in [sl_ob, sl_asia, sl_high] if x > precio + atr_sl * 0.5], default=float("inf"))
             sl = sl_struct if sl_struct < sl_atr else sl_atr
             dist_sl = sl - precio
-            tp   = precio - dist_sl * max(config.TP_ATR_MULT, 2.5)
-            tp1  = precio - dist_sl * 1.2
-            tp2  = precio - dist_sl * 4.0
+            # TP1: 1.5x riesgo (FIX v5.1)
+            tp1  = precio - dist_sl * 1.5
+            # TP principal: adaptativo por score
+            tp   = precio - dist_sl * tp_mult
+            # TP2: apuntar al swing low estructural si es alcanzable
+            swing_low = pd_zone.get("swing_low", 0)
+            tp2_base  = precio - dist_sl * tp2_mult
+            if 0 < swing_low < tp and swing_low >= tp2_base * 0.8:
+                tp2 = swing_low * 1.002
+            else:
+                tp2 = tp2_base
 
         rr = abs(tp - precio) / abs(precio - sl) if abs(precio - sl) > 0 else 0
         if rr < config.MIN_RR:
