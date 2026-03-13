@@ -1,6 +1,7 @@
 """
 exchange.py — BingX Perpetual Futures API v2/v3
 SMC Bot v5.0 [MetaClaw Edition]
+FIX: balance parsing robusto + múltiples endpoints
 """
 import hashlib
 import hmac
@@ -19,8 +20,8 @@ BASE_URL = "https://open-api.bingx.com"
 _CONTRATOS_FUTURES: set = set()
 _blocked_pairs: set = set()
 _time_offset: int = 0
-_QTY_PRECISION: dict = {}   # par → decimales
-_MIN_QTY: dict = {}         # par → cantidad mínima
+_QTY_PRECISION: dict = {}
+_MIN_QTY: dict = {}
 
 
 # ═══════════════════════════════════════════════════════
@@ -105,7 +106,6 @@ def _cargar_contratos():
             if not sym:
                 continue
             _CONTRATOS_FUTURES.add(sym)
-            # Guardar precisión de cantidad
             qty_prec = int(c.get("quantityPrecision", 4))
             _QTY_PRECISION[sym] = qty_prec
             min_qty = float(c.get("minQty", 0.0001) or 0.0001)
@@ -173,7 +173,6 @@ def get_candles(par: str, tf: str, limit: int = 200) -> list:
                     })
             except Exception:
                 pass
-        # Ordenar por timestamp ascendente
         result.sort(key=lambda x: x["ts"])
         return result
     except Exception as e:
@@ -182,30 +181,113 @@ def get_candles(par: str, tf: str, limit: int = 200) -> list:
 
 
 # ═══════════════════════════════════════════════════════
-# BALANCE
+# BALANCE — con múltiples endpoints de fallback
 # ═══════════════════════════════════════════════════════
+
+def _extraer_balance_usdt(data: dict) -> float:
+    """
+    Intenta extraer el balance disponible en USDT de cualquier
+    estructura de respuesta que devuelva BingX.
+    """
+    if not data or data.get("code", -1) != 0:
+        return -1.0
+
+    d = data.get("data", {})
+
+    # Estructura 1: data.balance (objeto con campos)
+    bal = d.get("balance")
+    if isinstance(bal, dict):
+        for campo in ("availableMargin", "freeMargin", "available", "balance", "equity"):
+            v = bal.get(campo)
+            if v is not None:
+                try:
+                    f = float(v)
+                    if f >= 0:
+                        return f
+                except Exception:
+                    pass
+
+    # Estructura 2: data es directamente el dict de balance
+    if isinstance(d, dict):
+        for campo in ("availableMargin", "freeMargin", "available", "balance"):
+            v = d.get(campo)
+            if v is not None:
+                try:
+                    f = float(v)
+                    if f >= 0:
+                        return f
+                except Exception:
+                    pass
+
+    # Estructura 3: data es lista de activos
+    if isinstance(d, list):
+        for item in d:
+            asset = str(item.get("asset", item.get("currency", ""))).upper()
+            if asset == "USDT" or asset == "":
+                for campo in ("availableMargin", "freeMargin", "available", "balance"):
+                    v = item.get(campo)
+                    if v is not None:
+                        try:
+                            f = float(v)
+                            if f >= 0:
+                                return f
+                        except Exception:
+                            pass
+
+    # Estructura 4: data.balance es lista
+    bal_list = d.get("balance", [])
+    if isinstance(bal_list, list):
+        for item in bal_list:
+            asset = str(item.get("asset", "")).upper()
+            if asset in ("USDT", ""):
+                v = item.get("availableMargin", item.get("balance", None))
+                if v is not None:
+                    try:
+                        return float(v)
+                    except Exception:
+                        pass
+
+    return -1.0
+
 
 def get_balance() -> float:
     if config.MODO_DEMO:
         return 200.0
+
+    # Endpoint 1: perpetuos v2
+    endpoints = [
+        "/openApi/swap/v2/user/balance",
+        "/openApi/swap/v3/user/balance",
+        "/openApi/contract/v3/user/balance",
+    ]
+
+    for ep in endpoints:
+        try:
+            data = _get(ep)
+            code = data.get("code", -1)
+            log.debug(f"[BAL] {ep} → code={code} data={str(data)[:200]}")
+            bal = _extraer_balance_usdt(data)
+            if bal >= 0:
+                log.debug(f"[BAL] {ep} → ${bal:.2f}")
+                return bal
+        except Exception as e:
+            log.debug(f"[BAL] {ep}: {e}")
+
+    # Último recurso: cuenta spot (en caso de que el usuario tenga USDT en spot)
     try:
-        data = _get("/openApi/swap/v2/user/balance")
-        bal = data.get("data", {}).get("balance", {})
-        if isinstance(bal, dict):
-            return float(
-                bal.get("availableMargin",
-                bal.get("freeMargin",
-                bal.get("available",
-                bal.get("balance", 0)))) or 0
-            )
-        if isinstance(bal, list):
-            for b in bal:
-                if b.get("asset", "").upper() == "USDT":
-                    return float(b.get("availableMargin", b.get("balance", 0)) or 0)
-        return 0.0
-    except Exception as e:
-        log.error(f"get_balance: {e}")
-        return 0.0
+        data = _get("/openApi/spot/v1/account/balance")
+        balances = data.get("data", {}).get("balances", []) or []
+        for b in balances:
+            if str(b.get("asset", "")).upper() == "USDT":
+                free = float(b.get("free", 0) or 0)
+                if free > 0:
+                    log.warning(f"[BAL] Balance encontrado en SPOT: ${free:.2f} — transfiere a Futuros")
+                    return free
+    except Exception:
+        pass
+
+    log.warning("[BAL] No se pudo obtener balance — retornando 0")
+    return 0.0
 
 
 # ═══════════════════════════════════════════════════════
@@ -273,7 +355,6 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
             "type":         "MARKET",
             "quantity":     qty,
         }
-        # SL y TP como JSON string
         if sl > 0:
             sl_price = round(sl, 8)
             params["stopLoss"] = json.dumps({
@@ -295,14 +376,12 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         if data.get("code", -1) != 0:
             err = data.get("msg", str(data))
             log.warning(f"abrir_long {par}: {err}")
-            # Retry sin SL/TP si fue error de parámetros
-            if "parameter" in err.lower() or "invalid" in err.lower():
+            if "parameter" in err.lower() or "invalid" in err.lower() or "sl" in err.lower():
                 params.pop("stopLoss", None)
                 params.pop("takeProfit", None)
                 data = _post("/openApi/swap/v2/trade/order", params)
                 if data.get("code", -1) != 0:
                     return {"error": data.get("msg", str(data))}
-                # Poner SL/TP como órdenes separadas si la entrada funcionó
                 _colocar_sl_tp_separados(par, sl, tp, "LONG", qty)
             else:
                 return {"error": err}
@@ -355,7 +434,7 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         if data.get("code", -1) != 0:
             err = data.get("msg", str(data))
             log.warning(f"abrir_short {par}: {err}")
-            if "parameter" in err.lower() or "invalid" in err.lower():
+            if "parameter" in err.lower() or "invalid" in err.lower() or "sl" in err.lower():
                 params.pop("stopLoss", None)
                 params.pop("takeProfit", None)
                 data = _post("/openApi/swap/v2/trade/order", params)
@@ -376,7 +455,6 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
 
 
 def _colocar_sl_tp_separados(par: str, sl: float, tp: float, lado: str, qty: float):
-    """Fallback: coloca SL y TP como órdenes separadas."""
     try:
         pos_side = "LONG" if lado == "LONG" else "SHORT"
         cl_side  = "SELL" if lado == "LONG" else "BUY"
@@ -426,8 +504,7 @@ def cerrar_posicion(par: str, qty: float, lado: str) -> Optional[dict]:
             "reduceOnly":   "true",
         })
         if data.get("code", -1) != 0:
-            # Intentar closePosition
-            log.warning(f"cerrar_posicion {par} market fail: {data.get('msg')} — intentando closePosition")
+            log.warning(f"cerrar_posicion {par}: {data.get('msg')} — intentando closePosition")
             data2 = _post("/openApi/swap/v2/trade/closePosition", {
                 "symbol":       par,
                 "positionSide": pos_side,
