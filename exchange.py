@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import time
 from typing import Optional
 from urllib.parse import urlencode
@@ -33,30 +32,36 @@ def _ts() -> int:
     return int(time.time() * 1000) + _time_offset
 
 
+# ── Leer claves (Railway usa BINGX_API_SECRET, no BINGX_SECRET_KEY) ──────
 def _api_key() -> str:
-    return (os.getenv("BINGX_API_KEY", config.BINGX_API_KEY) or "").strip()
+    return (os.getenv("BINGX_API_KEY", "") or config.BINGX_API_KEY or "").strip()
 
 def _secret_key() -> str:
-    return (os.getenv("BINGX_SECRET_KEY", config.BINGX_SECRET_KEY) or "").strip()
+    # Soportar ambos nombres de variable
+    return (os.getenv("BINGX_SECRET_KEY", "")
+            or os.getenv("BINGX_API_SECRET", "")
+            or config.BINGX_SECRET_KEY
+            or "").strip()
 
 
-def _sign(query_string: str) -> str:
-    """Firma el query string exacto (ya construido) con HMAC-SHA256."""
-    secret = _secret_key()
-    return hmac.new(
-        secret.encode("utf-8"),
-        query_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _build_query(params: dict) -> str:
+def _sign_and_build(params: dict):
     """
-    Construye query string SIN urlencode de valores —
-    BingX firma y envía los valores raw (sin %xx encoding).
-    Los parámetros se ordenan alfabéticamente por clave.
+    Firma según SDK oficial BingX:
+    1. Ordenar params alfabéticamente (SIN timestamp)
+    2. Añadir timestamp al final
+    3. HMAC-SHA256 del string completo
+    Retorna (query_string, signature)
     """
-    return "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    ts = _ts()
+    p = {k: v for k, v in params.items() if k != "timestamp"}
+    sorted_keys = sorted(p.keys())
+    if sorted_keys:
+        base = "&".join(f"{k}={p[k]}" for k in sorted_keys)
+        query = f"{base}&timestamp={ts}"
+    else:
+        query = f"timestamp={ts}"
+    sig = hmac.new(_secret_key().encode(), query.encode(), hashlib.sha256).hexdigest()
+    return query, sig
 
 
 def _headers() -> dict:
@@ -67,12 +72,8 @@ def _headers() -> dict:
 
 
 def _get(path: str, params: Optional[dict] = None) -> dict:
-    """GET firmado — construye URL manualmente para que firma == URL enviada."""
-    p = dict(params or {})
-    p["timestamp"] = _ts()
-    query = _build_query(p)
-    sig   = _sign(query)
-    url   = f"{BASE_URL}{path}?{query}&signature={sig}"
+    query, sig = _sign_and_build(params or {})
+    url = f"{BASE_URL}{path}?{query}&signature={sig}"
     try:
         r = requests.get(url, headers=_headers(), timeout=12)
         return r.json()
@@ -82,12 +83,8 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
 
 
 def _post(path: str, params: Optional[dict] = None) -> dict:
-    """POST firmado — query en URL (BingX perpetual swap requiere params en query string)."""
-    p = dict(params or {})
-    p["timestamp"] = _ts()
-    query = _build_query(p)
-    sig   = _sign(query)
-    url   = f"{BASE_URL}{path}?{query}&signature={sig}"
+    query, sig = _sign_and_build(params or {})
+    url = f"{BASE_URL}{path}?{query}&signature={sig}"
     try:
         r = requests.post(url, headers=_headers(), timeout=12)
         return r.json()
@@ -199,10 +196,10 @@ def get_candles(par: str, tf: str, limit: int = 200) -> list:
 # BALANCE — debug completo para diagnosticar
 # ═══════════════════════════════════════════════════════
 
-def _try_balance_endpoint(path: str, extra: dict = None) -> float:
+def _try_balance_endpoint(path: str) -> float:
     """Intenta un endpoint de balance y loguea la respuesta completa."""
     try:
-        data = _get(path, extra or {})
+        data = _get(path)
         code = data.get("code", -1)
         msg  = data.get("msg", "")
         raw  = json.dumps(data)[:400]
@@ -247,24 +244,20 @@ def _try_balance_endpoint(path: str, extra: dict = None) -> float:
                             except Exception:
                                 pass
 
-        # Caso 4: d.balance es lista (formato v3)
+        # Caso 4: d.balance es lista
         if isinstance(d, dict):
             for key_outer in ("balance", "assets", "data"):
                 inner = d.get(key_outer)
                 if isinstance(inner, list):
                     for item in inner:
-                        asset = str(item.get("asset", item.get("currency", ""))).upper()
+                        asset = str(item.get("asset", "")).upper()
                         if asset in ("USDT", ""):
-                            for k in ("availableMargin", "freeMargin", "available", "balance"):
-                                v = item.get(k)
-                                if v is not None:
-                                    try:
-                                        f = float(v)
-                                        if f >= 0:
-                                            log.info(f"[BAL] {path} v-list campo '{k}' = {f}")
-                                            return f
-                                    except Exception:
-                                        pass
+                            v = item.get("availableMargin", item.get("balance"))
+                            if v is not None:
+                                try:
+                                    return float(v)
+                                except Exception:
+                                    pass
 
         log.warning(f"[BAL] {path} no se encontró campo de balance en: {raw}")
         return -1.0
@@ -278,23 +271,18 @@ def get_balance() -> float:
     if config.MODO_DEMO:
         return 200.0
 
-    # Intentar v3 y v2 con y sin recvWindow
+    # Probar todos los endpoints conocidos de BingX futuros perpetuos
     endpoints = [
-        "/openApi/swap/v3/user/balance",
         "/openApi/swap/v2/user/balance",
+        "/openApi/swap/v3/user/balance",
+        "/openApi/account/v1/balance",
     ]
 
     for ep in endpoints:
-        # Intento 1: sin recvWindow
         bal = _try_balance_endpoint(ep)
         if bal >= 0:
             log.info(f"[BAL] ✅ Balance: ${bal:.2f} desde {ep}")
             return bal
-        # Intento 2: con recvWindow=5000
-        bal2 = _try_balance_endpoint(ep, extra={"recvWindow": 5000})
-        if bal2 >= 0:
-            log.info(f"[BAL] ✅ Balance (recvWindow): ${bal2:.2f} desde {ep}")
-            return bal2
 
     log.warning("[BAL] Todos los endpoints fallaron — retornando 0")
     return 0.0
@@ -496,65 +484,21 @@ def cerrar_posicion(par: str, qty: float, lado: str) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════
 
 def diagnostico_balance():
-    """Diagnóstico profundo: hex de claves, test spot, test futuros."""
+    """Llama a todos los endpoints y loguea la respuesta RAW completa.
+    Llamar una vez al arrancar para identificar qué endpoint funciona."""
     import json as _json
     log.info("=" * 60)
-    log.info("[DIAG] ====== DIAGNÓSTICO COMPLETO BingX ======")
-
-    ak = _api_key()
-    sk = _secret_key()
-
-    # ── 1. Verificar chars invisibles en las claves ──────────────
-    if not ak:
-        log.error("[DIAG] ❌ BINGX_API_KEY está VACÍA")
-        return
-    if not sk:
-        log.error("[DIAG] ❌ BINGX_SECRET_KEY está VACÍA")
-        return
-
-    # Mostrar hex de primeros y últimos 4 bytes para detectar \n \r \x00
-    ak_hex_start = ak[:4].encode().hex()
-    ak_hex_end   = ak[-4:].encode().hex()
-    sk_hex_start = sk[:4].encode().hex()
-    sk_hex_end   = sk[-4:].encode().hex()
-    log.info(f"[DIAG] API_KEY  len={len(ak)} inicio_hex={ak_hex_start} fin_hex={ak_hex_end}")
-    log.info(f"[DIAG] SECRET   len={len(sk)} inicio_hex={sk_hex_start} fin_hex={sk_hex_end}")
-
-    # ── 2. Mostrar query string + firma de prueba ────────────────
-    ts_test = _ts()
-    q_test  = f"timestamp={ts_test}"
-    sig_test = _sign(q_test)
-    log.info(f"[DIAG] Query ejemplo: '{q_test}'")
-    log.info(f"[DIAG] Firma ejemplo: {sig_test}")
-
-    # ── 3. Test SPOT (sin permisos de futuros) ───────────────────
-    # Si esto funciona → API key válida pero sin permiso futuros
-    try:
-        p = {"timestamp": _ts()}
-        q = _build_query(p)
-        sig = _sign(q)
-        url = f"{BASE_URL}/openApi/spot/v1/account/balance?{q}&signature={sig}"
-        r_spot = requests.get(url, headers=_headers(), timeout=10)
-        d_spot = r_spot.json()
-        log.info(f"[DIAG] SPOT balance code={d_spot.get('code')} msg={d_spot.get('msg','')[:80]}")
-    except Exception as e:
-        log.warning(f"[DIAG] SPOT test error: {e}")
-
-    # ── 4. Test endpoints FUTUROS ────────────────────────────────
+    log.info("[DIAG-BAL] Iniciando diagnóstico de balance BingX...")
     endpoints = [
-        "/openApi/swap/v3/user/balance",
         "/openApi/swap/v2/user/balance",
+        "/openApi/swap/v3/user/balance",
+        "/openApi/account/v1/balance",
+        "/openApi/swap/v2/user/margin",
     ]
     for ep in endpoints:
         try:
             data = _get(ep)
-            code = data.get("code", "?")
-            msg  = data.get("msg", "")[:100]
-            log.info(f"[DIAG] {ep} → code={code} msg={msg}")
-            if code == 0:
-                log.info(f"[DIAG] ✅ ÉXITO en {ep}: {_json.dumps(data)[:300]}")
+            log.info(f"[DIAG-BAL] {ep} → {_json.dumps(data)[:500]}")
         except Exception as e:
-            log.info(f"[DIAG] {ep} → ERROR: {e}")
-
-    log.info("[DIAG] ====== FIN DIAGNÓSTICO ======")
+            log.info(f"[DIAG-BAL] {ep} → ERROR: {e}")
     log.info("=" * 60)
