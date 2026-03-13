@@ -95,7 +95,7 @@ def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Op
                 "content-type":      "application/json",
             },
             json={
-                "model":      "claude-sonnet-4-6",
+                "model":      "claude-haiku-4-5-20251001",
                 "max_tokens": max_tokens,
                 "system":     system_prompt,
                 "messages":   [{"role": "user", "content": user_msg}],
