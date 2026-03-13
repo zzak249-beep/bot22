@@ -754,16 +754,10 @@ def analizar_par(par: str):
         # HTF multi-timeframe
         htf            = tendencia_htf(par)    # 1H
         htf_4h         = tendencia_4h(par)     # 4H (nueva)
-        # FIX: HTF 1H es filtro DURO — no entrar contra tendencia mayor
-        # Si ambos HTF (1H y 4H) contradicen la dirección → bloquear
-        # HTF 1H = filtro duro. Si 1H va en contra → bloquear
-        # Excepción: 4H a favor puede salvar el trade
-        htf_contra_long  = (htf == "BEAR")
-        htf_contra_short = (htf == "BULL")
-        if htf_4h == "BULL" and htf_contra_long:
-            htf_contra_long = False   # 4H alcista salva LONG aunque 1H sea BEAR
-        if htf_4h == "BEAR" and htf_contra_short:
-            htf_contra_short = False  # 4H bajista salva SHORT aunque 1H sea BULL
+        # HTF: bloquear solo si 1H Y 4H ambos van en contra (consenso total)
+        # Si solo 1H es contrario pero 4H neutral/favorable → permitir (el score lo penalizó)
+        htf_contra_long  = (htf == "BEAR" and htf_4h == "BEAR")
+        htf_contra_short = (htf == "BULL" and htf_4h == "BULL")
         trend_ok_long  = not htf_contra_long
         trend_ok_short = not htf_contra_short
 
@@ -981,44 +975,59 @@ def analizar_par(par: str):
         # ──────────────────────────────────────────────────────
         # CONDICIONES BASE
         # ──────────────────────────────────────────────────────
-        zona_long  = (near_s1 or near_s2 or near_pp or eq["is_eql"] or
-                      near_asia_low or asia_brk_low or ob["bull_ob"] or pd_zone["discount"])
-        zona_short = (near_r1 or near_r2 or near_pp or eq["is_eqh"] or
-                      near_asia_high or asia_brk_high or ob["bear_ob"] or pd_zone["premium"])
+        # Zona de valor: pivotes, EQL/EQH, Asia range, OB, premium/discount
+        # También: precio entre EMA21 y EMA50 = zona de valor (confluencia de medias)
+        ema_zona_bull = (ema_f is not None and ema_s is not None and
+                         min(ema_f, ema_s) <= precio <= max(ema_f, ema_s) * 1.005)
+        ema_zona_bear = ema_zona_bull  # zona de medias aplica para ambas direcciones
 
-        # FVG sin rellenar es requisito en v5.0 (FVG ya rellenado no cuenta)
+        zona_long  = (near_s1 or near_s2 or near_pp or eq["is_eql"] or
+                      near_asia_low or asia_brk_low or ob["bull_ob"] or pd_zone["discount"] or
+                      ema_zona_bull)
+        zona_short = (near_r1 or near_r2 or near_pp or eq["is_eqh"] or
+                      near_asia_high or asia_brk_high or ob["bear_ob"] or pd_zone["premium"] or
+                      ema_zona_bear)
+
+        # FVG válido: sin rellenar es ideal, pero también aceptar si hay FVG aunque rellenado
+        # si hay OB o zona fuerte de soporte/resistencia que lo confirme
         fvg_bull_valido = fvg["bull_fvg"] and not fvg.get("fvg_rellenado", True)
         fvg_bear_valido = fvg["bear_fvg"] and not fvg.get("fvg_rellenado", True)
+        # FVG rellenado pero con OB/zona = base válida (precio volvió a zona de liquidez)
+        fvg_bull_con_zona = fvg["bull_fvg"] and zona_long
+        fvg_bear_con_zona = fvg["bear_fvg"] and zona_short
 
         # FIX v5.4: base también válida con score alto en zona.
         # Un score ≥ SCORE_MIN+2 en zona premium/discount indica confluencia fuerte
         # aunque no haya FVG explícito — HTF+EMA+MACD+KZ+pivot ya son suficiente señal.
         score_min = config.SCORE_MIN
         base_long  = (
-            (fvg_bull_valido and zona_long)                     # FVG no rellenado + zona
+            (fvg_bull_valido and zona_long)                     # FVG fresco + zona
+            or fvg_bull_con_zona                                 # FVG (cualquier estado) + zona
             or ob_fvg_bull                                       # OB+FVG confluencia
             or sweep["sweep_bull"]                               # Liquidity sweep
             or idm_l                                             # Inducement
             or (ob_valido_bull(ob, precio) and zona_long)        # OB válido en zona
             or (bos["bos_bull"] and zona_long)                   # BOS + zona
-            or (zona_long and sl_long >= score_min + 2)          # Alta confluencia en zona
+            or (zona_long and sl_long >= score_min + 1)          # Confluencia en zona (antes +2)
         )
         base_short = (
             (fvg_bear_valido and zona_short)
+            or fvg_bear_con_zona                                 # FVG + zona short
             or ob_fvg_bear
             or sweep["sweep_bear"]
             or idm_s
             or (ob_valido_bear(ob, precio) and zona_short)
             or (bos["bos_bear"] and zona_short)
-            or (zona_short and sl_short >= score_min + 2)        # Alta confluencia en zona
+            or (zona_short and sl_short >= score_min + 1)        # Confluencia en zona (antes +2)
         )
 
         # Filtros de confirmación — respeta VELA_CONFIRMACION
         # FIX v5.4: con score muy alto (≥ score_min+3), aceptar cierre por encima del 35% del rango
         # como confirmación (vs 45% antes). Setup de alta calidad no necesita vela perfecta.
         rng_vela   = max(candles[-1]["high"] - candles[-1]["low"], 1e-10)
-        conf_umbral_long  = 0.35 if sl_long  >= score_min + 3 else 0.45
-        conf_umbral_short = 0.35 if sl_short >= score_min + 3 else 0.45
+        # Umbral más bajo = más señales. Score alto o fuera de KZ → más flexible
+        conf_umbral_long  = 0.25 if sl_long  >= score_min + 2 else 0.35
+        conf_umbral_short = 0.25 if sl_short >= score_min + 2 else 0.35
         if config.VELA_CONFIRMACION:
             conf_long  = (candles[-1]["close"] > candles[-1]["open"] or
                           (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > conf_umbral_long)
@@ -1030,9 +1039,8 @@ def analizar_par(par: str):
         mom_long  = momentum_ok(candles, "LONG")
         mom_short = momentum_ok(candles, "SHORT")
 
-        # RSI extremo = bloqueante duro (score no lo salva)
-        rsi_ok_long  = rsi < 75.0 and (rsi < config.RSI_BUY_MAX  or sl_long  >= 10)
-        rsi_ok_short = rsi > 25.0 and (rsi > config.RSI_SELL_MIN or sl_short >= 10)
+        rsi_ok_long  = rsi < config.RSI_BUY_MAX  or sl_long  >= 8
+        rsi_ok_short = rsi > config.RSI_SELL_MIN or sl_short >= 8
 
         # ── Elegir dirección ──
         lado = score = None
