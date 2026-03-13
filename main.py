@@ -25,7 +25,7 @@ log = logging.getLogger("main")
 log.info("=== ARRANQUE SMC BOT v4.2 ===")
 
 try:
-    import config, exchange, analizar, memoria, scanner_pares, metaclaw
+    import config, exchange, analizar, memoria, scanner_pares, metaclaw, optimizador
     from config_pares import PARES as PARES_FIJOS
 except Exception as e:
     log.error(f"ERROR importando módulos: {e}\n{traceback.format_exc()}")
