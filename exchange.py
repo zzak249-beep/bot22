@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import time
 from typing import Optional
 from urllib.parse import urlencode
@@ -33,50 +32,31 @@ def _ts() -> int:
     return int(time.time() * 1000) + _time_offset
 
 
-# ── Leer claves (Railway usa BINGX_API_SECRET, no BINGX_SECRET_KEY) ──────
-def _api_key() -> str:
-    return (os.getenv("BINGX_API_KEY", "") or config.BINGX_API_KEY or "").strip()
-
-def _secret_key() -> str:
-    # Soportar ambos nombres de variable
-    return (os.getenv("BINGX_SECRET_KEY", "")
-            or os.getenv("BINGX_API_SECRET", "")
-            or config.BINGX_SECRET_KEY
-            or "").strip()
-
-
-def _sign_and_build(params: dict):
-    """
-    Firma según SDK oficial BingX:
-    1. Ordenar params alfabéticamente (SIN timestamp)
-    2. Añadir timestamp al final
-    3. HMAC-SHA256 del string completo
-    Retorna (query_string, signature)
-    """
-    ts = _ts()
-    p = {k: v for k, v in params.items() if k != "timestamp"}
-    sorted_keys = sorted(p.keys())
-    if sorted_keys:
-        base = "&".join(f"{k}={p[k]}" for k in sorted_keys)
-        query = f"{base}&timestamp={ts}"
-    else:
-        query = f"timestamp={ts}"
-    sig = hmac.new(_secret_key().encode(), query.encode(), hashlib.sha256).hexdigest()
-    return query, sig
+def _sign(params: dict) -> str:
+    # BingX firma: parámetros en orden dado, SIN ordenar — HMAC-SHA256
+    # Excluir stopLoss/takeProfit del string de firma (van como JSON separado)
+    skip = {"stopLoss", "takeProfit"}
+    query = "&".join(f"{k}={v}" for k, v in params.items() if k not in skip)
+    return hmac.new(
+        config.BINGX_SECRET_KEY.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _headers() -> dict:
     return {
-        "X-BX-APIKEY": _api_key(),
+        "X-BX-APIKEY": config.BINGX_API_KEY,
         "Content-Type": "application/json",
     }
 
 
 def _get(path: str, params: Optional[dict] = None) -> dict:
-    query, sig = _sign_and_build(params or {})
-    url = f"{BASE_URL}{path}?{query}&signature={sig}"
+    p = dict(params or {})
+    p["timestamp"] = _ts()
+    p["signature"] = _sign(p)
     try:
-        r = requests.get(url, headers=_headers(), timeout=12)
+        r = requests.get(f"{BASE_URL}{path}", params=p, headers=_headers(), timeout=12)
         return r.json()
     except Exception as e:
         log.error(f"GET {path}: {e}")
@@ -84,10 +64,46 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
 
 
 def _post(path: str, params: Optional[dict] = None) -> dict:
-    query, sig = _sign_and_build(params or {})
-    url = f"{BASE_URL}{path}?{query}&signature={sig}"
+    """
+    BingX perpetual orders: params simples van en query string (URL),
+    stopLoss/takeProfit van como objetos en el JSON body.
+    """
+    p = dict(params or {})
+    p["timestamp"] = _ts()
+
+    # Separar campos que van en body JSON vs query string
+    body_fields = {}
+    for key in ("stopLoss", "takeProfit"):
+        if key in p:
+            val = p.pop(key)
+            # Si viene como string JSON, convertir a dict
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            body_fields[key] = val
+
+    p["signature"] = _sign(p)
+
     try:
-        r = requests.post(url, headers=_headers(), timeout=12)
+        if body_fields:
+            # Orden con SL/TP: query string + JSON body
+            r = requests.post(
+                f"{BASE_URL}{path}",
+                params=p,
+                json=body_fields,
+                headers=_headers(),
+                timeout=12,
+            )
+        else:
+            # Orden simple o leverage: todo en query string
+            r = requests.post(
+                f"{BASE_URL}{path}",
+                params=p,
+                headers=_headers(),
+                timeout=12,
+            )
         return r.json()
     except Exception as e:
         log.error(f"POST {path}: {e}")
@@ -349,18 +365,18 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         _set_leverage(par, "LONG")
         params: dict = {
             "symbol": par, "side": "BUY",
-            "positionSide": "LONG", "type": "MARKET", "quantity": qty,
+            "positionSide": "LONG", "type": "MARKET", "quantity": str(qty),
         }
         if sl > 0:
-            params["stopLoss"] = json.dumps({
+            params["stopLoss"] = {
                 "type": "STOP_MARKET", "stopPrice": round(sl, 8),
                 "price": round(sl, 8), "workingType": "MARK_PRICE",
-            })
+            }
         if tp > 0:
-            params["takeProfit"] = json.dumps({
+            params["takeProfit"] = {
                 "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 8),
                 "price": round(tp, 8), "workingType": "MARK_PRICE",
-            })
+            }
 
         data = _post("/openApi/swap/v2/trade/order", params)
         if data.get("code", -1) != 0:
@@ -395,18 +411,18 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         _set_leverage(par, "SHORT")
         params: dict = {
             "symbol": par, "side": "SELL",
-            "positionSide": "SHORT", "type": "MARKET", "quantity": qty,
+            "positionSide": "SHORT", "type": "MARKET", "quantity": str(qty),
         }
         if sl > 0:
-            params["stopLoss"] = json.dumps({
+            params["stopLoss"] = {
                 "type": "STOP_MARKET", "stopPrice": round(sl, 8),
                 "price": round(sl, 8), "workingType": "MARK_PRICE",
-            })
+            }
         if tp > 0:
-            params["takeProfit"] = json.dumps({
+            params["takeProfit"] = {
                 "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 8),
                 "price": round(tp, 8), "workingType": "MARK_PRICE",
-            })
+            }
 
         data = _post("/openApi/swap/v2/trade/order", params)
         if data.get("code", -1) != 0:
