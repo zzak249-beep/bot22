@@ -36,10 +36,6 @@ def _skills_path() -> str:
     base = config.MEMORY_DIR or ""
     return os.path.join(base, "metaclaw_skills.json") if base else "metaclaw_skills.json"
 
-# Flag: si la API da "credit balance too low", desactivar MetaClaw en esta sesión
-_sin_creditos: bool = False
-
-
 def _load_skills() -> list:
     path = _skills_path()
     try:
@@ -84,15 +80,20 @@ def _skill_relevante(skill: dict, señal: dict) -> bool:
 # LLAMADA A CLAUDE API
 # ══════════════════════════════════════════════════════════════
 
+# Flag de sesión: True si Anthropic devuelve error de créditos insuficientes
+_sin_creditos: bool = False
+
+
 def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Optional[str]:
+    global _sin_creditos  # declarar global AL INICIO de la función
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         log.debug("[MCL] ANTHROPIC_API_KEY no configurada — saltando MetaClaw")
         return None
     if _sin_creditos:
-        return None  # Sin créditos Anthropic — no reintentar hasta reinicio
+        return None  # Sin créditos — no reintentar hasta reinicio del bot
 
-    # Modelos en orden (más barato primero)
+    # Modelos en orden de preferencia (más barato primero)
     for model in ("claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"):
         try:
             resp = requests.post(
@@ -117,9 +118,8 @@ def _call_claude(system_prompt: str, user_msg: str, max_tokens: int = 500) -> Op
                 err_txt = resp.text
                 log.warning(f"[MCL] 400 con {model}: {err_txt[:200]} — intentando siguiente")
                 if "credit balance" in err_txt.lower() or "billing" in err_txt.lower():
-                    global _sin_creditos
                     _sin_creditos = True
-                    log.warning("[MCL] ⚠️  Sin créditos Anthropic — MetaClaw desactivado. Recarga en console.anthropic.com/settings/billing")
+                    log.warning("[MCL] ⚠️  Sin créditos Anthropic. Recarga en console.anthropic.com/settings/billing")
                     return None  # No reintentar otros modelos
                 continue
             else:
