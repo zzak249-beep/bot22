@@ -31,6 +31,14 @@ except Exception as e:
     log.error(f"ERROR importando módulos: {e}\n{traceback.format_exc()}")
     sys.exit(1)
 
+try:
+    import optimizador
+    _optimizador_ok = True
+    log.info("✅ optimizador cargado")
+except Exception as e:
+    log.warning(f"[OPT] optimizador no disponible: {e}")
+    _optimizador_ok = False
+
 errores_config = config.validar()
 for err in errores_config:
     log.warning(f"⚠️  CONFIG: {err}")
@@ -771,7 +779,8 @@ def main():
             _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
 
     # Agente de auto-optimización en segundo plano
-    optimizador.iniciar()
+    if _optimizador_ok:
+        optimizador.iniciar()
 
     # FIX v4.4: wrap startup en try/except para evitar crash por fallo de red
     try:
