@@ -1,145 +1,176 @@
 """
-config.py — SMC Bot v3.3 [PARÁMETROS OPTIMIZADOS POR BACKTEST]
-==============================================================
-Resultados bt_v3.py — Mejor config encontrada:
-  ✅ SL=0.6x ATR   TP=2.0x ATR  (PnL +$4.77 en 7 días)
-  ✅ PARTIAL_TP_ACTIVO = False   (el partial_be destruía el R:R)
-  ✅ HTF flexible (NEUTRAL permite operar)
-  ✅ PARES_BLOQUEADOS: KAVA-USDT, SOL-USDT (destroyers consistentes)
-  ✅ SCORE_MIN = 5
+config.py — SMC Bot BingX v5.5 [CRASH FIX + TRADING OPTIMIZADO]
 
-Benchmark antes/después:
-  ANTES: WR 26%  R:R real 0.37x  PF 0.07  PnL -$4.25/sem
-  AHORA: WR 34%  R:R real 2.28x  PF 1.17  PnL +$4.77/sem
+FIXES URGENTES (14 Mar 2026):
+  🔴 FIX CRASH: AttributeError 'METACLAW_ACTIVO' — atributos faltantes añadidos
+  🔴 FIX TRADING: Bot operaba pares de micro-cap manipulables (GRASS, NTRN, BROCC...)
+  🔴 FIX OVERTRADING: 20+ trades/día — filtros más estrictos
+
+CAMBIOS vs config_v32.py:
+  ✅ METACLAW_ACTIVO, METACLAW_VETO_MINIMO, METACLAW_CONFIANZA_MIN — AÑADIDOS
+  ✅ PINBAR_RATIO, VWAP_ACTIVO, COOLDOWN_VELAS, SWEEP_ACTIVO — AÑADIDOS
+  ✅ PARTIAL_TP1_MULT, SL_ATR_MULT, TP_ATR_MULT, TRAILING_ACTIVAR — AÑADIDOS
+  ✅ VOLUMEN_MIN_24H: 200k → 2M  (elimina tokens basura)
+  ✅ LOW_VOL_ACTIVO: False  (desactivar micro-caps)
+  ✅ SCORE_MIN: 5 → 7
+  ✅ TIME_EXIT_HORAS: 6 → 16
+  ✅ SL_ATR_MULT: 0.8 → 1.5  (SL menos cercano al precio)
+  ✅ TRAILING_ACTIVAR: 1.0 → 1.5
+  ✅ TRAILING_DISTANCIA: 0.8 → 1.2
+  ✅ PARES_BLOQUEADOS: incluye tokens del historial problemático
 """
 import os
 
-VERSION = "SMC-Bot v3.3 [BACKTEST-OPTIMIZED]"
+VERSION = "SMC-Bot v5.5 [CrashFix+OptimizedTrading]"
 
-def _int(v,d):
-    try: return int(os.getenv(v,str(d)).split()[0].split("(")[0].strip())
-    except: return d
+def _int(var, default):
+    try: return int(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
+    except Exception: return default
 
-def _float(v,d):
-    try: return float(os.getenv(v,str(d)).split()[0].split("(")[0].strip())
-    except: return d
+def _float(var, default):
+    try: return float(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
+    except Exception: return default
 
-def _bool(v,d):
-    raw=os.getenv(v,"true" if d else "false")
-    return raw.strip().lower().split()[0] in ("true","1","yes")
+def _bool(var, default):
+    raw = os.getenv(var, "true" if default else "false")
+    return raw.strip().lower().split()[0] in ("true", "1", "yes")
 
-# ── Credenciales ──────────────────────────────────────────────
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_SECRET_KEY = (os.getenv("BINGX_SECRET_KEY", "")
+                    or os.getenv("BINGX_API_SECRET", ""))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# ── General ───────────────────────────────────────────────────
 MODO_DEMO    = _bool("MODO_DEMO",    False)
 LOOP_SECONDS = _int("LOOP_SECONDS",  60)
 
-# ── Capital ───────────────────────────────────────────────────
+METACLAW_ACTIVO        = _bool("METACLAW_ACTIVO",        True)
+METACLAW_CONFIANZA_MIN = _int("METACLAW_CONFIANZA_MIN",  4)
+METACLAW_VETO_MINIMO   = _int("METACLAW_VETO_MINIMO",    5)
+
 TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)
 TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)
 COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 50.0)
 COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)
 
-# ── Posiciones ────────────────────────────────────────────────
 LEVERAGE       = _int("LEVERAGE",       10)
 MAX_POSICIONES = _int("MAX_POSICIONES",  3)
 
-# ── TP / SL — OPTIMIZADOS POR BACKTEST ───────────────────────
-# Antes: SL=1.0x TP=2.0x + partial → R:R real 0.5x → PÉRDIDA
-# Ahora: SL=0.6x TP=2.0x sin partial → R:R real 2.28x → +$4.77
-TP_ATR_MULT       = _float("TP_ATR_MULT",      2.0)   # sin cambio
-SL_ATR_MULT       = _float("SL_ATR_MULT",      0.6)   # ✅ era 1.0
-PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 1.0)
-PARTIAL_TP_ACTIVO = _bool("PARTIAL_TP_ACTIVO", False)  # ✅ DESACTIVADO
-MIN_RR            = _float("MIN_RR",            1.5)
+TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)
+SL_ATR_MULT       = _float("SL_ATR_MULT",      1.5)
+PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 1.2)
+PARTIAL_TP_ACTIVO = _bool("PARTIAL_TP_ACTIVO",  True)
+MIN_RR            = _float("MIN_RR",            1.8)
 
-# ── Trailing Stop ─────────────────────────────────────────────
 TRAILING_ACTIVO    = _bool("TRAILING_ACTIVO",    True)
 TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.5)
-TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA",0.8)
+TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 1.2)
 
-# ── Protección ────────────────────────────────────────────────
-TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)
-MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 25.0)
+TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 16.0)
+MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 
-# ── Score ─────────────────────────────────────────────────────
-SCORE_MIN    = _int("SCORE_MIN",      5)
-FVG_MIN_PIPS = _float("FVG_MIN_PIPS", 0.0)
-EQ_LOOKBACK  = _int("EQ_LOOKBACK",   50)
-EQ_THRESHOLD = _float("EQ_THRESHOLD", 0.1)
-EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN",   5)
+SCORE_MIN    = _int("SCORE_MIN",       7)
+FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
+EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
+EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
+EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN",    5)
 
-# ── Killzones ─────────────────────────────────────────────────
 KZ_ASIA_START   = _int("KZ_ASIA_START",    0)
 KZ_ASIA_END     = _int("KZ_ASIA_END",    240)
 KZ_LONDON_START = _int("KZ_LONDON_START",420)
 KZ_LONDON_END   = _int("KZ_LONDON_END",  600)
 KZ_NY_START     = _int("KZ_NY_START",    780)
 KZ_NY_END       = _int("KZ_NY_END",      960)
+KZ_REQUERIDA    = _bool("KZ_REQUERIDA",  False)
 
-# ── Indicadores ───────────────────────────────────────────────
 EMA_FAST       = _int("EMA_FAST",      21)
 EMA_SLOW       = _int("EMA_SLOW",      50)
+EMA_LOCAL_FAST = _int("EMA_LOCAL_FAST",  9)
+EMA_LOCAL_SLOW = _int("EMA_LOCAL_SLOW", 21)
 RSI_PERIOD     = _int("RSI_PERIOD",    14)
-RSI_BUY_MAX    = _float("RSI_BUY_MAX",  55.0)
-RSI_SELL_MIN   = _float("RSI_SELL_MIN", 45.0)
+RSI_BUY_MAX    = _float("RSI_BUY_MAX",  65.0)
+RSI_SELL_MIN   = _float("RSI_SELL_MIN", 35.0)
 ATR_PERIOD     = _int("ATR_PERIOD",    14)
-PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT",0.80)
+ATR_FAST       = _int("ATR_FAST",       7)
+PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 1.5)
 
-# ── Timeframe ─────────────────────────────────────────────────
-TIMEFRAME     = os.getenv("TIMEFRAME", "5m").strip()
-CANDLES_LIMIT = _int("CANDLES_LIMIT", 200)
+PINBAR_RATIO    = _float("PINBAR_RATIO",    0.50)
+ENGULF_ACTIVO   = _bool("ENGULF_ACTIVO",    True)
+VWAP_ACTIVO     = _bool("VWAP_ACTIVO",      True)
+VWAP_PCT        = _float("VWAP_PCT",        0.50)
+COOLDOWN_VELAS  = _int("COOLDOWN_VELAS",    8)
+MOMENTUM_ACTIVO = _bool("MOMENTUM_ACTIVO",  True)
 
-# ── MTF ───────────────────────────────────────────────────────
-MTF_ACTIVO    = _bool("MTF_ACTIVO",    True)
+PREMIUM_DISCOUNT_ACTIVO = _bool("PREMIUM_DISCOUNT_ACTIVO", True)
+PREMIUM_DISCOUNT_LB     = _int("PREMIUM_DISCOUNT_LB",      50)
+DISPLACEMENT_ACTIVO     = _bool("DISPLACEMENT_ACTIVO",     True)
+IDM_ACTIVO              = _bool("IDM_ACTIVO",               True)
+MTF_4H_ACTIVO           = _bool("MTF_4H_ACTIVO",            True)
+
+TIMEFRAME     = os.getenv("TIMEFRAME",     "5m").strip()
+CANDLES_LIMIT = _int("CANDLES_LIMIT",     200)
+MTF_ACTIVO    = _bool("MTF_ACTIVO",        True)
 MTF_TIMEFRAME = os.getenv("MTF_TIMEFRAME", "1h").strip()
-MTF_CANDLES   = _int("MTF_CANDLES",   60)
+MTF_CANDLES   = _int("MTF_CANDLES",        60)
 
-# ── Order Blocks ──────────────────────────────────────────────
-OB_ACTIVO   = _bool("OB_ACTIVO",    True)
-OB_LOOKBACK = _int("OB_LOOKBACK",  30)
+OB_ACTIVO          = _bool("OB_ACTIVO",          True)
+OB_LOOKBACK        = _int("OB_LOOKBACK",          30)
+BOS_ACTIVO         = _bool("BOS_ACTIVO",          True)
+ASIA_RANGE_ACTIVO  = _bool("ASIA_RANGE_ACTIVO",   True)
+VELA_CONFIRMACION  = _bool("VELA_CONFIRMACION",   True)
+CORRELACION_ACTIVO = _bool("CORRELACION_ACTIVO",  True)
+MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
+SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)
+SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
 
-# ── BOS / CHoCH ───────────────────────────────────────────────
-BOS_ACTIVO = _bool("BOS_ACTIVO", True)
+VOLUMEN_MIN_24H      = _float("VOLUMEN_MIN_24H",    2_000_000.0)
+VOLUMEN_MIN_LOW_VOL  = _float("VOLUMEN_MIN_LOW_VOL",  500_000.0)
+SCORE_MIN_LOW_VOL    = _int("SCORE_MIN_LOW_VOL",         10)
+LOW_VOL_ACTIVO       = _bool("LOW_VOL_ACTIVO",          False)
 
-# ── Rango Asia ────────────────────────────────────────────────
-ASIA_RANGE_ACTIVO  = _bool("ASIA_RANGE_ACTIVO",  True)
-VELA_CONFIRMACION  = _bool("VELA_CONFIRMACION",  True)
-CORRELACION_ACTIVO = _bool("CORRELACION_ACTIVO", True)
-
-# ── Scanner ───────────────────────────────────────────────────
-VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 500_000.0)
 MAX_PARES_SCAN   = _int("MAX_PARES_SCAN",    0)
-ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  8)
+ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  6)
+SOLO_LONG        = _bool("SOLO_LONG",        False)
 
-SOLO_LONG = _bool("SOLO_LONG", False)
+RANGE_ACTIVO    = _bool("RANGE_ACTIVO",     False)
+RANGE_ADX_MAX   = _float("RANGE_ADX_MAX",  22.0)
+RANGE_SCORE_MIN = _int("RANGE_SCORE_MIN",    7)
 
-# ── Pares bloqueados ──────────────────────────────────────────
-# ✅ KAVA-USDT y SOL-USDT bloqueados por backtest
-# (PnL consistentemente negativo en todos los tests)
-_bloq_env = os.getenv("PARES_BLOQUEADOS", "")
-_bloq_default = ["KAVA-USDT", "SOL-USDT"]
-PARES_BLOQUEADOS = list(set(
-    [p.strip() for p in _bloq_env.split(",") if p.strip()] + _bloq_default
-))
-PARES_PRIORITARIOS = [p.strip() for p in os.getenv("PARES_PRIORITARIOS","").split(",") if p.strip()]
+_bloqueados_default = (
+    "RESOLV-USDT,KAVA-USDT,AXS-USDT,"
+    "GRASS-USDT,NTRN-USDT,AWE-USDT,"
+    "DUSK-USDT,ME-USDT,2Z-USDT,"
+    "BROCCOLIF3B-USDT,PAXG-USDT,XAUT-USDT"
+)
+PARES_BLOQUEADOS = [
+    p.strip() for p in os.getenv("PARES_BLOQUEADOS", _bloqueados_default).split(",")
+    if p.strip()
+]
+PARES_PRIORITARIOS = [
+    p.strip() for p in os.getenv("PARES_PRIORITARIOS", "").split(",")
+    if p.strip()
+]
 
 MEMORY_DIR = os.getenv("MEMORY_DIR", "")
+BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
+
 
 def validar():
-    e = []
+    errores = []
     if not MODO_DEMO:
-        if not BINGX_API_KEY:    e.append("BINGX_API_KEY no configurada")
-        if not BINGX_SECRET_KEY: e.append("BINGX_SECRET_KEY no configurada")
-    if not TELEGRAM_TOKEN:       e.append("TELEGRAM_TOKEN no configurada")
+        if not BINGX_API_KEY:    errores.append("BINGX_API_KEY no configurada")
+        if not BINGX_SECRET_KEY: errores.append("BINGX_SECRET_KEY no configurada")
+    if not TELEGRAM_TOKEN:
+        errores.append("TELEGRAM_TOKEN no configurada")
+    if not ANTHROPIC_API_KEY and METACLAW_ACTIVO:
+        errores.append("ANTHROPIC_API_KEY no config — MetaClaw inactivo (bot funciona igual)")
     if LEVERAGE < 1 or LEVERAGE > 125:
-        e.append(f"LEVERAGE={LEVERAGE} fuera de rango (1-125)")
+        errores.append(f"LEVERAGE={LEVERAGE} fuera de rango")
     if TRADE_USDT_BASE < 1:
-        e.append(f"TRADE_USDT_BASE={TRADE_USDT_BASE} muy bajo (min $1)")
-    if PARTIAL_TP_ACTIVO:
-        e.append("⚠️  PARTIAL_TP_ACTIVO=True destruye el R:R (backtest probado)")
-    return e
+        errores.append(f"TRADE_USDT_BASE={TRADE_USDT_BASE} muy bajo")
+    if SCORE_MIN < 1 or SCORE_MIN > 16:
+        errores.append(f"SCORE_MIN={SCORE_MIN} debe ser 1-16")
+    if MIN_RR < 1.0:
+        errores.append(f"MIN_RR={MIN_RR} peligroso (min 1.0)")
+    return errores
