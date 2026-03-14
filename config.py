@@ -15,15 +15,17 @@ VERSION = os.getenv("VERSION", "SMC Bot BingX v8.0")
 # ══════════════════════════════════════════════════════════════
 # API KEYS (variables de entorno en Railway)
 # ══════════════════════════════════════════════════════════════
-API_KEY    = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
+API_KEY          = os.getenv("BINGX_API_KEY", "")
+API_SECRET       = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
 
 # ══════════════════════════════════════════════════════════════
 # EXCHANGE
 # ══════════════════════════════════════════════════════════════
 EXCHANGE   = "bingx"
 LEVERAGE   = int(os.getenv("LEVERAGE", "10"))
-MODO_DEMO  = os.getenv("MODO_DEMO", "false").lower() == "true"
+MODO_DEMO  = os.getenv("BINGX_MODE", os.getenv("MODO_DEMO", "false")).lower() in ("true", "demo")
 
 # ══════════════════════════════════════════════════════════════
 # MEMORIA / PERSISTENCIA
