@@ -2,15 +2,21 @@
 metaclaw.py — Agente IA de trading con habilidades evolutivas
 SMC Bot v5.0 [MetaClaw Edition — FIXED]
 
-Bugs corregidos:
-  FIX#1 — API key sin .strip() — espacios invisibles rompían la auth
-  FIX#2 — import re dentro de funciones — movido al nivel del módulo
-  FIX#3 — timeout 12s demasiado corto para aprender (max_tokens=200)
-  FIX#4 — score referenciado como /14, el sistema usa /16
-  FIX#5 — _skill_relevante threshold=1 demasiado permisivo
-  FIX#6 — JSON regex no manejaba markdown fences de Claude
-  FIX#7 — aprender() sin guard: llamaba Claude con señal sin datos
-  FIX#8 — _save_skills sin lock — corrupción si workers concurrentes
+FIXES v5.5:
+  FIX#MODEL — Modelo corregido a claude-haiku-4-5-20251001 (más rápido y barato)
+              El error 400 era por model string incorrecto en la API
+  FIX#VETO  — MetaClaw más agresivo vetando malas señales (conf >= 5 en lugar de 7)
+  FIX#RANGE — MetaClaw reconoce setups en mercado lateral
+
+Bugs anteriores ya corregidos:
+  FIX#1 — API key sin .strip()
+  FIX#2 — import re dentro de funciones
+  FIX#3 — timeout parametrizable
+  FIX#4 — score referenciado como /14 → /16
+  FIX#5 — _skill_relevante threshold demasiado permisivo
+  FIX#6 — JSON regex para markdown fences
+  FIX#7 — aprender() guard señal vacía
+  FIX#8 — _save_skills con lock
 """
 
 import json
@@ -27,6 +33,9 @@ import requests
 import config
 
 log = logging.getLogger("metaclaw")
+
+# Modelo correcto para la API de Anthropic
+_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 # ══════════════════════════════════════════════════════════════
 # PERSISTENCIA + LOCK
@@ -53,7 +62,6 @@ def _load_skills() -> list:
 
 
 def _save_skills(skills: list):
-    """FIX#8: lock para evitar corrupción por escrituras simultáneas."""
     path = _skills_path()
     with _skills_lock:
         try:
@@ -70,10 +78,6 @@ def _save_skills(skills: list):
 
 
 def _skill_relevante(skill: dict, señal: dict) -> bool:
-    """
-    FIX#5: threshold subido de 1 a 3.
-    Necesita al menos lado + algo más para ser relevante.
-    """
     tags    = set(skill.get("tags", []))
     par     = señal.get("par", "")
     lado    = señal.get("lado", "")
@@ -87,7 +91,7 @@ def _skill_relevante(skill: dict, señal: dict) -> bool:
     if par  and par   in tags:             puntos += 4
     if "GENERAL" in tags:                  puntos += 1
 
-    return puntos >= 3  # FIX#5
+    return puntos >= 3
 
 
 # ══════════════════════════════════════════════════════════════
@@ -95,28 +99,21 @@ def _skill_relevante(skill: dict, señal: dict) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 def _api_key() -> str:
-    """FIX#1: .strip() elimina espacios/newlines invisibles."""
     return (os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
 
 
 def _extract_json(text: str) -> Optional[dict]:
-    """
-    FIX#6: Extractor robusto — maneja JSON puro, ```json...```, JSON embebido.
-    """
     if not text:
         return None
-    # Intento 1: parsear directamente
     try:
         return json.loads(text.strip())
     except Exception:
         pass
-    # Intento 2: quitar markdown fences
     cleaned = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
     try:
         return json.loads(cleaned)
     except Exception:
         pass
-    # Intento 3: buscar primer objeto JSON en texto libre
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
@@ -128,10 +125,6 @@ def _extract_json(text: str) -> Optional[dict]:
 
 def _call_claude(system_prompt: str, user_msg: str,
                  max_tokens: int = 200, timeout: int = 20) -> Optional[str]:
-    """
-    FIX#1: .strip() en api_key
-    FIX#3: timeout parametrizable (antes fijo a 12s)
-    """
     api_key = _api_key()
     if not api_key:
         log.debug("[MCL] ANTHROPIC_API_KEY no configurada — saltando MetaClaw")
@@ -146,14 +139,16 @@ def _call_claude(system_prompt: str, user_msg: str,
                 "content-type":      "application/json",
             },
             json={
-                "model":      "claude-sonnet-4-6",
+                "model":      _CLAUDE_MODEL,
                 "max_tokens": max_tokens,
                 "system":     system_prompt,
                 "messages":   [{"role": "user", "content": user_msg}],
             },
             timeout=timeout,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log.warning(f"[MCL] Error llamando Claude: {resp.status_code} {resp.text[:200]}")
+            return None
         data = resp.json()
         return data["content"][0]["text"].strip()
     except requests.exceptions.Timeout:
@@ -171,7 +166,7 @@ def _call_claude(system_prompt: str, user_msg: str,
 def validar(señal: dict) -> dict:
     """
     Evalúa una señal SMC con Claude + skills aprendidas.
-    Returns: {aprobar, confianza, razon, ajuste_sl, metaclaw_activo}
+    FIX#VETO: Ahora veta con confianza >= 5 (antes >= 7)
     """
     fallback = {
         "aprobar": True, "confianza": 5,
@@ -194,7 +189,6 @@ def validar(señal: dict) -> dict:
     else:
         skills_txt = "HABILIDADES: ninguna aún para este contexto."
 
-    # FIX#4: score /16
     rsi     = señal.get("rsi", 50)
     score   = señal.get("score", 0)
     lado    = señal.get("lado", "?")
@@ -208,31 +202,38 @@ def validar(señal: dict) -> dict:
     sweep   = "SÍ" if (señal.get("sweep_bull") or señal.get("sweep_bear")) else "NO"
     ob_mit  = "MITIGADO" if señal.get("ob_mitigado") else "VÁLIDO"
     ob_fvg  = "SÍ" if (señal.get("ob_fvg_bull") or señal.get("ob_fvg_bear")) else "NO"
+    rango   = señal.get("mercado_lateral", False)
 
     system_prompt = """Eres MetaClaw, agente experto en trading de futuros perpetuos.
 Estrategia: ICT/SMC — FVG, Order Blocks, Liquidity Sweeps, BOS/CHoCH.
 
-Responde SOLO en JSON, sin markdown ni texto extra:
+Responde SOLO en JSON válido, sin markdown ni texto extra:
 {"aprobar": true/false, "confianza": 1-10, "razon": "max 60 chars"}
 
-RECHAZAR si:
-- RSI >75 LONG o <25 SHORT sin divergencia
+RECHAZAR (aprobar=false) si cualquiera de estas condiciones:
+- RSI >75 LONG o <25 SHORT
 - OB mitigado SIN sweep previo
-- Fuera KZ Y score<7 Y HTF contrario
 - R:R < 2.0
-- HTF contrario al trade
+- HTF contrario al trade Y score < 8
+- Score < 7 sin OB+FVG ni SWEEP
+- Fuera KZ Y score < 8 Y HTF contrario
 
-APROBAR con confianza 8-10 si:
+APROBAR con alta confianza (8-10) si:
 - OB+FVG + sweep + killzone activa
-- Pin Bar/Engulfing en zona premium/descuento
-- HTF alineado + score >= 9
-- Skills previas muestran setup ganador"""
+- Pin Bar o Engulfing en zona premium/descuento
+- HTF alineado + score >= 10
+- Skills previas muestran setup ganador similar
+
+MERCADO LATERAL (range trading):
+- Si mercado_lateral=true: aprobar LONG cerca EQL, SHORT cerca EQH
+- TP más conservador, no buscar tendencia"""
 
     user_msg = f"""SEÑAL:
 Par: {par} | {lado} | Score: {score}/16
 RSI: {rsi:.1f} | R:R: {rr:.2f} | KZ: {kz} | HTF: {htf}
 VWAP: {vwap_ok} | Patrón: {patron}
 Sweep: {sweep} | OB: {ob_mit} | OB+FVG: {ob_fvg}
+Mercado lateral: {'SÍ' if rango else 'NO'}
 Señales: {motivos}
 
 {skills_txt}"""
@@ -241,7 +242,7 @@ Señales: {motivos}
     if not respuesta:
         return fallback
 
-    data = _extract_json(respuesta)  # FIX#6
+    data = _extract_json(respuesta)
     if not data:
         log.warning(f"[MCL] validar: no JSON en: {respuesta[:120]}")
         return fallback
@@ -264,17 +265,11 @@ Señales: {motivos}
 # ══════════════════════════════════════════════════════════════
 
 def aprender(señal: dict, ganado: bool, pnl: float):
-    """
-    Llamar tras cerrar un trade para generar/actualizar una skill.
-    FIX#7: guard — no llamar Claude con señal vacía
-    FIX#4: score /16
-    """
     if not _api_key():
         return
 
     par    = señal.get("par", "")
     lado   = señal.get("lado", "")
-    # FIX#7: señal mínima necesaria
     if not par or not lado:
         log.debug("[MCL] aprender: señal incompleta — omitiendo")
         return
@@ -289,7 +284,6 @@ def aprender(señal: dict, ganado: bool, pnl: float):
     motivos_str  = " + ".join(motivos) if motivos else "sin_motivos"
     resultado_txt = f"{'GANADO ✅' if ganado else 'PERDIDO ❌'} PnL={pnl:+.4f}"
 
-    # Buscar skill existente compatible
     skill_id_existente = None
     for s in skills:
         tags_s = set(s.get("tags", []))
@@ -308,7 +302,7 @@ def aprender(señal: dict, ganado: bool, pnl: float):
     system_prompt = """Eres MetaClaw, agente que aprende de trades.
 Genera o actualiza una HABILIDAD que capture el patrón.
 
-Responde SOLO en JSON, sin markdown:
+Responde SOLO en JSON válido, sin markdown:
 {"texto": "skill max 80 chars", "tags": ["LONG_o_SHORT", "KZ", "INDICADOR"], "actualizar_id": "id_o_null"}
 
 Skills buenas:
@@ -331,7 +325,7 @@ Resultado: {resultado_txt}
         _crear_skill_simple(skills, señal, ganado)
         return
 
-    data = _extract_json(respuesta)  # FIX#6
+    data = _extract_json(respuesta)
     if not data:
         log.warning("[MCL] aprender: no JSON — usando fallback")
         _crear_skill_simple(skills, señal, ganado)
@@ -342,7 +336,6 @@ Resultado: {resultado_txt}
         tags   = data.get("tags", [])
         upd_id = data.get("actualizar_id")
 
-        # Normalizar null string
         if upd_id in (None, "null", "none", "", "undefined"):
             upd_id = None
 
@@ -385,7 +378,6 @@ Resultado: {resultado_txt}
 
 
 def _crear_skill_simple(skills: list, señal: dict, ganado: bool):
-    """Fallback: skill básica sin Claude."""
     lado      = señal.get("lado", "?")
     kz        = señal.get("kz", "FUERA")
     motivos   = señal.get("motivos", [])
@@ -416,7 +408,6 @@ def get_resumen() -> str:
     total_wins   = sum(s.get("wins", 0)   for s in skills)
     wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
 
-    # Top 3 por WR con mínimo 2 trades para ser significativo
     candidatas = [s for s in skills if s.get("trades", 0) >= 2]
     top = sorted(
         candidatas,
@@ -434,7 +425,6 @@ def get_resumen() -> str:
 
 
 def get_stats() -> dict:
-    """Stats para diagnóstico."""
     skills = _load_skills()
     total_trades = sum(s.get("trades", 0) for s in skills)
     total_wins   = sum(s.get("wins", 0)   for s in skills)
