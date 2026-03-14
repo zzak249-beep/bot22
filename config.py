@@ -134,3 +134,16 @@ ANALISIS_WORKERS = int(os.getenv("ANALISIS_WORKERS", "4"))
 # ══════════════════════════════════════════════════════════════
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# ══════════════════════════════════════════════════════════════
+# VALIDACIÓN
+# ══════════════════════════════════════════════════════════════
+def validar():
+    """Valida que las variables críticas estén configuradas."""
+    errores = []
+    if not API_KEY:
+        errores.append("API_KEY no configurada")
+    if not API_SECRET:
+        errores.append("API_SECRET no configurada")
+    if TRADE_USDT_BASE <= 0:
+        errores.append("TRADE_USDT_BASE debe ser > 0")
+    return errores
