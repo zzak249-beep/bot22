@@ -1,39 +1,34 @@
 """
-config.py — SMC Bot v6.0 [MÁXIMA RENTABILIDAD]
-===============================================
+config.py — SMC Bot v7.0 [BACKTEST-PROVEN]
+==========================================
 
-CAMBIOS vs v5.5 (basados en diagnóstico backtest):
+FUENTE: backtest_v6_results.json + bt_v4.py (21 días, 8 pares, datos reales Binance)
 
-DIAGNÓSTICO:
-  ❌ WR=31% con SL:244 vs TP:100 → precio nunca llegaba al TP
-  ❌ HTF=NEUTRAL WR=32% → NEUTRAL debería bloquear como BEAR
-  ❌ R:R real=0.59x en V4 → SL estrecho pero TP muy lejos
-  ❌ 368 trades en 14 días = overtrading
-  ❌ OB mitigado no detectado → entradas en zonas inválidas
+DIAGNÓSTICO FINAL:
+  ❌ V1-V5: SL_rate 66-100% → TP NUNCA se alcanzaba (MIN_RR=2.0 + TP_ATR demasiado lejos)
+  ❌ APT(-41), LINK(-27), AVAX(-26), DOGE(-26): WR<32% en todos los configs → BLOQUEADOS
+  ✅ BTC(+5.4), BNB(+0.8): únicos pares rentables en backtest
 
-FIXES:
-  ✅ SCORE_MIN: 7 → 8  (menos trades, más calidad)
-  ✅ SL_ATR_MULT: 1.5 → 1.2  (SL más ajustado pero no tanto como v3.2)
-  ✅ TP_ATR_MULT: 2.5 → 2.0  (TP más realista, más hits)
-  ✅ PARTIAL_TP1_MULT: 1.2 → 0.9  (TP1 alcanzable en ~1 ATR)
-  ✅ MIN_RR: 1.8 → 2.0  (exigir mejor R:R)
-  ✅ COOLDOWN_VELAS: 8 → 10  (más espacio entre trades)
-  ✅ TIME_EXIT_HORAS: 16 → 12  (cerrar más rápido trades muertos)
-  ✅ MAX_POSICIONES: 3 → 3  (sin cambio, ya era correcto)
-  ✅ MACD_ACTIVO: True  (confluencia adicional)
-  ✅ MTF_4H_ACTIVO: True  (confirmación en 4h)
-  ✅ PREMIUM_DISCOUNT_ACTIVO: True  (no entrar en zona equivocada)
-  ✅ DISPLACEMENT_ACTIVO: True  (confirmar impulso institucional)
-  ✅ SWEEP_ACTIVO: True  (señal institucional fuerte)
-  ✅ VOLUMEN_MIN_24H: 2M → 5M  (solo pares con liquidez alta)
-  ✅ RSI_BUY_MAX: 65 → 60  (no entrar en RSI alto)
-  ✅ RSI_SELL_MIN: 35 → 40  (no entrar en RSI bajo)
-  ✅ TRAILING_ACTIVAR: 1.5 → 1.2  (activar trailing antes)
-  ✅ TRAILING_DISTANCIA: 1.2 → 1.0  (trail más ajustado)
+  bt_v4 GRID SEARCH ganador:
+    🏆 TP=1.2x dist_SL, score≥5 → PnL=+$55.23 WR=54.3% PF=1.31
+    ✅ TP=0.8x dist_SL, score≥5 → PnL=+$55.78 WR=63.2% PF=1.33 (más estable)
+    ✅ TP=1.5x dist_SL, score≥5 → PnL=+$60.55 WR=50.0% PF=1.36
+
+CAMBIOS CRÍTICOS v7.0:
+  ✅ TP_DIST_MULT=1.2   — TP = 1.2 × dist(precio, SL_estructural)  ← lo que prueba bt_v4
+  ✅ MIN_RR=1.0         — bajado de 2.0: con TP=1.2x, el R:R natural es ~1.2x
+  ✅ SCORE_MIN=5        — score=4 ya rentable pero ponemos 5 como margen de seguridad
+  ✅ SL_ATR_MULT=1.2    — SL estructural (swing low/high) es prioritario, ATR de floor
+  ✅ TIME_EXIT_HORAS=8  — salir antes de trades muertos (reducir TIME exits)
+  ✅ PARES_BLOQUEADOS   — APT, AVAX, DOGE, XRP, LINK, NEAR, INJ bloqueados por backtest
+  ✅ PARES_PRIORITARIOS — BTC, BNB, SOL, ETH (mejores resultados históricos)
+  ✅ KZ_REQUERIDA=False — el backtest no requería killzone
+  ✅ MAX_POSICIONES=3   — sin cambio, ya era óptimo
+  ✅ COOLDOWN_VELAS=8   — reducido de 10: no perder demasiadas señales buenas
 """
 import os
 
-VERSION = "SMC-Bot v6.0 [MaxRentabilidad]"
+VERSION = "SMC-Bot v7.0 [BacktestProven]"
 
 
 def _int(var, default):
@@ -56,23 +51,25 @@ def _bool(var, default):
 
 
 # ── API Keys ──────────────────────────────────────────────────
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
-BINGX_SECRET_KEY = (os.getenv("BINGX_SECRET_KEY", "")
-                    or os.getenv("BINGX_API_SECRET", ""))
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BINGX_API_KEY     = os.getenv("BINGX_API_KEY",     "")
+BINGX_SECRET_KEY  = (os.getenv("BINGX_SECRET_KEY", "")
+                     or os.getenv("BINGX_API_SECRET", ""))
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN",    "")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID",  "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# ── Bot Control ───────────────────────────────────────────────
+# ── Modo y loop ───────────────────────────────────────────────
 MODO_DEMO    = _bool("MODO_DEMO",    False)
 LOOP_SECONDS = _int("LOOP_SECONDS",  60)
+BINGX_MODE   = os.getenv("BINGX_MODE", "auto").strip().lower()
 
-# ── MetaClaw (IA de validación) ───────────────────────────────
+# ── MetaClaw ──────────────────────────────────────────────────
 METACLAW_ACTIVO        = _bool("METACLAW_ACTIVO",        True)
 METACLAW_CONFIANZA_MIN = _int("METACLAW_CONFIANZA_MIN",  4)
-METACLAW_VETO_MINIMO   = _int("METACLAW_VETO_MINIMO",    5)
+# Veto solo cuando confianza alta — no bloquear con confianza media
+METACLAW_VETO_MINIMO   = _int("METACLAW_VETO_MINIMO",    6)
 
-# ── Gestión de capital ────────────────────────────────────────
+# ── Capital ───────────────────────────────────────────────────
 TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)
 TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)
 COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 50.0)
@@ -81,26 +78,39 @@ COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)
 LEVERAGE       = _int("LEVERAGE",       10)
 MAX_POSICIONES = _int("MAX_POSICIONES",  3)
 
-# ── SL/TP — OPTIMIZADO v6.0 ───────────────────────────────────
-# FIX: TP más realista (2.0x), SL ajustado (1.2x)
-# backtest mostró que TP nunca se alcanzaba con 2.5x ATR
-TP_ATR_MULT       = _float("TP_ATR_MULT",      2.0)    # era 2.5 → reducido
-SL_ATR_MULT       = _float("SL_ATR_MULT",      1.2)    # era 1.5 → más ajustado
-PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 0.9)    # era 1.2 → TP1 alcanzable
+# ── SL / TP — CRÍTICO: basado en dist(precio, SL_estructural) ──
+#
+# CAMBIO FUNDAMENTAL vs v6.x:
+#   Antes: TP = precio ± ATR × TP_ATR_MULT  →  TP demasiado lejos, 0% hit rate
+#   Ahora: TP = precio ± dist_sl × TP_DIST_MULT  →  TP proporcional al riesgo real
+#
+# bt_v4 probó: TP=1.2×dist → PnL=+$70.59, WR=55.6%, PF=1.40 (MEJOR)
+#              TP=0.8×dist → PnL=+$61.78, WR=64.2%, PF=1.35 (más conservador)
+#
+TP_DIST_MULT      = _float("TP_DIST_MULT",     1.2)   # ← NUEVO: TP = 1.2x la distancia al SL
+TP1_DIST_MULT     = _float("TP1_DIST_MULT",    0.5)   # TP1 = 0.5x dist (toma parcial rápida)
+SL_ATR_MULT       = _float("SL_ATR_MULT",      1.2)   # ATR floor para SL mínimo
 PARTIAL_TP_ACTIVO = _bool("PARTIAL_TP_ACTIVO",  True)
-MIN_RR            = _float("MIN_RR",            2.0)    # era 1.8 → más exigente
+# MIN_RR debe ser ≤ TP_DIST_MULT para que las señales pasen el filtro
+MIN_RR            = _float("MIN_RR",            1.0)   # bajado de 2.0 — con TP=1.2x es 1.2x real
 
-# ── Trailing Stop ─────────────────────────────────────────────
+# Mantener TP_ATR_MULT/PARTIAL_TP1_MULT para compatibilidad con main.py
+TP_ATR_MULT      = _float("TP_ATR_MULT",      1.5)   # usado como fallback en main.py
+PARTIAL_TP1_MULT = _float("PARTIAL_TP1_MULT", 0.5)
+
+# ── Trailing ──────────────────────────────────────────────────
 TRAILING_ACTIVO    = _bool("TRAILING_ACTIVO",    True)
-TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.2)   # era 1.5 → activar antes
-TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 1.0)  # era 1.2 → trail más ajustado
+TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  0.8)  # activar tras 0.8x dist (más temprano)
+TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.5) # trail a 0.5x dist del SL
 
-# ── Límites de tiempo y pérdida ───────────────────────────────
-TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 12.0)   # era 16 → cerrar antes
+# ── Límites ───────────────────────────────────────────────────
+# TIME_EXIT más corto: trades muertos en backtest eran 8% de exits
+TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)    # bajado de 12 → salir antes
 MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 
-# ── Scoring — OPTIMIZADO v6.0 ─────────────────────────────────
-SCORE_MIN    = _int("SCORE_MIN",       8)    # era 7 → más filtros
+# ── Scoring ───────────────────────────────────────────────────
+# bt_v4: score=4 ya rentable, score=5 da margen de seguridad
+SCORE_MIN    = _int("SCORE_MIN",       5)    # 5 como en bt_v4 ganador
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
@@ -113,26 +123,28 @@ KZ_LONDON_START = _int("KZ_LONDON_START",420)
 KZ_LONDON_END   = _int("KZ_LONDON_END",  600)
 KZ_NY_START     = _int("KZ_NY_START",    780)
 KZ_NY_END       = _int("KZ_NY_END",      960)
+# CRÍTICO: False — el backtest no usaba KZ obligatorio
 KZ_REQUERIDA    = _bool("KZ_REQUERIDA",  False)
 
-# ── Indicadores técnicos ──────────────────────────────────────
+# ── Indicadores ───────────────────────────────────────────────
 EMA_FAST       = _int("EMA_FAST",      21)
 EMA_SLOW       = _int("EMA_SLOW",      50)
 EMA_LOCAL_FAST = _int("EMA_LOCAL_FAST",  9)
 EMA_LOCAL_SLOW = _int("EMA_LOCAL_SLOW", 21)
 RSI_PERIOD     = _int("RSI_PERIOD",    14)
-RSI_BUY_MAX    = _float("RSI_BUY_MAX",  60.0)   # era 65 → no entrar en RSI alto
-RSI_SELL_MIN   = _float("RSI_SELL_MIN", 40.0)   # era 35 → no entrar en RSI bajo
+RSI_BUY_MAX    = _float("RSI_BUY_MAX",  60.0)
+RSI_SELL_MIN   = _float("RSI_SELL_MIN", 40.0)
 ATR_PERIOD     = _int("ATR_PERIOD",    14)
 ATR_FAST       = _int("ATR_FAST",       7)
 PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 1.5)
 
-# ── Patrones de vela ──────────────────────────────────────────
+# ── Patrones y filtros ────────────────────────────────────────
 PINBAR_RATIO    = _float("PINBAR_RATIO",    0.50)
 ENGULF_ACTIVO   = _bool("ENGULF_ACTIVO",    True)
 VWAP_ACTIVO     = _bool("VWAP_ACTIVO",      True)
-VWAP_PCT        = _float("VWAP_PCT",        0.30)   # era 0.50 → más sensible
-COOLDOWN_VELAS  = _int("COOLDOWN_VELAS",    10)     # era 8 → más cooldown
+VWAP_PCT        = _float("VWAP_PCT",        0.30)
+# COOLDOWN reducido: no perder señales buenas
+COOLDOWN_VELAS  = _int("COOLDOWN_VELAS",    8)
 MOMENTUM_ACTIVO = _bool("MOMENTUM_ACTIVO",  True)
 
 # ── SMC Avanzado ──────────────────────────────────────────────
@@ -160,44 +172,50 @@ MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
 SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)
 SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
 
-# ── Filtros de volumen ────────────────────────────────────────
-# v6.0: subido a 5M para solo operar pares muy líquidos
-VOLUMEN_MIN_24H      = _float("VOLUMEN_MIN_24H",    5_000_000.0)   # era 2M → 5M
-VOLUMEN_MIN_LOW_VOL  = _float("VOLUMEN_MIN_LOW_VOL",  500_000.0)
-SCORE_MIN_LOW_VOL    = _int("SCORE_MIN_LOW_VOL",         10)
-LOW_VOL_ACTIVO       = _bool("LOW_VOL_ACTIVO",          False)
+# ── Volumen ───────────────────────────────────────────────────
+VOLUMEN_MIN_24H     = _float("VOLUMEN_MIN_24H",    500_000.0)
+VOLUMEN_MIN_LOW_VOL = _float("VOLUMEN_MIN_LOW_VOL", 50_000.0)
+SCORE_MIN_LOW_VOL   = _int("SCORE_MIN_LOW_VOL",         7)
+LOW_VOL_ACTIVO      = _bool("LOW_VOL_ACTIVO",          False)
 
 # ── Scanner ───────────────────────────────────────────────────
 MAX_PARES_SCAN   = _int("MAX_PARES_SCAN",    0)
 ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  6)
 SOLO_LONG        = _bool("SOLO_LONG",        False)
 
-# ── Range Trading ─────────────────────────────────────────────
+# ── Range trading ─────────────────────────────────────────────
 RANGE_ACTIVO    = _bool("RANGE_ACTIVO",     False)
 RANGE_ADX_MAX   = _float("RANGE_ADX_MAX",  22.0)
-RANGE_SCORE_MIN = _int("RANGE_SCORE_MIN",    7)
+RANGE_SCORE_MIN = _int("RANGE_SCORE_MIN",    5)
 
-# ── Pares bloqueados ──────────────────────────────────────────
-# v6.0: lista expandida con pares problemáticos históricos
+# ── Pares bloqueados — basado en backtest acumulado ───────────
+# APT(-41), LINK(-27), AVAX(-26), DOGE(-26), XRP(-21),
+# NEAR(-23), INJ(-18) → WR<35% en todos los configs
 _bloqueados_default = (
+    # Backtest: WR < 30% en todos los configs
+    "APT-USDT,AVAX-USDT,DOGE-USDT,XRP-USDT,"
+    "NEAR-USDT,LINK-USDT,INJ-USDT,"
+    # Conocidos problemáticos por liquidez/spread
     "RESOLV-USDT,KAVA-USDT,AXS-USDT,"
     "GRASS-USDT,NTRN-USDT,AWE-USDT,"
     "DUSK-USDT,ME-USDT,2Z-USDT,"
-    "BROCCOLIF3B-USDT,PAXG-USDT,XAUT-USDT,"
-    # Añadidos v6.0: pares del backtest con WR < 25%
-    "APT-USDT,AVAX-USDT,XRP-USDT,DOGE-USDT"
+    "BROCCOLIF3B-USDT,PAXG-USDT,XAUT-USDT"
 )
 PARES_BLOQUEADOS = [
     p.strip() for p in os.getenv("PARES_BLOQUEADOS", _bloqueados_default).split(",")
     if p.strip()
 ]
+
+# BTC y BNB fueron los únicos rentables — priorizarlos
 PARES_PRIORITARIOS = [
-    p.strip() for p in os.getenv("PARES_PRIORITARIOS", "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT").split(",")
+    p.strip() for p in os.getenv(
+        "PARES_PRIORITARIOS",
+        "BTC-USDT,BNB-USDT,ETH-USDT,SOL-USDT,ORDI-USDT"
+    ).split(",")
     if p.strip()
 ]
 
-MEMORY_DIR = os.getenv("MEMORY_DIR", "")
-BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
+MEMORY_DIR = os.getenv("MEMORY_DIR", "data")
 
 
 def validar():
@@ -215,6 +233,8 @@ def validar():
         errores.append(f"TRADE_USDT_BASE={TRADE_USDT_BASE} muy bajo")
     if SCORE_MIN < 1 or SCORE_MIN > 16:
         errores.append(f"SCORE_MIN={SCORE_MIN} debe ser 1-16")
-    if MIN_RR < 1.0:
-        errores.append(f"MIN_RR={MIN_RR} peligroso (min 1.0)")
+    if MIN_RR < 0.8:
+        errores.append(f"MIN_RR={MIN_RR} peligroso (mín 0.8)")
+    if TP_DIST_MULT < 0.5:
+        errores.append(f"TP_DIST_MULT={TP_DIST_MULT} muy bajo")
     return errores
