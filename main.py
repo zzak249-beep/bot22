@@ -22,7 +22,7 @@ if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
     logging.getLogger().setLevel(logging.DEBUG)
 
 log = logging.getLogger("main")
-log.info("=== ARRANQUE SMC BOT v4.2 ===")
+log.info("=== ARRANQUE SMC BOT v7.0 ===")
 
 try:
     import config, exchange, analizar, memoria, scanner_pares, metaclaw
@@ -52,12 +52,19 @@ log.info(f"Módulos OK | {config.VERSION}")
 
 GRUPOS_CORRELACION = [
     {"BTC-USDT", "ETH-USDT"},
-    {"SOL-USDT", "APT-USDT"},                    # L1 alta cap
-    {"AVAX-USDT", "SUI-USDT"},                   # L1 media cap (separados de SOL)
+    {"SOL-USDT", "APT-USDT"},
+    {"AVAX-USDT", "SUI-USDT"},
     {"ARB-USDT", "OP-USDT"},
-    {"DOGE-USDT", "SHIB-USDT"},
-    {"PEPE-USDT", "WIF-USDT", "BONK-USDT"},
+    # v5.5: grupo meme completo — todos correlacionados
+    {"DOGE-USDT", "SHIB-USDT", "PEPE-USDT", "WIF-USDT", "BONK-USDT",
+     "FLOKI-USDT", "HIPPO-USDT", "NEIRO-USDT", "MOG-USDT"},
+    # v5.5: grupo BTC-L2 / ordinals
+    {"ORDI-USDT", "STX-USDT", "SATS-USDT"},
+    # v5.5: grupo DeFi blue-chip
+    {"AAVE-USDT", "UNI-USDT", "MKR-USDT"},
     {"BNB-USDT", "TRX-USDT"},
+    # v5.5: grupo gaming/metaverse
+    {"AXS-USDT", "SAND-USDT", "MANA-USDT", "IMX-USDT"},
 ]
 
 def hay_correlacion(par: str, lado: str, posiciones: dict) -> bool:
@@ -316,6 +323,11 @@ def sincronizar_posiciones():
                 kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
             # ── MetaClaw: aprender del resultado ────────────────
             _mcl_aprender(pos, pnl)
+            # ── v5.5: registrar en contador KZ ──────────────────
+            try:
+                analizar.registrar_trade_kz(pos.get("kz", "FUERA"), pnl > 0)
+            except Exception:
+                pass
             del estado.posiciones[par]
             _notif_cierre(par, lado, entry, salida, pnl, f"BingX-{razon}")
             log.info(f"[SYNC] {par} cerrado ({razon}) PnL≈{pnl:+.4f}")
@@ -448,6 +460,23 @@ def gestionar_posiciones():
 
             gestionar_partial_tp(par, pos, precio)
 
+            # v5.5: cierre por falta de movimiento (2h sin avance)
+            if _check_sin_movimiento(par, pos, precio):
+                res         = exchange.cerrar_posicion(par, qty, lado)
+                salida_real = (res or {}).get("precio_salida", precio) or precio
+                pnl = qty * ((salida_real - pos["entrada"]) if lado == "LONG" else (pos["entrada"] - salida_real))
+                estado.registrar_cierre(pnl)
+                memoria.registrar_resultado(par, pnl, lado,
+                    kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
+                _mcl_aprender(pos, pnl)
+                try:
+                    analizar.registrar_trade_kz(pos.get("kz", "FUERA"), pnl > 0)
+                except Exception:
+                    pass
+                del estado.posiciones[par]
+                _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, "SIN-MOVIMIENTO")
+                continue
+
             if check_time_exit(par, pos):
                 res         = exchange.cerrar_posicion(par, qty, lado)
                 salida_real = (res or {}).get("precio_salida", precio) or precio
@@ -456,6 +485,11 @@ def gestionar_posiciones():
                 memoria.registrar_resultado(par, pnl, lado,
                     kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
                 _mcl_aprender(pos, pnl)
+                # v5.5: registrar KZ
+                try:
+                    analizar.registrar_trade_kz(pos.get("kz", "FUERA"), pnl > 0)
+                except Exception:
+                    pass
                 del estado.posiciones[par]
                 _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, "TIME")
                 continue
@@ -482,6 +516,11 @@ def gestionar_posiciones():
                 memoria.registrar_resultado(par, pnl, lado,
                     kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
                 _mcl_aprender(pos, pnl)
+                # v5.5: registrar KZ
+                try:
+                    analizar.registrar_trade_kz(pos.get("kz", "FUERA"), pnl > 0)
+                except Exception:
+                    pass
                 del estado.posiciones[par]
                 log.info(f"CIERRE {lado} {par} @ {salida_real:.6f} PnL={pnl:+.4f} ({razon})")
                 _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, razon,
@@ -500,6 +539,59 @@ def gestionar_posiciones():
 def _pos_bot_count() -> int:
     """Posiciones abiertas por el bot (excluye manuales con recuperada=True)."""
     return sum(1 for v in estado.posiciones.values() if not v.get("recuperada", False))
+
+
+def _check_sin_movimiento(par: str, pos: dict, precio: float) -> bool:
+    """
+    v5.5: Cierra el trade si lleva 2h sin moverse ±0.15%.
+    Trades que no van a ningún sitio acaban en pérdida por time-exit.
+    """
+    ts_str = pos.get("ts", "")
+    if not ts_str:
+        return False
+    try:
+        ts    = datetime.fromisoformat(ts_str)
+        ahora = datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        horas = (ahora - ts).total_seconds() / 3600
+        if horas < 2.0:
+            return False
+        # Si ya golpeó TP1, darle más tiempo
+        if pos.get("tp1_hit"):
+            return False
+        entrada = pos["entrada"]
+        if entrada <= 0:
+            return False
+        movimiento = abs(precio - entrada) / entrada * 100
+        # Menos de 0.15% de movimiento en 2h = trade muerto
+        if movimiento < 0.15:
+            log.info(f"[SIN-MOV] {par} {pos['lado']} {horas:.1f}h movimiento={movimiento:.2f}% → cierre")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _get_streak_multiplier() -> float:
+    """
+    v5.5: Ajusta el tamaño del trade según la racha reciente.
+    Racha ganadora → aumentar. Racha perdedora → reducir.
+    """
+    trades = memoria._data.get("trades", [])[-5:]
+    if len(trades) < 3:
+        return 1.0
+    wins   = sum(1 for t in trades if t.get("ganado"))
+    losses = len(trades) - wins
+    if wins >= 4:
+        return 1.4   # 4-5 ganadores de los últimos 5 → +40%
+    elif wins >= 3:
+        return 1.2   # 3 ganadores → +20%
+    elif losses >= 4:
+        return 0.6   # 4-5 perdedores → -40%
+    elif losses >= 3:
+        return 0.8   # 3 perdedores → -20%
+    return 1.0
 
 
 def ejecutar_senal(s: dict) -> str:
@@ -572,12 +664,20 @@ def ejecutar_senal(s: dict) -> str:
 
     trade_usdt = memoria.get_trade_amount()
 
+    # v5.5: ajuste por racha (streak multiplier)
+    streak_mult = _get_streak_multiplier()
+    if streak_mult != 1.0:
+        log.info(f"[STREAK] {par} multiplicador={streak_mult:.1f}x (racha reciente)")
+
     # Compounding basado en balance TOTAL (no margen libre)
     balance = balance_total  # alias para compatibilidad con el resto del bloque
     if balance > config.TRADE_USDT_BASE * 2 and not config.MODO_DEMO:
         trade_por_balance = balance * 0.12  # 12% del balance total disponible
         trade_usdt = min(max(trade_usdt, trade_por_balance), config.TRADE_USDT_MAX)
         trade_usdt = round(trade_usdt, 2)
+
+    # Aplicar streak multiplier
+    trade_usdt = round(min(trade_usdt * streak_mult, config.TRADE_USDT_MAX), 2)
 
     # ── Sizing dinámico por score ──────────────────────────────────────────
     score_trade  = s.get("score", 0)
@@ -639,14 +739,26 @@ def ejecutar_senal(s: dict) -> str:
     if entrada_real <= 0:
         entrada_real = exchange.get_precio(par) or s["precio"]
 
-    atr    = s.get("atr", 0)
-    precio = s["precio"]
-    if atr > 0:
-        sl_r  = (entrada_real - atr * config.SL_ATR_MULT)  if lado == "LONG" else (entrada_real + atr * config.SL_ATR_MULT)
-        tp_r  = (entrada_real + atr * config.TP_ATR_MULT)  if lado == "LONG" else (entrada_real - atr * config.TP_ATR_MULT)
+    atr     = s.get("atr", 0)
+    precio  = s["precio"]
+    ratio   = entrada_real / precio if precio > 0 else 1.0
+
+    # FIX v7.0: TP proporcional al riesgo real (dist_sl x TP_DIST_MULT)
+    # Antes: TP = ATR x mult → demasiado lejos → SL_rate 66-98%
+    # Ahora: TP = dist_sl x 1.2 → proporcional, WR=55.6% PF=1.40 (bt_v4)
+    dist_sl = s.get("dist_sl", 0)
+    if dist_sl > 0:
+        dist_real = dist_sl * ratio
+        tp_mult   = getattr(config, "TP_DIST_MULT",  1.2)
+        tp1_mult  = getattr(config, "TP1_DIST_MULT", 0.5)
+        sl_r  = (entrada_real - dist_real)                if lado == "LONG" else (entrada_real + dist_real)
+        tp_r  = (entrada_real + dist_real * tp_mult)      if lado == "LONG" else (entrada_real - dist_real * tp_mult)
+        tp1_r = (entrada_real + dist_real * tp1_mult)     if lado == "LONG" else (entrada_real - dist_real * tp1_mult)
+    elif atr > 0:
+        sl_r  = (entrada_real - atr * config.SL_ATR_MULT)      if lado == "LONG" else (entrada_real + atr * config.SL_ATR_MULT)
+        tp_r  = (entrada_real + atr * config.TP_ATR_MULT)      if lado == "LONG" else (entrada_real - atr * config.TP_ATR_MULT)
         tp1_r = (entrada_real + atr * config.PARTIAL_TP1_MULT) if lado == "LONG" else (entrada_real - atr * config.PARTIAL_TP1_MULT)
     else:
-        ratio = entrada_real / precio if precio > 0 else 1.0
         sl_r  = s["sl"]  * ratio
         tp_r  = s["tp"]  * ratio
         tp1_r = s["tp1"] * ratio
@@ -818,14 +930,14 @@ def main():
         f"🤖 *{config.VERSION}* arrancado\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance    : `${balance:.2f} USDT`\n"
-        f"💵 Trade      : `$10.00` × {config.LEVERAGE}x (real)\n"
+        f"💵 Trade      : `${config.TRADE_USDT_BASE:.0f}` × {config.LEVERAGE}x\n"
         f"📊 Pares      : `{len(pares)}` (vol >${config.VOLUMEN_MIN_24H/1e6:.0f}M)\n"
-        f"🏅 Score≥`{config.SCORE_MIN}/14` | Min R:R `{config.MIN_RR}x`\n"
-        f"💹 Compounding: cada ${config.COMPOUND_STEP_USDT:.0f} ganados → +${config.COMPOUND_ADD_USDT:.0f}/trade\n"
-        f"🏆 OB+FVG Confluencia | OB no mitigado\n"
-        f"🧠 Pin Bar + Engulfing + Sweeps + VWAP\n"
-        f"⏱️ Cooldown: {config.COOLDOWN_VELAS} velas | Time exit: {config.TIME_EXIT_HORAS}h\n"
-        f"🔁 Anti-hedge + Correlación\n"
+        f"🏅 Score≥`{config.SCORE_MIN}/16` | Min R:R `{config.MIN_RR}x`\n"
+        f"🔒 Cond. institucional OBLIGATORIA: OB+FVG / SWEEP / IDM\n"
+        f"🌍 Macro BTC activo | Anti-overtrading KZ\n"
+        f"📈 Streak sizing | Cierre sin-movimiento 2h\n"
+        f"🔁 Anti-hedge + Correlación ampliada (memes/L2/gaming)\n"
+        f"{'🌊 Modo RANGE activo' if getattr(config,'RANGE_ACTIVO',False) else ''}\n"
         f"🔴 *LIVE — DINERO REAL — 24/7*"
     )
 
@@ -840,6 +952,12 @@ def main():
             estado.reset_diario()
             balance = exchange.get_balance()
             kz      = analizar.en_killzone()
+
+            # v5.5: actualizar macro BTC cada ciclo
+            try:
+                analizar.actualizar_macro_btc()
+            except Exception:
+                pass
 
             log.info(
                 f"Ciclo {ciclo} | {datetime.now(timezone.utc).strftime('%H:%M UTC')} | "
