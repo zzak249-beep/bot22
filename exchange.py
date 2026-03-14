@@ -1,6 +1,11 @@
 """
 exchange.py — BingX Perpetual Futures API
 SMC Bot v5.0 — FIX balance + debug logging
+
+FIXES v5.5:
+  FIX#SL — Verificar SL/TP real en BingX tras abrir posición
+           Si falló silenciosamente, colocar manualmente antes de registrar
+  FIX#RETRY — El retry sin SL/TP ahora siempre coloca SL/TP separados
 """
 import hashlib
 import hmac
@@ -40,7 +45,6 @@ def _praseParam(params: dict) -> str:
     parts = []
     for k, v in params.items():
         if isinstance(v, dict):
-            # Objetos como stopLoss/takeProfit → JSON string en la URL
             parts.append(f"{k}={json.dumps(v, separators=(',', ':'))}")
         else:
             parts.append(f"{k}={v}")
@@ -77,17 +81,13 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
 
 
 def _post(path: str, params: Optional[dict] = None) -> dict:
-    """
-    Patrón oficial BingX: todos los params van en la URL como query string.
-    El body está vacío. La firma se hace sobre el query string completo.
-    """
     p = dict(params or {})
     p["timestamp"] = _ts()
     qs = _praseParam(p)
     sig = _sign(qs)
     url = f"{BASE_URL}{path}?{qs}&signature={sig}"
     try:
-        r = requests.post(url, headers=_headers(), data={}, timeout=12)
+        r = requests.post(url, headers=_headers(), timeout=15)
         return r.json()
     except Exception as e:
         log.error(f"POST {path}: {e}")
@@ -95,20 +95,19 @@ def _post(path: str, params: Optional[dict] = None) -> dict:
 
 
 # ═══════════════════════════════════════════════════════
-# TIEMPO
+# TIME SYNC
 # ═══════════════════════════════════════════════════════
 
 def sync_server_time():
     global _time_offset
     try:
-        r = requests.get(f"{BASE_URL}/openApi/swap/v2/server/time", timeout=5)
-        d = r.json()
-        st = int(d.get("data", {}).get("serverTime", 0) or 0)
-        if st > 0:
-            _time_offset = st - int(time.time() * 1000)
-            log.info(f"[TIME] offset={_time_offset}ms")
+        r    = requests.get(f"{BASE_URL}/openApi/swap/v2/server/time", timeout=8)
+        srv  = r.json().get("data", {}).get("serverTime", 0)
+        local = int(time.time() * 1000)
+        _time_offset = int(srv) - local if srv else 0
+        log.info(f"[TIME] offset={_time_offset}ms")
     except Exception as e:
-        log.warning(f"sync_server_time: {e}")
+        log.warning(f"[TIME] sync falló: {e}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -116,21 +115,22 @@ def sync_server_time():
 # ═══════════════════════════════════════════════════════
 
 def _cargar_contratos():
-    global _CONTRATOS_FUTURES
+    global _QTY_PRECISION, _MIN_QTY
     try:
-        r = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/contracts", timeout=12)
-        contratos = r.json().get("data", []) or []
-        _CONTRATOS_FUTURES = set()
-        for c in contratos:
-            sym = c.get("symbol", "")
+        data  = _get("/openApi/swap/v2/quote/contracts")
+        items = data.get("data", []) or []
+        for item in items:
+            sym  = item.get("symbol", "")
             if not sym:
                 continue
             _CONTRATOS_FUTURES.add(sym)
-            _QTY_PRECISION[sym] = int(c.get("quantityPrecision", 4))
-            _MIN_QTY[sym] = float(c.get("minQty", 0.0001) or 0.0001)
-        log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} pares")
+            prec = int(item.get("quantityPrecision", 4) or 4)
+            mq   = float(item.get("minQty", 0) or 0)
+            _QTY_PRECISION[sym] = prec
+            _MIN_QTY[sym]       = mq
+        log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} futuros cargados")
     except Exception as e:
-        log.warning(f"_cargar_contratos: {e}")
+        log.warning(f"[CONTRATOS] {e}")
 
 
 def par_es_soportado(par: str) -> bool:
@@ -141,137 +141,78 @@ def par_es_soportado(par: str) -> bool:
     return True
 
 
+def bloquear_par(par: str):
+    _blocked_pairs.add(par)
+    log.info(f"[BLOCKED] {par} bloqueado permanentemente")
+
+
 # ═══════════════════════════════════════════════════════
-# PRECIO Y VELAS
+# PRECIO
 # ═══════════════════════════════════════════════════════
 
 def get_precio(par: str) -> float:
-    if config.MODO_DEMO:
-        return 1.0
     try:
-        r = requests.get(
-            f"{BASE_URL}/openApi/swap/v2/quote/price",
-            params={"symbol": par}, timeout=6,
-        )
-        return float(r.json().get("data", {}).get("price", 0) or 0)
+        data = _get("/openApi/swap/v2/quote/price", {"symbol": par})
+        p    = data.get("data", {}).get("price", 0)
+        return float(p) if p else 0.0
     except Exception as e:
-        log.debug(f"get_precio {par}: {e}")
+        log.error(f"get_precio {par}: {e}")
         return 0.0
 
 
-def get_candles(par: str, tf: str, limit: int = 200) -> list:
+# ═══════════════════════════════════════════════════════
+# VELAS
+# ═══════════════════════════════════════════════════════
+
+def get_candles(par: str, tf: str = "5m", limit: int = 200) -> list:
     try:
-        r = requests.get(
-            f"{BASE_URL}/openApi/swap/v2/quote/klines",
-            params={"symbol": par, "interval": tf, "limit": min(limit, 1000)},
-            timeout=10,
-        )
-        raw = r.json().get("data", []) or []
-        result = []
+        data   = _get("/openApi/swap/v3/quote/klines",
+                      {"symbol": par, "interval": tf, "limit": limit})
+        raw    = data.get("data", []) or []
+        candles = []
         for c in raw:
             try:
-                if isinstance(c, list):
-                    result.append({
-                        "ts": int(c[0]), "open": float(c[1]), "high": float(c[2]),
-                        "low": float(c[3]), "close": float(c[4]), "volume": float(c[5]),
-                    })
-                elif isinstance(c, dict):
-                    result.append({
-                        "ts":     int(c.get("time", c.get("openTime", 0))),
-                        "open":   float(c.get("open", 0)),
-                        "high":   float(c.get("high", 0)),
-                        "low":    float(c.get("low", 0)),
-                        "close":  float(c.get("close", 0)),
-                        "volume": float(c.get("volume", 0)),
-                    })
+                candles.append({
+                    "ts":     int(c[0]),
+                    "open":   float(c[1]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "close":  float(c[4]),
+                    "volume": float(c[5]),
+                })
             except Exception:
-                pass
-        result.sort(key=lambda x: x["ts"])
-        return result
+                continue
+        return candles
     except Exception as e:
-        log.debug(f"get_candles {par}/{tf}: {e}")
+        log.error(f"get_candles {par} {tf}: {e}")
         return []
 
 
 # ═══════════════════════════════════════════════════════
-# BALANCE — debug completo para diagnosticar
+# BALANCE
 # ═══════════════════════════════════════════════════════
 
-def _try_balance_endpoint(path: str) -> tuple:
-    """
-    Retorna (balance_total, margen_disponible) desde el endpoint.
-    balance_total  = campo 'balance' o 'equity' (dinero total en la cuenta)
-    margen_disponible = campo 'availableMargin' (libre para nuevas órdenes)
-    """
+def _try_balance_endpoint(ep: str) -> tuple:
     try:
-        data = _get(path)
-        code = data.get("code", -1)
-        msg  = data.get("msg", "")
-        raw  = json.dumps(data)[:400]
-        log.info(f"[BAL-RAW] {path} code={code} msg={msg} → {raw}")
-
-        if code != 0:
-            return -1.0, -1.0
-
-        d   = data.get("data", {})
-        bal = d.get("balance") if isinstance(d, dict) else None
-
-        total_val = -1.0
-        avail_val = -1.0
-
-        if isinstance(bal, dict):
-            # balance total: preferir 'balance' → 'equity'
-            for k in ("balance", "equity"):
-                v = bal.get(k)
-                if v is not None:
-                    try:
-                        f = float(v)
-                        if f >= 0:
-                            total_val = f
-                            break
-                    except Exception:
-                        pass
-            # margen disponible
-            for k in ("availableMargin", "freeMargin", "available", "maxWithdrawAmount"):
-                v = bal.get(k)
-                if v is not None:
-                    try:
-                        f = float(v)
-                        if f >= 0:
-                            avail_val = f
-                            break
-                    except Exception:
-                        pass
-            if total_val >= 0:
-                log.info(f"[BAL] {path} total={total_val:.2f} disponible={avail_val:.2f}")
-                return total_val, avail_val
-
-        # Caso 2: data es dict directo
-        if isinstance(d, dict) and "availableMargin" in d:
-            avail = float(d.get("availableMargin", 0))
-            total = float(d.get("balance", d.get("equity", avail)))
-            return total, avail
-
-        # Caso 3: data es lista
-        if isinstance(d, list):
-            for item in d:
-                asset = str(item.get("asset", item.get("currency", ""))).upper()
-                if asset in ("USDT", ""):
-                    t = item.get("balance", item.get("equity"))
-                    a = item.get("availableMargin", item.get("freeMargin", item.get("available")))
-                    if t is not None:
-                        return float(t), float(a) if a is not None else float(t)
-
-        log.warning(f"[BAL] {path} no se encontró campo de balance en: {raw}")
-        return -1.0, -1.0
-
+        data  = _get(ep)
+        bal   = data.get("data", {})
+        if isinstance(bal, list) and bal:
+            bal = bal[0]
+        if not isinstance(bal, dict):
+            return -1, -1
+        total = float(bal.get("balance",    bal.get("totalWalletBalance", -1)) or -1)
+        avail = float(bal.get("availableMargin",
+                              bal.get("availableBalance",
+                              bal.get("available", total))) or total)
+        if total >= 0:
+            log.info(f"[BAL] {ep} total={total:.2f} disponible={avail:.2f}")
+        return total, avail
     except Exception as e:
-        log.warning(f"[BAL] {path} excepción: {e}")
-        return -1.0, -1.0
+        log.debug(f"[BAL] {ep} error: {e}")
+        return -1, -1
 
 
 def get_balance() -> float:
-    """Balance TOTAL de la cuenta (para display y reporte). Incluye margen en uso."""
     if config.MODO_DEMO:
         return 200.0
 
@@ -286,16 +227,10 @@ def get_balance() -> float:
         if total >= 0:
             log.info(f"[BAL] ✅ Balance total: ${total:.2f} | Disponible: ${avail:.2f} desde {ep}")
             return total
-
-    log.warning("[BAL] Todos los endpoints fallaron — retornando 0")
     return 0.0
 
 
 def get_available_margin() -> float:
-    """
-    Margen DISPONIBLE para abrir nuevas posiciones.
-    Usar SOLO en ejecutar_senal() para verificar si hay fondos libres.
-    """
     if config.MODO_DEMO:
         return 200.0
 
@@ -308,7 +243,6 @@ def get_available_margin() -> float:
     for ep in endpoints:
         total, avail = _try_balance_endpoint(ep)
         if total >= 0:
-            # Si no se pudo leer availableMargin, asumir conservadoramente
             return avail if avail >= 0 else total
     return 0.0
 
@@ -330,12 +264,43 @@ def get_posiciones_abiertas() -> list:
 
 
 # ═══════════════════════════════════════════════════════
+# ÓRDENES ABIERTAS — para verificar SL/TP
+# ═══════════════════════════════════════════════════════
+
+def get_ordenes_abiertas(par: str) -> list:
+    """Retorna las órdenes pendientes (SL/TP) de un par."""
+    try:
+        data = _get("/openApi/swap/v2/trade/openOrders", {"symbol": par})
+        orders = data.get("data", {})
+        if isinstance(orders, dict):
+            orders = orders.get("orders", []) or []
+        return orders if isinstance(orders, list) else []
+    except Exception as e:
+        log.debug(f"get_ordenes_abiertas {par}: {e}")
+        return []
+
+
+def verificar_sl_tp_presentes(par: str) -> tuple:
+    """
+    Verifica si hay órdenes SL y TP activas en BingX para el par.
+    Retorna (tiene_sl, tiene_tp).
+    """
+    ordenes = get_ordenes_abiertas(par)
+    tiene_sl = any(
+        o.get("type", "") in ("STOP_MARKET", "STOP") for o in ordenes
+    )
+    tiene_tp = any(
+        o.get("type", "") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") for o in ordenes
+    )
+    return tiene_sl, tiene_tp
+
+
+# ═══════════════════════════════════════════════════════
 # CANTIDAD Y LEVERAGE
 # ═══════════════════════════════════════════════════════
 
-# Límite de notional por par (qty × precio). BingX varía por par y leverage.
-# Si BingX rechaza con "maximum position value", se reduce qty automáticamente.
-_MAX_NOTIONAL: dict = {}   # par → max_notional_usdt (aprendido dinámicamente)
+_MAX_NOTIONAL: dict = {}
+
 
 def calcular_cantidad(par: str, usdt: float, precio: float) -> float:
     if precio <= 0:
@@ -349,12 +314,10 @@ def calcular_cantidad(par: str, usdt: float, precio: float) -> float:
         if qty < min_q:
             return 0.0
 
-        # Respetar límite de notional conocido para este par
         max_notional = _MAX_NOTIONAL.get(par, 0)
         if max_notional > 0:
-            # notional real = qty × precio (sin leverage, es el valor de la posición)
             notional = qty * precio
-            if notional > max_notional * 0.90:  # 10% de margen
+            if notional > max_notional * 0.90:
                 qty_limitada = float(int((max_notional * 0.88 / precio) * factor)) / factor
                 if qty_limitada >= min_q:
                     log.info(f"[QTY] {par} notional limitado a ${max_notional:.0f} → qty={qty_limitada}")
@@ -368,13 +331,11 @@ def calcular_cantidad(par: str, usdt: float, precio: float) -> float:
 
 
 def registrar_max_notional(par: str, max_usdt: float):
-    """Registrar límite aprendido de error de BingX."""
     _MAX_NOTIONAL[par] = max_usdt
     log.info(f"[QTY] {par} límite notional aprendido: ${max_usdt:.0f}")
 
 
 def _detectar_limite_notional(par: str, err_msg: str):
-    """Detecta el error 'maximum position value is X USDT' y lo aprende."""
     import re
     m = re.search(r'maximum position value for this leverage is (\d+(?:\.\d+)?)\s*USDT', err_msg, re.I)
     if m:
@@ -396,7 +357,7 @@ def _set_leverage(par: str, lado: str):
 
 
 # ═══════════════════════════════════════════════════════
-# ABRIR LONG
+# ABRIR LONG — FIX SL/TP CRÍTICO
 # ═══════════════════════════════════════════════════════
 
 def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Optional[dict]:
@@ -421,24 +382,43 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
             }
 
         data = _post("/openApi/swap/v2/trade/order", params)
+        sl_tp_incluidos = True
+
         if data.get("code", -1) != 0:
             err = data.get("msg", str(data))
             log.warning(f"abrir_long {par}: {err}")
             _detectar_limite_notional(par, err)
-            # Retry sin SL/TP
-            params.pop("stopLoss", None); params.pop("takeProfit", None)
+            # Retry SIN SL/TP — pero marcamos que hay que colocarlos después
+            params.pop("stopLoss", None)
+            params.pop("takeProfit", None)
+            sl_tp_incluidos = False
             data = _post("/openApi/swap/v2/trade/order", params)
             if data.get("code", -1) != 0:
                 err2 = data.get("msg", str(data))
                 _detectar_limite_notional(par, err2)
                 log.error(f"[API-ERR] {par}: {err2}")
                 return {"error": err2}
-            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty)
 
         order = data.get("data", {}).get("order", {})
         fill  = float(order.get("avgPrice", 0) or order.get("price", 0) or precio)
         qty_r = float(order.get("executedQty", qty) or qty)
         log.info(f"✅ LONG {par} fill={fill:.6f} qty={qty_r}")
+
+        # FIX CRÍTICO: Si SL/TP no se incluyeron en la orden, colocarlos ahora
+        if not sl_tp_incluidos:
+            log.warning(f"[SL-FIX] {par} LONG — colocando SL/TP separados (fill={fill:.6f})")
+            time.sleep(1)  # Esperar a que la posición se registre en BingX
+            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty_r or qty)
+
+        # FIX CRÍTICO: Verificar que SL está presente en BingX
+        time.sleep(2)
+        tiene_sl, tiene_tp = verificar_sl_tp_presentes(par)
+        if not tiene_sl and sl > 0:
+            log.warning(f"[SL-CHECK] {par} LONG — SL ausente en BingX, reintentando...")
+            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty_r or qty)
+        elif tiene_sl:
+            log.info(f"[SL-CHECK] {par} ✅ SL confirmado en BingX")
+
         return {"fill_price": fill or precio, "executedQty": qty_r or qty}
     except Exception as e:
         log.error(f"abrir_long {par}: {e}")
@@ -446,7 +426,7 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
 
 
 # ═══════════════════════════════════════════════════════
-# ABRIR SHORT
+# ABRIR SHORT — FIX SL/TP CRÍTICO
 # ═══════════════════════════════════════════════════════
 
 def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Optional[dict]:
@@ -471,20 +451,39 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
             }
 
         data = _post("/openApi/swap/v2/trade/order", params)
+        sl_tp_incluidos = True
+
         if data.get("code", -1) != 0:
             err = data.get("msg", str(data))
             log.warning(f"abrir_short {par}: {err}")
             _detectar_limite_notional(par, err)
-            params.pop("stopLoss", None); params.pop("takeProfit", None)
+            params.pop("stopLoss", None)
+            params.pop("takeProfit", None)
+            sl_tp_incluidos = False
             data = _post("/openApi/swap/v2/trade/order", params)
             if data.get("code", -1) != 0:
                 return {"error": data.get("msg", str(data))}
-            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty)
 
         order = data.get("data", {}).get("order", {})
         fill  = float(order.get("avgPrice", 0) or order.get("price", 0) or precio)
         qty_r = float(order.get("executedQty", qty) or qty)
         log.info(f"✅ SHORT {par} fill={fill:.6f} qty={qty_r}")
+
+        # FIX CRÍTICO: Si SL/TP no se incluyeron en la orden, colocarlos ahora
+        if not sl_tp_incluidos:
+            log.warning(f"[SL-FIX] {par} SHORT — colocando SL/TP separados (fill={fill:.6f})")
+            time.sleep(1)
+            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty_r or qty)
+
+        # FIX CRÍTICO: Verificar que SL está presente en BingX
+        time.sleep(2)
+        tiene_sl, tiene_tp = verificar_sl_tp_presentes(par)
+        if not tiene_sl and sl > 0:
+            log.warning(f"[SL-CHECK] {par} SHORT — SL ausente en BingX, reintentando...")
+            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty_r or qty)
+        elif tiene_sl:
+            log.info(f"[SL-CHECK] {par} ✅ SL confirmado en BingX")
+
         return {"fill_price": fill or precio, "executedQty": qty_r or qty}
     except Exception as e:
         log.error(f"abrir_short {par}: {e}")
@@ -496,36 +495,34 @@ def _colocar_sl_tp_separados(par: str, sl: float, tp: float, lado: str, qty: flo
         pos_side = "LONG" if lado == "LONG" else "SHORT"
         cl_side  = "SELL" if lado == "LONG" else "BUY"
         if sl > 0:
-            _post("/openApi/swap/v2/trade/order", {
+            res = _post("/openApi/swap/v2/trade/order", {
                 "symbol": par, "side": cl_side, "positionSide": pos_side,
                 "type": "STOP_MARKET", "quantity": qty,
                 "stopPrice": round(sl, 8), "workingType": "MARK_PRICE", "reduceOnly": "true",
             })
+            if res.get("code", -1) == 0:
+                log.info(f"[SL-SEP] {par} SL={sl:.8f} colocado ✅")
+            else:
+                log.warning(f"[SL-SEP] {par} SL falló: {res.get('msg')}")
         if tp > 0:
-            _post("/openApi/swap/v2/trade/order", {
+            res = _post("/openApi/swap/v2/trade/order", {
                 "symbol": par, "side": cl_side, "positionSide": pos_side,
                 "type": "TAKE_PROFIT_MARKET", "quantity": qty,
                 "stopPrice": round(tp, 8), "workingType": "MARK_PRICE", "reduceOnly": "true",
             })
+            if res.get("code", -1) == 0:
+                log.info(f"[TP-SEP] {par} TP={tp:.8f} colocado ✅")
+            else:
+                log.warning(f"[TP-SEP] {par} TP falló: {res.get('msg')}")
     except Exception as e:
         log.debug(f"_colocar_sl_tp_separados {par}: {e}")
 
 
 # ═══════════════════════════════════════════════════════
-# TRAILING STOP REAL — actualizar SL en BingX
+# TRAILING STOP REAL
 # ═══════════════════════════════════════════════════════
 
 def actualizar_sl_bingx(par: str, nuevo_sl: float, lado: str) -> bool:
-    """
-    Actualiza el Stop Loss de una posición abierta en BingX.
-
-    CRÍTICO: Sin esta función el trailing stop solo vive en memoria Python —
-    BingX sigue ejecutando el SL original aunque el precio haya subido 3 ATR.
-
-    Intenta primero con /profitloss (endpoint moderno).
-    Si falla, cancela la orden SL existente y coloca una nueva.
-    Retorna True si la actualización fue exitosa.
-    """
     if config.MODO_DEMO or nuevo_sl <= 0:
         return True
     try:
@@ -554,15 +551,10 @@ def actualizar_sl_bingx(par: str, nuevo_sl: float, lado: str) -> bool:
 
 
 def _actualizar_sl_cancel_replace(par: str, nuevo_sl: float, lado: str):
-    """
-    Fallback: cancela órdenes pendientes del par y coloca nuevo SL.
-    """
     try:
         cl_side  = "SELL" if lado == "LONG" else "BUY"
         pos_side = "LONG" if lado == "LONG" else "SHORT"
-        # Cancelar todas las stop orders abiertas del par
         _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
-        # Colocar nuevo SL (closePosition cierra toda la posición)
         _post("/openApi/swap/v2/trade/order", {
             "symbol":        par,
             "side":          cl_side,
@@ -614,8 +606,6 @@ def cerrar_posicion(par: str, qty: float, lado: str) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════
 
 def diagnostico_balance():
-    """Llama a todos los endpoints y loguea la respuesta RAW completa.
-    Llamar una vez al arrancar para identificar qué endpoint funciona."""
     import json as _json
     log.info("=" * 60)
     log.info("[DIAG-BAL] Iniciando diagnóstico de balance BingX...")
