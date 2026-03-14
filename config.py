@@ -1,9 +1,18 @@
 """
-config.py — SMC Bot BingX v5.0 [MetaClaw Edition]
+config.py — SMC Bot BingX v5.5 [MetaClaw Edition]
+
+CAMBIOS v5.5 (mejoras de rentabilidad):
+  - SCORE_MIN: 6 → 8 (menos señales pero mejores)
+  - MAX_POSICIONES: 5 → 3 (menos exposición simultánea)
+  - METACLAW_VETO_MINIMO: 7 → 5 (MetaClaw veta más señales malas)
+  - VOLUMEN_MIN_24H: ajustado para aceptar monedas de bajo volumen con SCORE alto
+  - TIME_EXIT_HORAS: 8 → 16 (más tiempo para que los trades funcionen)
+  - RANGE_ACTIVO: nuevo — activa trading en mercado lateral
+  - RANGE_ADX_MAX: nuevo — ADX máximo para considerar mercado lateral
 """
 import os
 
-VERSION = "SMC-Bot v5.0 [MetaClaw+SMC+PremiumDiscount+ICT]"
+VERSION = "SMC-Bot v5.5 [MetaClaw+SMC+Range+ICT]"
 
 def _int(var, default):
     try: return int(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
@@ -19,7 +28,7 @@ def _bool(var, default):
 
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
 BINGX_SECRET_KEY = (os.getenv("BINGX_SECRET_KEY", "")
-                    or os.getenv("BINGX_API_SECRET", ""))  # Railway usa BINGX_API_SECRET
+                    or os.getenv("BINGX_API_SECRET", ""))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -27,17 +36,19 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 MODO_DEMO    = _bool("MODO_DEMO",    False)
 LOOP_SECONDS = _int("LOOP_SECONDS",  60)
 
-METACLAW_ACTIVO       = _bool("METACLAW_ACTIVO",       True)
+METACLAW_ACTIVO        = _bool("METACLAW_ACTIVO",        True)
 METACLAW_CONFIANZA_MIN = _int("METACLAW_CONFIANZA_MIN",  4)
-METACLAW_VETO_MINIMO  = _int("METACLAW_VETO_MINIMO",    7)
+# FIX v5.5: Bajar de 7 a 5 para que MetaClaw vete más señales malas
+METACLAW_VETO_MINIMO   = _int("METACLAW_VETO_MINIMO",    5)
 
 TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)
 TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)
 COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 30.0)
 COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)
 
-LEVERAGE       = _int("LEVERAGE",       10)
-MAX_POSICIONES = _int("MAX_POSICIONES",  5)
+LEVERAGE = _int("LEVERAGE", 10)
+# FIX v5.5: Reducir de 5 a 3 — menos exposición simultánea = más capital por trade
+MAX_POSICIONES = _int("MAX_POSICIONES", 3)
 
 TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)
 TP2_ATR_MULT      = _float("TP2_ATR_MULT",     4.0)
@@ -50,10 +61,12 @@ TRAILING_ACTIVO    = _bool("TRAILING_ACTIVO",    True)
 TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.2)
 TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.8)
 
-TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)
+# FIX v5.5: Subir de 8h a 16h — dar más tiempo a trades con buen setup
+TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 16.0)
 MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 
-SCORE_MIN    = _int("SCORE_MIN",       6)   # FIX v5.4: default 6 — Railway puede sobrescribir con SCORE_MIN=7/8
+# FIX v5.5: Subir de 6 a 8 — menos señales pero de mayor calidad
+SCORE_MIN    = _int("SCORE_MIN",       8)
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
@@ -107,11 +120,23 @@ MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
 SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)
 SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
 
-VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 200_000.0)
+# Volumen mínimo 24h — dividido por modo
+# Modo normal: 200k USDT
+# Modo bajo volumen: 50k USDT (con SCORE_MIN más alto se compensa el riesgo)
+VOLUMEN_MIN_24H      = _float("VOLUMEN_MIN_24H",      200_000.0)
+VOLUMEN_MIN_LOW_VOL  = _float("VOLUMEN_MIN_LOW_VOL",   50_000.0)
+SCORE_MIN_LOW_VOL    = _int("SCORE_MIN_LOW_VOL",        10)   # Score más alto para bajo volumen
+LOW_VOL_ACTIVO       = _bool("LOW_VOL_ACTIVO",          True)  # Activar monedas bajo volumen
+
 MAX_PARES_SCAN   = _int("MAX_PARES_SCAN",    0)
 ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  6)
 
 SOLO_LONG = _bool("SOLO_LONG", False)
+
+# NUEVO v5.5: Trading en mercado lateral
+RANGE_ACTIVO  = _bool("RANGE_ACTIVO",   True)    # Activar detección de mercado lateral
+RANGE_ADX_MAX = _float("RANGE_ADX_MAX", 22.0)    # ADX máximo para considerar lateral
+RANGE_SCORE_MIN = _int("RANGE_SCORE_MIN", 7)      # Score mínimo para trades en rango
 
 PARES_BLOQUEADOS   = [p.strip() for p in os.getenv("PARES_BLOQUEADOS",   "RESOLV-USDT").split(",") if p.strip()]
 PARES_PRIORITARIOS = [p.strip() for p in os.getenv("PARES_PRIORITARIOS", "").split(",") if p.strip()]
