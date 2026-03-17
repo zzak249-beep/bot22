@@ -1,0 +1,321 @@
+================================================================================
+🚢 GUÍA COMPLETA: RAILWAY DEPLOYMENT
+================================================================================
+
+PASO 1: PREPARAR GITHUB
+================================================================================
+
+1. Crea repositorio nuevo en GitHub:
+   - Ve a github.com/new
+   - Nombre: "trading-bot"
+   - Visibilidad: Public (para Railway pueda verlo)
+   - NO inicialices con README
+
+2. Desde tu terminal:
+   ```
+   cd /ruta/a/trading-bot
+   git init
+   git add .
+   git commit -m "Initial commit"
+   git branch -M main
+   git remote add origin https://github.com/tu-usuario/trading-bot.git
+   git push -u origin main
+   ```
+
+3. Verifica que estos archivos están en GitHub:
+   ✓ main.py
+   ✓ config.py
+   ✓ indicators.py
+   ✓ bingx_api.py
+   ✓ telegram_bot.py
+   ✓ requirements.txt
+   ✓ Dockerfile
+   ✓ .env.example
+   ✓ README.md
+
+PASO 2: CONECTAR RAILWAY
+================================================================================
+
+1. Ve a https://railway.app
+2. Login/Signup con GitHub
+3. Click "New Project"
+4. Selecciona "Deploy from GitHub"
+5. Autoriza Railway con GitHub
+6. Selecciona tu repositorio "trading-bot"
+7. Railway automáticamente detectará el Dockerfile
+
+PASO 3: AGREGAR VARIABLES DE ENTORNO
+================================================================================
+
+En Railway Dashboard:
+
+1. Ve al proyecto "trading-bot"
+2. Click en "Variables" (en el panel izquierdo)
+3. Agrega CADA una de estas variables:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🔑 VARIABLES DE ENTORNO PARA RAILWAY                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+SECCIÓN 1: BINGX API (REQUERIDO)
+═══════════════════════════════════════════════════════════════════════════════
+
+Variable: BINGX_API_KEY
+Valor: [Tu API Key de BingX]
+Descripción: Ve a BingX.com → Account → API Management → Copia el API Key
+
+Variable: BINGX_SECRET_KEY
+Valor: [Tu Secret Key de BingX]
+Descripción: Ve a BingX.com → Account → API Management → Copia el Secret Key
+
+═══════════════════════════════════════════════════════════════════════════════
+SECCIÓN 2: TELEGRAM (REQUERIDO PARA NOTIFICACIONES)
+═══════════════════════════════════════════════════════════════════════════════
+
+Variable: TELEGRAM_BOT_TOKEN
+Valor: [Token de tu bot]
+Descripción: @BotFather en Telegram → /newbot → Copia el token
+
+Variable: TELEGRAM_CHAT_ID
+Valor: [Tu ID de chat]
+Descripción: @userinfobot en Telegram → Copia el ID que aparece
+
+═══════════════════════════════════════════════════════════════════════════════
+SECCIÓN 3: PARÁMETROS DE TRADING
+═══════════════════════════════════════════════════════════════════════════════
+
+Variable: SYMBOL
+Valor: BTC/USDT
+Opciones: BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, etc.
+Descripción: Par de criptomonedas a tradear
+
+Variable: TIMEFRAME
+Valor: 15m
+Opciones: 1m, 5m, 15m, 1h, 4h, 1d
+Descripción: Marcos de tiempo para análisis
+
+Variable: POSITION_SIZE
+Valor: 0.01
+Descripción: Cantidad a tradear por operación (en unidades del activo)
+Ejemplos: 0.005 (pequeño), 0.01 (medio), 0.05 (grande)
+
+Variable: TAKE_PROFIT_PERCENT
+Valor: 2.5
+Descripción: Porcentaje de ganancia para cerrar automáticamente
+Ejemplos: 1.5 (conservador), 2.5 (normal), 5.0 (agresivo)
+
+Variable: STOP_LOSS_PERCENT
+Valor: 1.5
+Descripción: Porcentaje de pérdida máxima antes de cerrar
+Ejemplos: 1.0 (apretado), 1.5 (normal), 2.5 (amplio)
+
+═══════════════════════════════════════════════════════════════════════════════
+SECCIÓN 4: PARÁMETROS DE INDICADORES
+═══════════════════════════════════════════════════════════════════════════════
+
+Variable: LINREG_LENGTH
+Valor: 50
+Descripción: Número de velas para calcular la regresión lineal
+Ejemplos: 30 (15m), 50 (1h), 100 (4h)
+
+Variable: LINREG_MULT
+Valor: 2.0
+Descripción: Multiplicador de desviación estándar para las bandas
+Rango: 1.5 a 3.0 (mayor = bandas más amplias)
+
+═══════════════════════════════════════════════════════════════════════════════
+SECCIÓN 5: CONFIGURACIÓN DEL BOT
+═══════════════════════════════════════════════════════════════════════════════
+
+Variable: CHECK_INTERVAL
+Valor: 300
+Descripción: Segundos entre cada análisis de mercado
+Ejemplos: 60 (cada minuto), 300 (cada 5 min), 900 (cada 15 min)
+
+Variable: ENABLE_TRADING
+Valor: True
+Opciones: True (ejecuta trades reales) o False (sin trades)
+Descripción: Habilita/Deshabilita ejecución de órdenes
+
+Variable: DRY_RUN
+Valor: False
+Opciones: True (simula trades) o False (trades reales)
+Descripción: Modo prueba sin dinero real
+
+═══════════════════════════════════════════════════════════════════════════════
+
+PASO 4: VERIFICAR DEPLOYMENT
+================================================================================
+
+1. En Railway, espera a que termine el build (verde ✅)
+2. Ve a "Logs" para ver la salida del bot
+3. Deberías ver:
+   ✅ "Bot inicializado"
+   ✅ "Bot iniciado - Esperando señales..."
+   ✅ Mensaje de Telegram confirmando que está activo
+
+4. Si hay errores:
+   - Revisa que las variables estén correctas
+   - Verifica que BINGX_API_KEY y BINGX_SECRET_KEY son válidas
+   - Comprueba que TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID son correctos
+
+PASO 5: MONITOREAR EL BOT
+================================================================================
+
+1. Logs en Railway:
+   - Haz click en el servicio
+   - Ve a "Logs"
+   - Verás cada acción del bot
+
+2. Notificaciones de Telegram:
+   - Recibirás mensajes cuando:
+     🟢 Se abre una posición LONG
+     🔴 Se abre una posición SHORT
+     💰 Se cierra con ganancia (TP)
+     ⛔ Se cierra con pérdida (SL)
+
+3. Detener el bot:
+   - En Railway → Servicio → "Remove" para parar
+   - El bot se reiniciará automáticamente si crashes
+
+================================================================================
+⚙️ CONFIGURACIONES RECOMENDADAS POR OBJETIVO
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🔴 CONSERVADOR (Bajo riesgo)                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+SYMBOL=BTC/USDT
+TIMEFRAME=4h
+POSITION_SIZE=0.005
+TAKE_PROFIT_PERCENT=2.0
+STOP_LOSS_PERCENT=1.0
+LINREG_LENGTH=100
+CHECK_INTERVAL=600
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🟡 EQUILIBRADO (Riesgo medio)                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+SYMBOL=BTC/USDT
+TIMEFRAME=1h
+POSITION_SIZE=0.01
+TAKE_PROFIT_PERCENT=2.5
+STOP_LOSS_PERCENT=1.5
+LINREG_LENGTH=50
+CHECK_INTERVAL=300
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🟢 AGRESIVO (Alto riesgo)                                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+SYMBOL=ETH/USDT
+TIMEFRAME=15m
+POSITION_SIZE=0.05
+TAKE_PROFIT_PERCENT=1.5
+STOP_LOSS_PERCENT=1.0
+LINREG_LENGTH=30
+CHECK_INTERVAL=60
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+🔐 OBTENER CREDENCIALES
+================================================================================
+
+┌─ BINGX API ──────────────────────────────────────────────────────────────┐
+1. Ve a https://bingx.com y login
+2. Click en "Account" (esquina superior derecha)
+3. Selecciona "API Management"
+4. Click "Create API Key"
+5. Elige: "Standard API Key" (para trading)
+6. Escribe contraseña
+7. Copia API Key (empieza con "BingX_")
+8. Copia Secret Key
+9. IMPORTANTE: Habilita estos permisos:
+   ✓ Spot Trading
+   ✓ Margin Trading
+   ✓ Position Management
+10. Guarda en un lugar seguro
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ TELEGRAM BOT TOKEN ──────────────────────────────────────────────────────┐
+1. Abre Telegram
+2. Busca y abre @BotFather
+3. Escribe: /start
+4. Escribe: /newbot
+5. Dale un nombre: "TradingBot" (o lo que prefieras)
+6. Dale un username único: "mi_trading_bot_123"
+   (debe terminar en "_bot" y ser único)
+7. Copiarás un token parecido a:
+   "5123456789:ABCDEfghijklmnopqrstuvwxyz-abcd_1234"
+8. Guarda este token en TELEGRAM_BOT_TOKEN
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ TELEGRAM CHAT ID ────────────────────────────────────────────────────────┐
+1. Abre Telegram
+2. Busca y abre @userinfobot
+3. Click "Start"
+4. Verás tu información incluyendo un ID como: 123456789
+5. Ese número es tu TELEGRAM_CHAT_ID
+6. Guarda este ID en TELEGRAM_CHAT_ID
+└──────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+✅ CHECKLIST ANTES DE DEPLOYAR
+================================================================================
+
+Antes de hacer el push final a GitHub:
+
+□ He creado un repositorio en GitHub
+□ Todos los archivos están en la carpeta
+□ He verificado que .env NO está en .gitignore
+□ He copiado .env.example a .env
+□ He obtenido BINGX_API_KEY y BINGX_SECRET_KEY de BingX
+□ He creado un bot en Telegram via @BotFather
+□ He obtenido TELEGRAM_BOT_TOKEN
+□ He obtenido mi TELEGRAM_CHAT_ID de @userinfobot
+□ He configurado todas las variables en .env
+□ He probado localmente con `python main.py`
+□ He hecho git push a GitHub
+□ He creado proyecto en Railway
+□ He agregado TODAS las variables en Railway
+□ He espera a que termine el build (verde ✅)
+□ He revisado los logs en Railway
+
+================================================================================
+❓ PREGUNTAS FRECUENTES
+================================================================================
+
+P: ¿Cuánto cuesta Railway?
+R: Gratis hasta $5 USD/mes. Luego paga solo lo que uses. Un bot cuesta ~$2-3/mes.
+
+P: ¿El bot funciona 24/7?
+R: Sí, una vez deployado en Railway, corre continuamente.
+
+P: ¿Puedo cambiar las variables mientras el bot está corriendo?
+R: Sí. Modifica en Railway → Variables → Save. El bot se reiniciará con nuevos valores.
+
+P: ¿Qué pasa si el bot crashea?
+R: Railway lo reinicia automáticamente en segundos.
+
+P: ¿Puedo ejecutar múltiples instancias?
+R: No recomendado sin sincronización. Mejor crea varios bots con diferentes símbolos.
+
+P: ¿Es seguro? ¿Puedo perder dinero?
+R: Sí es seguro pero el trading siempre tiene riesgo. Comienza con POSITION_SIZE pequeño.
+
+P: ¿Puedo pausar el bot?
+R: En Railway, ve al servicio y click "Pause" o "Remove".
+
+================================================================================
+🎯 PRÓXIMOS PASOS
+================================================================================
+
+1. Deploy y monitorea durante 1 semana
+2. Revisa estadísticas en Telegram
+3. Ajusta parámetros según rendimiento
+4. Aumenta POSITION_SIZE gradualmente si es rentable
+5. Considera agregar más símbolos
+
+================================================================================
