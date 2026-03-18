@@ -6,7 +6,13 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from config import Config
+
+try:
+    from config import Config
+except ImportError:
+    # Fallback si no está disponible
+    class Config:
+        DB_PATH = 'trading_bot.db'
 
 logger = logging.getLogger(__name__)
 
