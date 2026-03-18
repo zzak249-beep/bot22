@@ -1,4 +1,0 @@
-ccxt==4.0.62
-aiohttp==3.9.1
-numpy==1.24.3
-python-dotenv==1.0.0
