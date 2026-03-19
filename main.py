@@ -207,41 +207,302 @@ class TradingBot:
             log.warning(f"Error contratos: {e}")
 
     def _get_symbols(self):
-        excl = {
-            'GOLD','SILVER','XAG','XAU','PAXG','XAUT','OIL','BRENT','WTI','GAS',
-            'TSLA','AAPL','MSFT','GOOGL','AMZN','META','NVDA','COIN','MSTR','GME','AMC',
-            'EUR','GBP','JPY','CHF','AUD','CAD','NZD','NASDAQ','SPX','DJI','NDX',
-            '100','1000'
+        """
+        SOLO CRIPTOMONEDAS PURAS.
+        Estrategia: whitelist de criptos conocidas + validacion por nombre.
+        JAMAS incluye: acciones, SP500, oro, petroleo, forex, indices.
+        """
+
+        # ================================================================
+        # WHITELIST: solo estas criptos conocidas pueden pasar
+        # Ampliada con las mas populares de BingX
+        # ================================================================
+        CRIPTO_WHITELIST = {
+            # Top por market cap
+            'BTC','ETH','BNB','XRP','SOL','ADA','DOGE','TRX','TON','AVAX',
+            'SHIB','DOT','LINK','MATIC','WBTC','DAI','UNI','LTC','BCH','ATOM',
+            'XLM','ETC','ALGO','FIL','HBAR','VET','MANA','SAND','AXS','THETA',
+            # DeFi
+            'AAVE','COMP','CRV','SNX','YFI','SUSHI','1INCH','BAL','REN','KNC',
+            'MKR','ZRX','LRC','PERP','DYDX','GMX','GNS','RUNE','CAKE','JOE',
+            # Layer 2 y nuevas L1
+            'ARB','OP','MATIC','IMX','METIS','BOBA','ZKS','STRK','MANTA','TAIKO',
+            # Memes
+            'DOGE','SHIB','PEPE','FLOKI','BONK','WIF','MEME','TURBO','NEIRO',
+            'DOGS','HMSTR','PNUT','ACT','GOAT','MOODENG',
+            # Infraestructura
+            'FIL','AR','STORJ','GRT','API3','BAND','OCEAN','ANKR','NMR',
+            # Gaming y NFT
+            'AXS','SAND','MANA','ENJ','GALA','ILV','YGG','MAGIC','PIXEL','PORTAL',
+            # Exchange tokens
+            'BNB','OKB','HT','KCS','GT','MX','FTT',
+            # Interoperabilidad
+            'DOT','ATOM','OSMO','INJ','SEI','SUI','APT','NEAR','ICP','FTM',
+            # Privacidad
+            'XMR','ZEC','DASH','SCRT','ROSE',
+            # Oraculo y datos
+            'LINK','BAND','API3','DIA','TRB','UMA',
+            # Stablecoins algoritmicas (no operar pero por si aparecen)
+            # Otros populares en BingX
+            'TIA','PYTH','JUP','WEN','ONDO','ENA','ETHFI','REZ','BB','NOT',
+            'IO','ZRO','BLAST','LISTA','ZK','BOME','SLERF','W','TNSR',
+            'OMNI','REI','DYM','ALT','JTO','MANTA','AEVO','STRK',
+            'PIXELS','PORTAL','MYRO','WIF','BOME','SLERF',
+            'ORDI','SATS','RATS','MUBI','MMSS','TURT',
+            'CKB','BEFI','MASA','OBOL','ETHENA','ENA',
+            'PONKE','ANALOS','BODEN','TREMP',
+            # Mas populares
+            'LDO','RPL','SSV','SWISE','ANKR','FXS','FRAX',
+            'CVX','CNC','ALCX','TOKE','TEMPLE',
+            'STG','VELO','BTRFLY','OHM','KLIMA',
+            'UMAMI','DOPEX','HEGIC','PREMIA',
+            'MAGIC','TreasureDAO',
+            'GMX','GNS','CAP','MUX',
+            'PENDLE','TIMELESS','APW',
+            'RADIANT','LODE',
+            'ACE','ACM','ACH','ACQ',
+            'KEY','KEEP','NU','T',
+            'COTI','CTSI','CXT','CELR',
+            'LINA','LINEAR','LIT','LTO',
+            'CHESS','BAKE','TKO','XVS',
+            'ALPACA','BELT','BFT','BUNNY',
+            'BABY','BABYSWAP',
+            'HIGH','AUCTION',
+            'JASMY','FLOW','CHZ','ENS',
+            'STX','BLUR','CFX','ID',
+            'HOOK','MAGIC','HIGH','LOKA',
+            'PEOPLE','DUSK','CHESS',
+            'ALPHA','BETA','HARD','WING',
+            'BIFI','AUTO','EGGP',
+            'CREAM','RAMP',
+            'BEL','POND','QKC','QI',
+            'NULS','NKN','NEBL',
+            'WICC','WIN','WAN','WTC',
+            'ZIL','ZEN','ZMT',
+            'KAVA','KDA','KEEP',
+            'IOTA','IOTX','IOST',
+            'HIVE','HEART','HERO',
+            'FORTH','FARM','FIDA',
+            'ERN','ERTHA','ERG',
+            'DENT','DEGO','CTXC',
+            'COMBO','CLV','CITY',
+            'BNX','BIFI','BICO',
+            'AUCTION','ASR','ARPA',
+            'AION','AGLD','ACA',
+            'KSM','KMD','KLV',
+            'IOST','IOT','IOTX',
+            'GTC','GLM','GHST',
+            'FLUX','FLM','FIRO',
+            'EGLD','EDU','ECOX',
+            'CTSI','CTKN','CSP',
+            'COS','COCOS','CELO',
+            'C98','BURGER','BSW',
+            'BOUNCEBIT','BOME',
+            'AVA','AUTO','ASTR',
+            'ALT','ALICE','ALD',
+            'AGIX','AEVO','AERGO',
+            'XNO','XEC','XDC',
+            'VTHO','VOXEL','VITE',
+            'UTK','USTC','UNFI',
+            'TWT','TVK','TRU',
+            'SYN','SWEAT','SWP',
+            'SUPER','STPT','STEP',
+            'SPARTA','SNFT','SLP',
+            'SKL','SFP','SCRT',
+            'RAY','QUICK','QNT',
+            'PYR','PROM','POLYX',
+            'POL','PLA','PIVX',
+            'PHB','PERP','PAXG',
+            'OM','OGN','NFT',
+            'MTL','MSN','MOVR',
+            'MOB','MBOX','MARS',
+            'LOOKS','LON','LITH',
+            'LEVER','LEND',
+            'LA','KUNCI','KP3R',
+            'KNC','KLAY','KINE',
+            'JASMY','IQ','IQBAL',
+            'HXRO','HUNT','HFT',
+            'HAI','GXS','GRS',
+            'GREIP','GPS','GNO',
+            'GFI','GALA','FRONT',
+            'FOR','FOAM','FNCT',
+            'FIO','FERRUM','FEI',
+            'FDUSD','FCON','FCAST',
+            'EVMOS','EVA','EUROC',
+            'EPX','EPAN','EPIC',
+            'ELON','ELF','EDEN',
+            'DUSK','DODO','DIS',
+            'DIMO','DEXT','DENS',
+            'DAR','CZZ','CXT',
+            'CVC','CRO','CPOOL',
+            'COVER','CORE','CONV',
+            'COMB','CMD','CLEO',
+            'CAST','CAMP','BSX',
+            'BRWL','BRISE','BOBA',
+            'BNT','BMX','BLOK',
+            'BLZ','BIFI','BHT',
+            'BEP','BCUT','BCOIN',
+            'BADGER','AXL','AWT',
+            'AVAIL','AURA','ATOLO',
+            'PROS','POLS','POC',
+            'PHTR','PERP','PEAK',
+            'NYAN','NUX','NSFW',
+            'NOIA','NIOX','NIF',
+            'NFTD','NFTB','NEON',
+            'MYC','MVL','MUSK',
+            'MOOV','MONO','MONI',
+            'MON','MOD','MNGO',
+            'MITH','MINI','MILK',
+            'MIKU','MHC','MFT',
+            'MEAN','MCRT','MBX',
+            'LPOOL','LPNT','LOS',
+            'LONG','LOCO','LNR',
+            'LMR','LKY','LIME',
+            'LIKE','LIF3','LFLY',
+            'LAYER','LAZIO','LASER',
+            'LACE','KZEN','KUN',
+            'KRTC','KRS','KRTS',
+            'KOL','KOG','KOBO',
+            'KNOT','KMB','KISHIMOTO',
+            'JUV','JRT','JOB',
+            'JMPT','JET','JAM',
+            'JAB','IZI','ITGR',
+            'IRON','IPAD','IPAY',
+            'IOSG','IONIC','IOI',
+            'INTER','INT','INSUR',
+            'INF','INFI','INDO',
+            'IME','IMPT','IMANITY',
+            'ILSI','ILUS','IHF',
+            'IFC','IDO','IDEX',
+            'IBFK','IAG','HYVE',
+            'HZN','HYN','HYDRA',
+            'HTZ','HSF','HPS',
+            'HPB','HOT','HNT',
+            'HMT','HLG','HIT',
+            'HIRE','HIFI','HFN',
+            'HEX','HENLO','HELLO',
+            'HECTOR','HEC','HBB',
+            'HAL','GZX','GXT',
+            'GZONE','GYM','GWT',
+            'GUSDT','GUM','GOVI',
+            'GOVI','GORILLA','GOM2',
+            'GOLDY','GODE','GNX',
+            'GNFT','GMM','GLAD',
+            'GHX','GHC','GFX',
+            'GET','GES','GEMS',
+            'GEL','GEC','GDX',
+            'GCN','GBT','GBPT',
         }
+
+        # Patron de nombres tipicos de acciones que NO son cripto:
+        # Mayusculas de 1-4 letras tipicas de NYSE/NASDAQ
+        # Excepciones: BTC, ETH, BNB etc ya estan en whitelist
+        STOCK_PATTERNS = {
+            # Acciones conocidas que podrian colarse
+            'SPX','SPY','QQQ','IWM','DIA','GLD','SLV','USO','UNG',
+            'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','BRK',
+            'JPM','BAC','WFC','GS','MS','C','V','MA','AXP',
+            'JNJ','PFE','MRK','ABBV','BMY','LLY','AMGN',
+            'XOM','CVX','COP','SLB','HAL','BKR','MPC',
+            'CAT','DE','MMM','HON','GE','BA','LMT','RTX',
+            'WMT','TGT','COST','HD','LOW','AMZN',
+            'NFLX','DIS','CMCSA','T','VZ',
+            'COIN','HOOD','MSTR','RIOT','MARA','HUT','BITF',
+            # Materias primas
+            'GOLD','SILVER','OIL','GAS','NATGAS','BRENT','WTI','CRUDE',
+            'WHEAT','CORN','SUGAR','COFFEE','COTTON','LUMBER',
+            'COPPER','NICKEL','ZINC','LEAD','ALUM','TIN',
+            'PLATINUM','PALLADIUM','RHODIUM',
+            # Indices
+            'SP500','DOW','NASDAQ','NIKKEI','DAX','FTSE','CAC','IBEX',
+            'HANG','HSI','ASX','BOVESPA','RTS','MOEX',
+            # Forex
+            'EURUSD','GBPUSD','USDJPY','USDCHF','AUDUSD','USDCAD',
+            'NZDUSD','EURGBP','EURJPY','GBPJPY',
+        }
+
+        def is_real_crypto(symbol):
+            base = symbol.replace('-USDT', '').upper()
+
+            # 1. Si empieza con numero -> NO (1000SHIB, 10000LADYS)
+            if base and base[0].isdigit():
+                return False
+
+            # 2. Si esta en patrones de acciones/commodities -> NO
+            if base in STOCK_PATTERNS:
+                return False
+
+            # 3. Si contiene palabras de commodities/acciones -> NO
+            commodity_words = [
+                'GOLD','SILVER','OIL','GAS','BRENT','CRUDE','WHEAT',
+                'CORN','COPPER','NASDAQ','SP500','NIKKEI','FTSE',
+                'TSLA','AAPL','MSFT','NVDA','GOOGL','AMZN','META',
+                'FOREX','STOCK','SHARE','EQUITY','INDEX','INDICE',
+                'XAU','XAG','XPT','XPD',  # codigos de metales
+            ]
+            for word in commodity_words:
+                if word in base:
+                    return False
+
+            # 4. WHITELIST: si esta en la lista de criptos conocidas -> SI
+            if base in CRIPTO_WHITELIST:
+                return True
+
+            # 5. Si no esta en whitelist pero tampoco en blacklist,
+            #    aceptar si tiene entre 2 y 10 caracteres (tipico de cripto)
+            #    y no parece un ticker de accion
+            if 2 <= len(base) <= 10:
+                return True
+
+            return False
+
         try:
             r = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker", timeout=15)
             d = r.json()
             if d.get('code') == 0:
-                items = []
+                items    = []
+                excluded = []
+
                 for t in d.get('data', []):
-                    sym = t.get('symbol','')
-                    if not sym.endswith('-USDT'): continue
-                    if any(k in sym.replace('-USDT','').upper() for k in excl): continue
+                    sym = t.get('symbol', '')
+                    if not sym.endswith('-USDT'):
+                        continue
+
+                    if not is_real_crypto(sym):
+                        excluded.append(sym.replace('-USDT', ''))
+                        continue
+
                     try:
                         price = float(t.get('lastPrice', 0))
                         vol   = float(t.get('volume', 0)) * price
-                        if vol < MIN_VOLUME or price < 0.0001: continue
+                        if vol < MIN_VOLUME or price < 0.0001:
+                            continue
                         items.append({'symbol': sym, 'vol': vol})
-                    except: continue
+                    except:
+                        continue
+
                 items.sort(key=lambda x: x['vol'], reverse=True)
                 self.symbols = [x['symbol'] for x in items[:MAX_SYMBOLS]]
-                log.info(f"{len(self.symbols)} criptomonedas seleccionadas (vol>${MIN_VOLUME/1e6:.1f}M)")
+
+                if excluded:
+                    log.info(f"Excluidos ({len(excluded)} no-cripto): {', '.join(excluded[:20])}")
+                log.info(f"✅ {len(self.symbols)} CRIPTOMONEDAS puras seleccionadas")
+                for i, x in enumerate(items[:5], 1):
+                    log.info(f"  {i}. {x['symbol']:15s} Vol:${x['vol']/1e6:.1f}M")
                 return
+
         except Exception as e:
-            log.warning(f"Error simbolos: {e}")
-        # fallback
+            log.warning(f"Error obteniendo simbolos: {e}")
+
+        # Fallback SOLO criptos top
+        log.warning("Usando lista estatica de criptos top")
         self.symbols = [
             'BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT',
-            'DOGE-USDT','ADA-USDT','AVAX-USDT','LINK-USDT','DOT-USDT'
+            'DOGE-USDT','ADA-USDT','AVAX-USDT','LINK-USDT','DOT-USDT',
+            'MATIC-USDT','UNI-USDT','ATOM-USDT','LTC-USDT','BCH-USDT',
+            'NEAR-USDT','FIL-USDT','APT-USDT','ARB-USDT','OP-USDT',
+            'INJ-USDT','SUI-USDT','SEI-USDT','TIA-USDT','JUP-USDT'
         ]
-
-    # ---------------------------------------------------------------- DATOS
-
     def _klines(self, symbol, interval='5m', limit=50):
         try:
             r = requests.get(
