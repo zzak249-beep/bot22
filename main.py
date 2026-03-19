@@ -32,13 +32,13 @@ AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')  # <-- CAMBIADO 
 POSITION_SIZE = clean('MAX_POSITION_SIZE',       '7',    'float')  # <-- 7 USDT por trade
 MIN_TRADE     = clean('MIN_TRADE_USDT',          '5',    'float')  # <-- Minimo 5 USDT
 LEVERAGE      = clean('LEVERAGE',                '3',    'int')
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5',  'float')
-SL_PCT        = clean('STOP_LOSS_PCT',           '1.2',  'float')
-MAX_TRADES    = clean('MAX_OPEN_TRADES',          '3',   'int')
+TP_PCT        = clean('TAKE_PROFIT_PCT',         '3.5',  'float')  # Aumentado
+SL_PCT        = clean('STOP_LOSS_PCT',           '1.0',  'float')  # Más ajustado
+MAX_TRADES    = clean('MAX_OPEN_TRADES',          '2',   'int')  # Más selectivo
 INTERVAL      = clean('CHECK_INTERVAL',          '60',   'int')
 MIN_VOLUME    = clean('MIN_VOLUME_24H',       '500000',  'float')
 MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '80',  'int')
-MIN_SCORE     = clean('MIN_SCORE',               '60',   'float')
+MIN_SCORE     = clean('MIN_SCORE',               '75',   'float')  # Más selectivo
 TRAILING      = clean('TRAILING_STOP_ENABLED',  'true',  'bool')
 
 BASE_URL = "https://open-api.bingx.com"
@@ -133,9 +133,9 @@ class TradingBot:
 
     def __init__(self):
         log.info("=" * 70)
-        log.info("BOT TRADING PROFESIONAL v3.1")
-        log.info("EMA + RSI + MACD + Bollinger + Trailing Stop")
-        log.info("AJUSTE: 7 USDT/trade (min 5) + Solo 1 direccion/moneda")
+        log.info("BOT TRADING PROFESIONAL v3.2 - OPTIMIZADO RENTABILIDAD")
+        log.info("EMA + RSI + MACD + Bollinger + Trailing Stop MEJORADO")
+        log.info("Score 75+ | TP 3.5% SL 1.0% | Filtros multi-confirmacion")
         log.info("=" * 70)
         log.info(f"AUTO-TRADING:  {'ON - EJECUTANDO TRADES REALES' if AUTO_TRADING else 'OFF'}")
         log.info(f"Capital/trade: ${POSITION_SIZE} USDT (min ${MIN_TRADE})")
@@ -158,10 +158,11 @@ class TradingBot:
 
         estado = "AUTO-TRADING ON - ejecutando trades reales" if AUTO_TRADING else "Modo señales (OFF)"
         self._tg(
-            f"<b>Bot v3.1 iniciado</b>\n"
+            f"<b>Bot v3.2 OPTIMIZADO iniciado</b>\n"
             f"{estado}\n"
-            f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
-            f"Score min:{MIN_SCORE} | Trades max:{MAX_TRADES} | Trailing:{'ON' if TRAILING else 'OFF'}\n"
+            f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}% (RR 3.5:1)\n"
+            f"Score min:{MIN_SCORE} | Trades max:{MAX_TRADES} | Trailing:0.5%\n"
+            f"Filtros: Multi-confirmacion | Solo 1 dir/moneda\n"
             f"Analizando {len(self.symbols)} monedas"
         )
 
@@ -578,57 +579,142 @@ class TradingBot:
         ema_gap  = abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
         short_trend = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else 0
 
-        # Score LONG
+        # Score LONG - MEJORADO para mayor rentabilidad
         ls, lr = 0, []
+        
+        # EMA alineación (más peso)
         if ema_bull:
-            p = 20 + min(10, ema_gap * 5); ls += p; lr.append(f"EMA+({p:.0f})")
-        if rsi_v < 30:
-            ls += 25; lr.append("RSI<30(25)")
-        elif rsi_v < 40:
-            ls += 15; lr.append("RSI<40(15)")
+            p = 25 + min(15, ema_gap * 8); ls += p; lr.append(f"EMA+({p:.0f})")
+        
+        # RSI oversold (más selectivo)
+        if rsi_v < 25:
+            ls += 30; lr.append("RSI<25(30)")
+        elif rsi_v < 35:
+            ls += 18; lr.append("RSI<35(18)")
+        
+        # MACD confirmación fuerte
         if ml > sg and hist > 0:
-            ls += 20; lr.append("MACD+(20)")
-        if price <= bb_l * 1.005:
-            ls += 15; lr.append("BB-low(15)")
-        if vsp >= 1.3:
-            p = min(15, vsp * 5); ls += p; lr.append(f"Vol{vsp:.1f}x({p:.0f})")
-        if short_trend > 0.3:
-            ls += 10; lr.append("trend+(10)")
-        if change > 1.0:
-            p = min(10, change * 2); ls += p; lr.append(f"24h+{change:.1f}%")
+            if hist > abs(ml) * 0.3:  # Histograma fuerte
+                ls += 25; lr.append("MACD++(25)")
+            else:
+                ls += 15; lr.append("MACD+(15)")
+        
+        # Bollinger Bands
+        if price <= bb_l * 1.003:
+            ls += 20; lr.append("BB-low(20)")
+        elif price <= bb_m * 0.98:
+            ls += 10; lr.append("BB-mid(10)")
+        
+        # Volumen spike fuerte
+        if vsp >= 2.0:
+            p = min(20, vsp * 8); ls += p; lr.append(f"Vol{vsp:.1f}x({p:.0f})")
+        elif vsp >= 1.5:
+            p = min(12, vsp * 5); ls += p; lr.append(f"Vol{vsp:.1f}x({p:.0f})")
+        
+        # Tendencia corto plazo
+        if short_trend > 0.5:
+            ls += 15; lr.append("trend++(15)")
+        elif short_trend > 0.2:
+            ls += 8; lr.append("trend+(8)")
+        
+        # Cambio 24h positivo
+        if change > 2.0:
+            p = min(15, change * 3); ls += p; lr.append(f"24h+{change:.1f}%({p:.0f})")
+        elif change > 0.5:
+            p = min(8, change * 2); ls += p; lr.append(f"24h+{change:.1f}%({p:.0f})")
+        
+        # FILTROS NEGATIVOS (restan puntos)
+        if rsi_v > 65:
+            ls -= 15; lr.append("RSI>65(-15)")
+        if price > bb_u:
+            ls -= 10; lr.append("BB-high(-10)")
 
-        # Score SHORT
+        # Score SHORT - MEJORADO para mayor rentabilidad
         ss, sr = 0, []
+        
+        # EMA alineación bajista (más peso)
         if ema_bear:
-            p = 20 + min(10, ema_gap * 5); ss += p; sr.append(f"EMA-({p:.0f})")
-        if rsi_v > 70:
-            ss += 25; sr.append("RSI>70(25)")
-        elif rsi_v > 60:
-            ss += 15; sr.append("RSI>60(15)")
+            p = 25 + min(15, ema_gap * 8); ss += p; sr.append(f"EMA-({p:.0f})")
+        
+        # RSI overbought (más selectivo)
+        if rsi_v > 75:
+            ss += 30; sr.append("RSI>75(30)")
+        elif rsi_v > 65:
+            ss += 18; sr.append("RSI>65(18)")
+        
+        # MACD confirmación fuerte
         if ml < sg and hist < 0:
-            ss += 20; sr.append("MACD-(20)")
-        if price >= bb_u * 0.995:
-            ss += 15; sr.append("BB-high(15)")
-        if vsp >= 1.3:
-            p = min(15, vsp * 5); ss += p; sr.append(f"Vol{vsp:.1f}x({p:.0f})")
-        if short_trend < -0.3:
-            ss += 10; sr.append("trend-(10)")
-        if change < -1.0:
-            p = min(10, abs(change) * 2); ss += p; sr.append(f"24h{change:.1f}%")
+            if abs(hist) > abs(ml) * 0.3:  # Histograma fuerte
+                ss += 25; sr.append("MACD--(25)")
+            else:
+                ss += 15; sr.append("MACD-(15)")
+        
+        # Bollinger Bands
+        if price >= bb_u * 0.997:
+            ss += 20; sr.append("BB-high(20)")
+        elif price >= bb_m * 1.02:
+            ss += 10; sr.append("BB-mid(10)")
+        
+        # Volumen spike fuerte
+        if vsp >= 2.0:
+            p = min(20, vsp * 8); ss += p; sr.append(f"Vol{vsp:.1f}x({p:.0f})")
+        elif vsp >= 1.5:
+            p = min(12, vsp * 5); ss += p; sr.append(f"Vol{vsp:.1f}x({p:.0f})")
+        
+        # Tendencia corto plazo bajista
+        if short_trend < -0.5:
+            ss += 15; sr.append("trend--(15)")
+        elif short_trend < -0.2:
+            ss += 8; sr.append("trend-(8)")
+        
+        # Cambio 24h negativo
+        if change < -2.0:
+            p = min(15, abs(change) * 3); ss += p; sr.append(f"24h{change:.1f}%({p:.0f})")
+        elif change < -0.5:
+            p = min(8, abs(change) * 2); ss += p; sr.append(f"24h{change:.1f}%({p:.0f})")
+        
+        # FILTROS NEGATIVOS (restan puntos)
+        if rsi_v < 35:
+            ss -= 15; sr.append("RSI<35(-15)")
+        if price < bb_l:
+            ss -= 10; sr.append("BB-low(-10)")
 
-        # TP dinamico por ATR
+        # TP dinamico por ATR (más agresivo en alta volatilidad)
         atr_pct = (atr_v / price * 100) if price > 0 else 0
-        tp_dyn  = max(TP_PCT, min(TP_PCT * 2, atr_pct * 1.5))
+        tp_dyn  = max(TP_PCT, min(TP_PCT * 2.5, atr_pct * 2.0))
+        
+        # FILTRO: evitar señales débiles o contradictorias
+        # Si ambos scores son bajos, no operar
+        if max(ls, ss) < MIN_SCORE * 0.7:
+            return None
+        
+        # Filtro de RSI extremo para LONG (evitar comprar muy alto)
+        if ls > ss and ls >= MIN_SCORE and rsi_v <= 70 and price < bb_u:
+            # Confirmación adicional: debe tener al menos 2 indicadores fuertes
+            strong_signals = 0
+            if ema_bull and ema_gap > 0.5: strong_signals += 1
+            if rsi_v < 35: strong_signals += 1
+            if ml > sg and hist > 0: strong_signals += 1
+            if vsp >= 1.5: strong_signals += 1
+            
+            if strong_signals >= 2:
+                return {'signal':'LONG',  'price':price, 'change':change,
+                        'score':ls, 'reasons':' | '.join(lr),
+                        'rsi':rsi_v, 'vol':vsp, 'tp_pct':tp_dyn, 'sl_pct':SL_PCT}
 
-        if ls > ss and ls >= MIN_SCORE and rsi_v <= 72:
-            return {'signal':'LONG',  'price':price, 'change':change,
-                    'score':ls, 'reasons':' | '.join(lr),
-                    'rsi':rsi_v, 'vol':vsp, 'tp_pct':tp_dyn, 'sl_pct':SL_PCT}
-
-        if ss > ls and ss >= MIN_SCORE and rsi_v >= 28:
-            return {'signal':'SHORT', 'price':price, 'change':change,
-                    'score':ss, 'reasons':' | '.join(sr),
-                    'rsi':rsi_v, 'vol':vsp, 'tp_pct':tp_dyn, 'sl_pct':SL_PCT}
+        # Filtro de RSI extremo para SHORT (evitar vender muy bajo)
+        if ss > ls and ss >= MIN_SCORE and rsi_v >= 30 and price > bb_l:
+            # Confirmación adicional: debe tener al menos 2 indicadores fuertes
+            strong_signals = 0
+            if ema_bear and ema_gap > 0.5: strong_signals += 1
+            if rsi_v > 65: strong_signals += 1
+            if ml < sg and hist < 0: strong_signals += 1
+            if vsp >= 1.5: strong_signals += 1
+            
+            if strong_signals >= 2:
+                return {'signal':'SHORT', 'price':price, 'change':change,
+                        'score':ss, 'reasons':' | '.join(sr),
+                        'rsi':rsi_v, 'vol':vsp, 'tp_pct':tp_dyn, 'sl_pct':SL_PCT}
 
         return None
 
@@ -926,25 +1012,32 @@ class TradingBot:
                     pnl_pct = (cur - t['entry']) / t['entry'] * 100
                     hit_tp  = cur >= t['tp']
                     hit_sl  = cur <= t['sl']
-                    # Trailing stop: cuando ganancia >= 1% mover SL para proteger
+                    
+                    # Trailing stop MEJORADO: activar con 0.5% ganancia
                     if TRAILING and cur > t['highest']:
                         t['highest'] = cur
-                        if pnl_pct >= 1.0:
-                            new_sl = cur * (1 - t['sl_pct'] / 100)
+                        if pnl_pct >= 0.5:  # Activar más temprano
+                            # SL más agresivo: proteger 60% de la ganancia
+                            profit = cur - t['entry']
+                            new_sl = t['entry'] + (profit * 0.6)
                             if new_sl > t['sl']:
                                 t['sl'] = new_sl
-                                log.info(f"  Trailing SL {symbol} -> ${new_sl:.4f}")
+                                log.info(f"  Trailing SL {symbol} -> ${new_sl:.4f} (protege {pnl_pct*0.6:.1f}%)")
                 else:
                     pnl_pct = (t['entry'] - cur) / t['entry'] * 100
                     hit_tp  = cur <= t['tp']
                     hit_sl  = cur >= t['sl']
+                    
+                    # Trailing stop MEJORADO para SHORT
                     if TRAILING and cur < t['lowest']:
                         t['lowest'] = cur
-                        if pnl_pct >= 1.0:
-                            new_sl = cur * (1 + t['sl_pct'] / 100)
+                        if pnl_pct >= 0.5:  # Activar más temprano
+                            # SL más agresivo: proteger 60% de la ganancia
+                            profit = t['entry'] - cur
+                            new_sl = t['entry'] - (profit * 0.6)
                             if new_sl < t['sl']:
                                 t['sl'] = new_sl
-                                log.info(f"  Trailing SL {symbol} -> ${new_sl:.4f}")
+                                log.info(f"  Trailing SL {symbol} -> ${new_sl:.4f} (protege {pnl_pct*0.6:.1f}%)")
 
                 if abs(pnl_pct) > 0.4:
                     log.info(
