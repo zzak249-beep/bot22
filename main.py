@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-BOT DE TRADING PROFESIONAL v3.0 - main.py
+BOT DE TRADING PROFESIONAL v3.1 - main.py
 Auto-trading ACTIVADO por defecto
 EMA + RSI + MACD + Bollinger + Trailing Stop + TP/SL automatico
+AJUSTES: 7 USDT por trade (min 5 USDT) + Solo una direccion por moneda
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math
@@ -26,10 +27,10 @@ BINGX_API_SECRET = os.getenv('BINGX_API_SECRET', '').strip().strip('"').strip("'
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
-# Trading - AUTO_TRADING true POR DEFECTO (antes era false, eso causaba [OFF])
+# Trading - AJUSTADO: 7 USDT por trade, minimo 5 USDT
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')  # <-- CAMBIADO A true
-POSITION_SIZE = clean('MAX_POSITION_SIZE',      '100',   'float')
-MIN_TRADE     = clean('MIN_TRADE_USDT',          '7',    'float')
+POSITION_SIZE = clean('MAX_POSITION_SIZE',       '7',    'float')  # <-- 7 USDT por trade
+MIN_TRADE     = clean('MIN_TRADE_USDT',          '5',    'float')  # <-- Minimo 5 USDT
 LEVERAGE      = clean('LEVERAGE',                '3',    'int')
 TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5',  'float')
 SL_PCT        = clean('STOP_LOSS_PCT',           '1.2',  'float')
@@ -132,8 +133,9 @@ class TradingBot:
 
     def __init__(self):
         log.info("=" * 70)
-        log.info("BOT TRADING PROFESIONAL v3.0")
+        log.info("BOT TRADING PROFESIONAL v3.1")
         log.info("EMA + RSI + MACD + Bollinger + Trailing Stop")
+        log.info("AJUSTE: 7 USDT/trade (min 5) + Solo 1 direccion/moneda")
         log.info("=" * 70)
         log.info(f"AUTO-TRADING:  {'ON - EJECUTANDO TRADES REALES' if AUTO_TRADING else 'OFF'}")
         log.info(f"Capital/trade: ${POSITION_SIZE} USDT (min ${MIN_TRADE})")
@@ -156,7 +158,7 @@ class TradingBot:
 
         estado = "AUTO-TRADING ON - ejecutando trades reales" if AUTO_TRADING else "Modo señales (OFF)"
         self._tg(
-            f"<b>Bot v3.0 iniciado</b>\n"
+            f"<b>Bot v3.1 iniciado</b>\n"
             f"{estado}\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Score min:{MIN_SCORE} | Trades max:{MAX_TRADES} | Trailing:{'ON' if TRAILING else 'OFF'}\n"
@@ -503,6 +505,7 @@ class TradingBot:
             'NEAR-USDT','FIL-USDT','APT-USDT','ARB-USDT','OP-USDT',
             'INJ-USDT','SUI-USDT','SEI-USDT','TIA-USDT','JUP-USDT'
         ]
+
     def _klines(self, symbol, interval='5m', limit=50):
         try:
             r = requests.get(
@@ -632,22 +635,37 @@ class TradingBot:
     # ---------------------------------------------------------------- CANTIDAD
 
     def _qty(self, symbol, price):
+        """Calcular cantidad respetando POSITION_SIZE de 7 USDT (min 5 USDT)"""
         info    = self._contracts.get(symbol, {'step': 1.0, 'prec': 2})
         step, prec = info['step'], info['prec']
+        
+        # Usar POSITION_SIZE preferido, pero nunca menos que MIN_TRADE
         capital = max(POSITION_SIZE, MIN_TRADE)
+        
         raw     = capital / price
         stepped = math.ceil(raw / step) * step if step > 0 else raw
         qty     = round(stepped, prec)
         val     = qty * price
+        
+        # Ajustar si quedo por debajo del minimo
         i = 0
         while val < MIN_TRADE and step > 0 and i < 1000:
-            qty += step; qty = round(qty, prec); val = qty * price; i += 1
+            qty += step
+            qty = round(qty, prec)
+            val = qty * price
+            i += 1
+        
         return qty, round(val, 4)
 
-    # ---------------------------------------------------------------- ABRIR TRADE
+    # ---------------------------------------------------------------- VERIFICAR POSICION
 
     def _tiene_posicion_bingx(self, symbol):
-        """Verificar en BingX si ya hay posicion abierta en este simbolo (LONG o SHORT)"""
+        """
+        Verificar si hay posicion abierta en BingX para este simbolo.
+        Retorna: (tiene_posicion, direccion)
+        tiene_posicion: bool
+        direccion: 'LONG', 'SHORT' o None
+        """
         try:
             r = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol': symbol})
             d = r.json()
@@ -656,15 +674,20 @@ class TradingBot:
                 for p in posiciones:
                     amt = float(p.get('positionAmt', 0) or 0)
                     if abs(amt) > 0:
-                        lado = 'LONG' if amt > 0 else 'SHORT'
-                        log.info(f"  {symbol} ya tiene posicion {lado} en BingX ({amt}) - saltando")
-                        return True
+                        direccion = 'LONG' if amt > 0 else 'SHORT'
+                        return True, direccion
         except Exception as e:
-            log.debug(f"  _tiene_posicion_bingx {symbol}: {e}")
-        return False
+            log.debug(f"_tiene_posicion_bingx {symbol}: {e}")
+        return False, None
+
+    # ---------------------------------------------------------------- ABRIR TRADE
 
     def open_trade(self, symbol, sig):
-        """Abrir posicion con TP y SL automaticos"""
+        """
+        Abrir posicion con TP y SL automaticos.
+        REGLA: Solo una direccion por moneda.
+        Si ya existe LONG, no permitir SHORT (y viceversa)
+        """
         price     = sig['price']
         direction = sig['signal']
         tp_pct    = sig['tp_pct']
@@ -680,20 +703,29 @@ class TradingBot:
             log.info(f"  {symbol} ya en open_trades locales - saltando")
             return False
 
-        # BLOQUEO 2: verificar en BingX directamente (evita dobles en hedge mode)
-        if AUTO_TRADING and self._tiene_posicion_bingx(symbol):
-            # Registrar localmente para no volver a preguntar
-            self.open_trades[symbol] = {
-                'direction': direction, 'entry': price,
-                'qty': 0, 'val': 0,
-                'tp': price*(1+tp_pct/100) if direction=='LONG' else price*(1-tp_pct/100),
-                'sl': price*(1-sl_pct/100) if direction=='LONG' else price*(1+sl_pct/100),
-                'tp_pct': tp_pct, 'sl_pct': sl_pct,
-                'highest': price, 'lowest': price,
-                'order_id': 'EXISTENTE', 'tp_ok': False, 'sl_ok': False,
-                'opened_at': datetime.now(), 'score': sig['score'],
-            }
-            return False
+        # BLOQUEO 2: verificar en BingX - solo una direccion por moneda
+        if AUTO_TRADING:
+            tiene_pos, pos_dir = self._tiene_posicion_bingx(symbol)
+            if tiene_pos:
+                if pos_dir == direction:
+                    # Misma direccion - registrar localmente y saltar
+                    log.info(f"  {symbol} ya tiene {direction} en BingX - saltando")
+                    self.open_trades[symbol] = {
+                        'direction': direction, 'entry': price,
+                        'qty': 0, 'val': 0,
+                        'tp': price*(1+tp_pct/100) if direction=='LONG' else price*(1-tp_pct/100),
+                        'sl': price*(1-sl_pct/100) if direction=='LONG' else price*(1+sl_pct/100),
+                        'tp_pct': tp_pct, 'sl_pct': sl_pct,
+                        'highest': price, 'lowest': price,
+                        'order_id': 'EXISTENTE', 'tp_ok': False, 'sl_ok': False,
+                        'opened_at': datetime.now(), 'score': sig['score'],
+                    }
+                    return False
+                else:
+                    # Direccion contraria - RECHAZAR
+                    log.warning(f"  ⚠️ {symbol} RECHAZADO: ya existe {pos_dir}, queria {direction}")
+                    log.warning(f"  REGLA: Solo una direccion por moneda")
+                    return False
 
         qty, val = self._qty(symbol, price)
         if val < MIN_TRADE:
@@ -834,7 +866,6 @@ class TradingBot:
         """
         Sincronizar open_trades con posiciones reales de BingX.
         Si BingX ya cerro una posicion (TP/SL ejecutado), eliminarla del dict local.
-        Evita que el bot intente abrir en direccion contraria.
         """
         if not self.open_trades or not AUTO_TRADING:
             return
@@ -881,6 +912,9 @@ class TradingBot:
 
     async def monitor_trades(self):
         """Monitorear trades abiertos con trailing stop y cierre automatico"""
+        # Sincronizar con BingX primero
+        await self._sync_con_bingx()
+        
         for symbol in list(self.open_trades.keys()):
             try:
                 t  = self.open_trades[symbol]
