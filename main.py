@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-🚀 BOT ULTRA-OPTIMIZADO - CON TP/SL AUTOMÁTICOS EN BINGX
-=========================================================
-✅ GENERA SEÑALES
-✅ ABRE TRADES
-✅ COLOCA TP/SL COMO ÓRDENES EN BINGX ← NUEVO
-✅ CIERRA AUTOMÁTICAMENTE
+🚀 BOT CON INVERSIÓN FIJA - $6 POR OPERACIÓN
+=============================================
+✅ Inversión real: $6 USDT por trade
+✅ Con leverage: $6 × leverage = posición controlada
+✅ TP/SL automáticos en BingX
 """
 
 import os
@@ -33,8 +32,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-class BotConTPSL:
-    """Bot con TP/SL reales en BingX"""
+class BotInversionFija:
+    """Bot con inversión fija de $6 por operación"""
     
     def __init__(self):
         """Inicializar"""
@@ -52,8 +51,8 @@ class BotConTPSL:
         self.bingx_api_secret = os.getenv('BINGX_API_SECRET', '')
         self.base_url = "https://open-api.bingx.com"
         
-        # Parámetros
-        self.position_size = float(os.getenv('MAX_POSITION_SIZE', '50'))
+        # INVERSIÓN FIJA
+        self.capital_per_trade = 6.0  # $6 USDT FIJO por operación
         self.leverage = int(os.getenv('LEVERAGE', '3'))
         self.interval = int(os.getenv('CHECK_INTERVAL', '60'))
         
@@ -67,7 +66,7 @@ class BotConTPSL:
         
         # Umbrales
         self.min_change_pct = float(os.getenv('MIN_CHANGE_PCT', '0.3'))
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', '45'))
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', '42'))
         
         # Trading
         self.auto_trading = os.getenv('AUTO_TRADING_ENABLED', 'false').lower() == 'true'
@@ -92,11 +91,13 @@ class BotConTPSL:
     def _startup(self):
         """Info de inicio"""
         logger.info("="*80)
-        logger.info("🚀 BOT CON TP/SL AUTOMÁTICOS EN BINGX")
+        logger.info("🚀 BOT CON INVERSIÓN FIJA - $6 POR OPERACIÓN")
         logger.info("="*80)
         logger.info(f"✅ Modo: {'TRADING REAL' if self.auto_trading else 'SOLO SEÑALES'}")
         logger.info(f"📊 Pares: {len(self.symbols)}")
-        logger.info(f"💰 Position: ${self.position_size} | Leverage: {self.leverage}x")
+        logger.info(f"💰 Inversión por trade: ${self.capital_per_trade} USDT")
+        logger.info(f"📈 Leverage: {self.leverage}x")
+        logger.info(f"💵 Posición controlada: ${self.capital_per_trade * self.leverage}")
         logger.info(f"🎯 TP: {self.take_profit_pct}% | SL: {self.stop_loss_pct}%")
         logger.info(f"🔄 Trailing: {self.trailing_activation}% / {self.trailing_distance}%")
         logger.info(f"📈 Min Change: {self.min_change_pct}%")
@@ -243,7 +244,14 @@ class BotConTPSL:
         }
     
     def _execute_trade(self, symbol: str, direction: str, price: float) -> bool:
-        """Ejecutar trade CON TP/SL en BingX"""
+        """
+        Ejecutar trade con INVERSIÓN FIJA de $6
+        
+        Fórmula:
+        - Capital real: $6 USDT
+        - Posición controlada: $6 × leverage
+        - Cantidad: (capital × leverage) / precio
+        """
         if not self.auto_trading:
             return False
         
@@ -252,6 +260,31 @@ class BotConTPSL:
             return False
         
         try:
+            # CÁLCULO CORRECTO DE CANTIDAD
+            # Inversión real: $6 USDT
+            # Posición controlada: $6 × leverage
+            position_value = self.capital_per_trade * self.leverage
+            qty = position_value / price
+            
+            # Redondear según el asset
+            if price > 1000:  # BTC, ETH, etc
+                qty = round(qty, 6)
+            elif price > 100:
+                qty = round(qty, 5)
+            elif price > 10:
+                qty = round(qty, 4)
+            elif price > 1:
+                qty = round(qty, 3)
+            else:
+                qty = round(qty, 2)
+            
+            logger.info(f"💰 Calculando inversión:")
+            logger.info(f"   Capital: ${self.capital_per_trade}")
+            logger.info(f"   Leverage: {self.leverage}x")
+            logger.info(f"   Posición: ${position_value:.2f}")
+            logger.info(f"   Precio: ${price}")
+            logger.info(f"   Cantidad: {qty}")
+            
             # Calcular TP/SL
             if direction == 'LONG':
                 tp_price = price * (1 + self.take_profit_pct / 100)
@@ -260,10 +293,6 @@ class BotConTPSL:
                 tp_price = price * (1 - self.take_profit_pct / 100)
                 sl_price = price * (1 + self.stop_loss_pct / 100)
             
-            # Cantidad
-            qty = (self.position_size / price) * self.leverage
-            qty = max(qty, 10 / price)
-            
             # 1. ABRIR POSICIÓN
             timestamp = int(time.time() * 1000)
             params = {
@@ -271,7 +300,7 @@ class BotConTPSL:
                 'side': 'BUY' if direction == 'LONG' else 'SELL',
                 'positionSide': direction,
                 'type': 'MARKET',
-                'quantity': f"{qty:.6f}",
+                'quantity': str(qty),
                 'timestamp': timestamp
             }
             
@@ -288,7 +317,8 @@ class BotConTPSL:
             if r.status_code == 200:
                 data = r.json()
                 if data.get('code') == 0:
-                    order_id = data.get('data', {}).get('order', {}).get('orderId', 'N/A')
+                    order_data = data.get('data', {}).get('order', {})
+                    order_id = order_data.get('orderId', 'N/A')
                     
                     logger.info(f"✅ Posición abierta: {direction} {symbol}")
                     
@@ -302,9 +332,10 @@ class BotConTPSL:
                     
                     if tp_result and sl_result:
                         logger.info(f"✅ TP/SL colocados correctamente")
-                        logger.info(f"   TP: ${tp_price:.4f} | SL: ${sl_price:.4f}")
+                        logger.info(f"   TP: ${tp_price:.4f} (+{self.take_profit_pct}%)")
+                        logger.info(f"   SL: ${sl_price:.4f} (-{self.stop_loss_pct}%)")
                     else:
-                        logger.warning(f"⚠️ Error colocando TP/SL - Verificar en BingX")
+                        logger.warning(f"⚠️ Error colocando TP/SL")
                     
                     # Registrar
                     self.open_trades[symbol] = {
@@ -313,25 +344,31 @@ class BotConTPSL:
                         'tp': tp_price,
                         'sl': sl_price,
                         'qty': qty,
+                        'capital': self.capital_per_trade,
                         'order_id': order_id,
-                        'time': datetime.now().isoformat(),
-                        'highest': price if direction == 'LONG' else 0,
-                        'lowest': price if direction == 'SHORT' else float('inf'),
-                        'trailing': False
+                        'time': datetime.now().isoformat()
                     }
                     
                     self.stats['trades_open'] += 1
                     
+                    # Notificación
                     self._notify(
                         f"✅ <b>TRADE ABIERTO</b>\n"
                         f"{direction} {symbol}\n"
-                        f"Entry: ${price:.4f}\n"
-                        f"TP: ${tp_price:.4f} (+{self.take_profit_pct}%)\n"
-                        f"SL: ${sl_price:.4f} (-{self.stop_loss_pct}%)\n"
-                        f"Tamaño: ${price * qty:.2f}"
+                        f"💰 Inversión: ${self.capital_per_trade} USDT\n"
+                        f"📊 Posición: ${position_value:.2f}\n"
+                        f"📈 Entry: ${price:.4f}\n"
+                        f"🎯 TP: ${tp_price:.4f} (+{self.take_profit_pct}%)\n"
+                        f"🛑 SL: ${sl_price:.4f} (-{self.stop_loss_pct}%)\n"
+                        f"⚡ Leverage: {self.leverage}x\n"
+                        f"📦 Cantidad: {qty}"
                     )
                     
                     return True
+                else:
+                    logger.error(f"❌ Error BingX: {data.get('msg')}")
+            else:
+                logger.error(f"❌ HTTP Error: {r.status_code}")
             
             return False
         except Exception as e:
@@ -339,11 +376,9 @@ class BotConTPSL:
             return False
     
     def _place_tp_order(self, symbol: str, direction: str, tp_price: float, qty: float) -> bool:
-        """Colocar orden TAKE PROFIT en BingX"""
+        """Colocar orden TAKE PROFIT"""
         try:
             timestamp = int(time.time() * 1000)
-            
-            # Orden TP es inversa a la posición
             side = 'SELL' if direction == 'LONG' else 'BUY'
             
             params = {
@@ -352,7 +387,7 @@ class BotConTPSL:
                 'positionSide': direction,
                 'type': 'TAKE_PROFIT_MARKET',
                 'stopPrice': f"{tp_price:.4f}",
-                'quantity': f"{qty:.6f}",
+                'quantity': str(qty),
                 'timestamp': timestamp
             }
             
@@ -373,7 +408,6 @@ class BotConTPSL:
                     return True
                 else:
                     logger.warning(f"   ⚠️ Error TP: {data.get('msg')}")
-                    return False
             
             return False
         except Exception as e:
@@ -381,11 +415,9 @@ class BotConTPSL:
             return False
     
     def _place_sl_order(self, symbol: str, direction: str, sl_price: float, qty: float) -> bool:
-        """Colocar orden STOP LOSS en BingX"""
+        """Colocar orden STOP LOSS"""
         try:
             timestamp = int(time.time() * 1000)
-            
-            # Orden SL es inversa a la posición
             side = 'SELL' if direction == 'LONG' else 'BUY'
             
             params = {
@@ -394,7 +426,7 @@ class BotConTPSL:
                 'positionSide': direction,
                 'type': 'STOP_MARKET',
                 'stopPrice': f"{sl_price:.4f}",
-                'quantity': f"{qty:.6f}",
+                'quantity': str(qty),
                 'timestamp': timestamp
             }
             
@@ -415,7 +447,6 @@ class BotConTPSL:
                     return True
                 else:
                     logger.warning(f"   ⚠️ Error SL: {data.get('msg')}")
-                    return False
             
             return False
         except Exception as e:
@@ -433,7 +464,7 @@ class BotConTPSL:
     
     async def run(self):
         """Loop principal"""
-        logger.info("\n🚀 Bot iniciado - Con TP/SL automáticos\n")
+        logger.info("\n🚀 Bot iniciado - Inversión fija $6 por trade\n")
         iteration = 0
         
         while True:
@@ -482,10 +513,6 @@ class BotConTPSL:
                             
                             if self.auto_trading:
                                 self._execute_trade(symbol, 'SHORT', data['price'])
-                        
-                        else:
-                            logger.debug(f"{i:2d}. ⚪ {symbol}: ${data['price']:.4f} | "
-                                       f"{analysis['change']:+.2f}% | NEUTRAL ({analysis['score']:.0f}%)")
                     
                     except Exception as e:
                         logger.debug(f"Error {symbol}: {e}")
@@ -500,6 +527,7 @@ class BotConTPSL:
                 logger.info(f"   🤖 Trades abiertos: {len(self.open_trades)}/{self.max_trades}")
                 logger.info(f"   ✅ Cerrados: {self.stats['trades_closed']}")
                 logger.info(f"   💵 PnL: ${self.stats['pnl']:+.2f}")
+                logger.info(f"   💰 Capital en uso: ${len(self.open_trades) * self.capital_per_trade}")
                 logger.info(f"{'='*80}")
                 
                 logger.info(f"\n⏱️ Próxima en {self.interval}s...\n")
@@ -516,7 +544,7 @@ class BotConTPSL:
 async def main():
     """Main"""
     try:
-        bot = BotConTPSL()
+        bot = BotInversionFija()
         await bot.run()
     except Exception as e:
         logger.error(f"❌ Fatal: {e}")
