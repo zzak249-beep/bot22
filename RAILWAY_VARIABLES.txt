@@ -1,0 +1,46 @@
+# ========================================
+# COPIA Y PEGA ESTO EN RAILWAY → SETTINGS → VARIABLES
+# ========================================
+
+# === API CREDENTIALS (OBLIGATORIAS) ===
+BINGX_API_KEY=TU_API_KEY_AQUI
+BINGX_API_SECRET=TU_SECRET_AQUI
+
+# === TELEGRAM (OPCIONAL) ===
+TELEGRAM_BOT_TOKEN=tu_token
+TELEGRAM_CHAT_ID=tu_chat_id
+
+# === TRADING MODE ===
+AUTO_TRADING_ENABLED=true
+
+# === CAPITAL Y LEVERAGE ===
+MAX_POSITION_SIZE=30
+LEVERAGE=3
+
+# === TP/SL AGRESIVOS ===
+TAKE_PROFIT_PCT=2.0
+STOP_LOSS_PCT=1.0
+
+# === TRAILING STOP ===
+TRAILING_ACTIVATION=0.8
+TRAILING_DISTANCE=0.4
+
+# === UMBRALES ULTRA-BAJOS (GENERA MUCHAS SEÑALES) ===
+MIN_CHANGE_PCT=0.3
+MIN_CONFIDENCE=45
+
+# === GESTIÓN ===
+MAX_OPEN_TRADES=5
+CHECK_INTERVAL=60
+
+# ========================================
+# IMPORTANTE: 
+# - MIN_CONFIDENCE=45 (muy bajo = muchas señales)
+# - MIN_CHANGE_PCT=0.3 (muy bajo = detecta mínimos movimientos)
+# - CHECK_INTERVAL=60 (cada minuto = muy rápido)
+# 
+# Con esta configuración deberías ver:
+# ✅ 15-25 señales por hora
+# ✅ 5-10 trades ejecutados por hora
+# ✅ Muy activo y rentable
+# ========================================
