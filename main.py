@@ -646,6 +646,23 @@ class TradingBot:
 
     # ---------------------------------------------------------------- ABRIR TRADE
 
+    def _tiene_posicion_bingx(self, symbol):
+        """Verificar en BingX si ya hay posicion abierta en este simbolo (LONG o SHORT)"""
+        try:
+            r = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol': symbol})
+            d = r.json()
+            if d.get('code') == 0:
+                posiciones = d.get('data', []) or []
+                for p in posiciones:
+                    amt = float(p.get('positionAmt', 0) or 0)
+                    if abs(amt) > 0:
+                        lado = 'LONG' if amt > 0 else 'SHORT'
+                        log.info(f"  {symbol} ya tiene posicion {lado} en BingX ({amt}) - saltando")
+                        return True
+        except Exception as e:
+            log.debug(f"  _tiene_posicion_bingx {symbol}: {e}")
+        return False
+
     def open_trade(self, symbol, sig):
         """Abrir posicion con TP y SL automaticos"""
         price     = sig['price']
@@ -656,6 +673,26 @@ class TradingBot:
         if not AUTO_TRADING:
             log.info(f"  SEÑAL {direction} {symbol} score:{sig['score']:.0f} [AUTO-TRADING OFF]")
             log.info(f"  Para activar: pon AUTO_TRADING_ENABLED=true en Railway Variables")
+            return False
+
+        # BLOQUEO 1: ya registrado localmente
+        if symbol in self.open_trades:
+            log.info(f"  {symbol} ya en open_trades locales - saltando")
+            return False
+
+        # BLOQUEO 2: verificar en BingX directamente (evita dobles en hedge mode)
+        if AUTO_TRADING and self._tiene_posicion_bingx(symbol):
+            # Registrar localmente para no volver a preguntar
+            self.open_trades[symbol] = {
+                'direction': direction, 'entry': price,
+                'qty': 0, 'val': 0,
+                'tp': price*(1+tp_pct/100) if direction=='LONG' else price*(1-tp_pct/100),
+                'sl': price*(1-sl_pct/100) if direction=='LONG' else price*(1+sl_pct/100),
+                'tp_pct': tp_pct, 'sl_pct': sl_pct,
+                'highest': price, 'lowest': price,
+                'order_id': 'EXISTENTE', 'tp_ok': False, 'sl_ok': False,
+                'opened_at': datetime.now(), 'score': sig['score'],
+            }
             return False
 
         qty, val = self._qty(symbol, price)
@@ -792,6 +829,55 @@ class TradingBot:
         return False
 
     # ---------------------------------------------------------------- MONITOR
+
+    async def _sync_con_bingx(self):
+        """
+        Sincronizar open_trades con posiciones reales de BingX.
+        Si BingX ya cerro una posicion (TP/SL ejecutado), eliminarla del dict local.
+        Evita que el bot intente abrir en direccion contraria.
+        """
+        if not self.open_trades or not AUTO_TRADING:
+            return
+        try:
+            r = bingx_request('GET', '/openApi/swap/v2/user/positions', {})
+            d = r.json()
+            if d.get('code') != 0:
+                return
+            posiciones_bingx = {}
+            for p in (d.get('data') or []):
+                sym = p.get('symbol','')
+                amt = float(p.get('positionAmt', 0) or 0)
+                if abs(amt) > 0:
+                    posiciones_bingx[sym] = amt
+
+            for symbol in list(self.open_trades.keys()):
+                if symbol not in posiciones_bingx:
+                    t = self.open_trades[symbol]
+                    # BingX ya no tiene posicion -> fue cerrada por TP/SL
+                    tk = self._ticker(symbol)
+                    cur = tk['price'] if tk else t['entry']
+                    if t['direction'] == 'LONG':
+                        pnl = (cur - t['entry']) * t['qty']
+                    else:
+                        pnl = (t['entry'] - cur) * t['qty']
+                    self.stats['closed'] += 1
+                    self.stats['pnl']    += pnl
+                    if pnl >= 0: self.stats['wins']   += 1
+                    else:        self.stats['losses'] += 1
+                    total = self.stats['wins'] + self.stats['losses']
+                    wr    = self.stats['wins'] / total * 100 if total else 0
+                    log.info(f"  SYNC: {symbol} cerrado por BingX PnL≈${pnl:+.2f}")
+                    msg = (
+                        "<b>CERRADO por BingX (TP/SL)</b>\n"
+                        + symbol + "\n"
+                        + "PnL estimado: ${:.2f}\n".format(pnl)
+                        + "Total PnL: ${:.2f}\n".format(self.stats['pnl'])
+                        + "WR: {:.1f}% ({}W/{}L)".format(wr, self.stats['wins'], self.stats['losses'])
+                    )
+                    self._tg(msg)
+                    del self.open_trades[symbol]
+        except Exception as e:
+            log.debug(f"_sync_con_bingx: {e}")
 
     async def monitor_trades(self):
         """Monitorear trades abiertos con trailing stop y cierre automatico"""
