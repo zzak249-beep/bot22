@@ -139,11 +139,12 @@ class TradingBot:
         log.info("=" * 70)
         log.info(f"AUTO-TRADING:  {'ON - EJECUTANDO TRADES REALES' if AUTO_TRADING else 'OFF'}")
         log.info(f"Capital/trade: ${POSITION_SIZE} USDT (min ${MIN_TRADE})")
+        log.info(f"  → IMPORTANTE: debe ser ~7 USDT, NO 100 USDT")
         log.info(f"Leverage:      {LEVERAGE}x  =>  posicion ${POSITION_SIZE * LEVERAGE}")
         log.info(f"TP/SL:         {TP_PCT}% / {SL_PCT}%  (RR {TP_PCT/SL_PCT:.1f}:1)")
         log.info(f"Max trades:    {MAX_TRADES}")
         log.info(f"Score minimo:  {MIN_SCORE}/100")
-        log.info(f"Trailing stop: {'ON' if TRAILING else 'OFF'}")
+        log.info(f"Trailing stop: {'ON' if TRAILING else 'OFF'} (activa +0.5%)")
         log.info(f"Volumen min:   ${MIN_VOLUME/1e6:.1f}M")
         log.info("=" * 70)
 
@@ -158,10 +159,11 @@ class TradingBot:
 
         estado = "AUTO-TRADING ON - ejecutando trades reales" if AUTO_TRADING else "Modo señales (OFF)"
         self._tg(
-            f"<b>Bot v3.2 OPTIMIZADO iniciado</b>\n"
+            f"<b>Bot v3.3 CORREGIDO iniciado</b>\n"
             f"{estado}\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}% (RR 3.5:1)\n"
             f"Score min:{MIN_SCORE} | Trades max:{MAX_TRADES} | Trailing:0.5%\n"
+            f"PnL REAL (considera leverage + comisiones)\n"
             f"Filtros: Multi-confirmacion | Solo 1 dir/moneda\n"
             f"Analizando {len(self.symbols)} monedas"
         )
@@ -725,8 +727,15 @@ class TradingBot:
         info    = self._contracts.get(symbol, {'step': 1.0, 'prec': 2})
         step, prec = info['step'], info['prec']
         
-        # Usar POSITION_SIZE preferido, pero nunca menos que MIN_TRADE
-        capital = max(POSITION_SIZE, MIN_TRADE)
+        # FORZAR: usar exactamente POSITION_SIZE (7 USDT), nunca más
+        # Esto evita que use 100 USDT como en los logs anteriores
+        capital = POSITION_SIZE  # 7 USDT fijo
+        
+        # Solo si es menor que el mínimo, usar MIN_TRADE
+        if capital < MIN_TRADE:
+            capital = MIN_TRADE  # 5 USDT mínimo
+        
+        log.info(f"  Calculando cantidad para ${capital:.2f} USDT a precio ${price:.6f}")
         
         raw     = capital / price
         stepped = math.ceil(raw / step) * step if step > 0 else raw
@@ -741,6 +750,14 @@ class TradingBot:
             val = qty * price
             i += 1
         
+        # VALIDACIÓN FINAL: nunca permitir más de 10 USDT
+        if val > 10:
+            log.warning(f"  ADVERTENCIA: Capital calculado ${val:.2f} > 10 USDT, ajustando...")
+            qty = (POSITION_SIZE / price)
+            qty = round(math.floor(qty / step) * step, prec)
+            val = qty * price
+        
+        log.info(f"  Cantidad final: {qty} (${val:.2f} USDT)")
         return qty, round(val, 4)
 
     # ---------------------------------------------------------------- VERIFICAR POSICION
@@ -814,10 +831,19 @@ class TradingBot:
                     return False
 
         qty, val = self._qty(symbol, price)
+        
+        # VALIDACIÓN CRÍTICA: rechazar si capital > 10 USDT
+        if val > 10:
+            log.error(f"  {symbol} RECHAZADO: capital ${val:.2f} > 10 USDT (debe ser ~7 USDT)")
+            log.error(f"  Revisa POSITION_SIZE en variables de entorno")
+            return False
+        
         if val < MIN_TRADE:
             log.warning(f"  {symbol} rechazado: ${val:.2f} < min ${MIN_TRADE}")
             return False
-
+        
+        log.info(f"  ✓ Capital validado: ${val:.2f} USDT (objetivo: ${POSITION_SIZE})")
+        
         tp = price * (1 + tp_pct/100) if direction == 'LONG' else price * (1 - tp_pct/100)
         sl = price * (1 - sl_pct/100) if direction == 'LONG' else price * (1 + sl_pct/100)
 
@@ -876,7 +902,9 @@ class TradingBot:
             f"Entry: ${price:.4f}\n"
             f"{'OK' if tp_ok else 'ERR'} TP: ${tp:.4f} (+{tp_pct:.1f}%)\n"
             f"{'OK' if sl_ok else 'ERR'} SL: ${sl:.4f} (-{sl_pct:.1f}%)\n"
-            f"Capital: ${val:.2f} x{LEVERAGE}\n"
+            f"Capital: ${val:.2f} USDT\n"
+            f"Leverage: {LEVERAGE}x → Posicion: ${val * LEVERAGE:.2f}\n"
+            f"Cantidad: {qty}\n"
             f"{sig['reasons']}"
         )
         return True
@@ -920,9 +948,24 @@ class TradingBot:
             })
             d = r.json()
             if d.get('code') == 0:
-                pnl = (cur_price - t['entry']) * t['qty'] if t['direction'] == 'LONG' \
-                      else (t['entry'] - cur_price) * t['qty']
-                pnl_pct = pnl / t['val'] * 100
+                # PnL CORREGIDO: considerar leverage y comisiones
+                # Comisión BingX: 0.05% entrada + 0.05% salida = 0.1% total
+                COMISION_TOTAL = 0.001  # 0.1%
+                
+                if t['direction'] == 'LONG':
+                    # PnL sin leverage
+                    pnl_sin_lev = (cur_price - t['entry']) * t['qty']
+                    # PnL real = (cambio % * capital * leverage) - comisiones
+                    cambio_pct = (cur_price - t['entry']) / t['entry']
+                    pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
+                else:
+                    # SHORT
+                    pnl_sin_lev = (t['entry'] - cur_price) * t['qty']
+                    cambio_pct = (t['entry'] - cur_price) / t['entry']
+                    pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
+                
+                pnl_pct = (pnl / t['val']) * 100  # % sobre capital invertido (sin leverage)
+                
                 self.stats['closed'] += 1
                 self.stats['pnl']    += pnl
                 if pnl > 0: self.stats['wins']   += 1
@@ -936,6 +979,8 @@ class TradingBot:
                     f"<b>CERRADO - {reason}</b>\n"
                     f"{symbol}\n"
                     f"PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
+                    f"Entry: ${t['entry']:.4f} → Exit: ${cur_price:.4f}\n"
+                    f"Capital: ${t['val']:.2f} x{LEVERAGE}\n"
                     f"Duracion: {mins} min\n"
                     f"Total PnL: ${self.stats['pnl']:+.2f}\n"
                     f"Win Rate: {wr:.1f}% ({self.stats['wins']}W/{self.stats['losses']}L)"
@@ -973,21 +1018,35 @@ class TradingBot:
                     # BingX ya no tiene posicion -> fue cerrada por TP/SL
                     tk = self._ticker(symbol)
                     cur = tk['price'] if tk else t['entry']
+                    
+                    # PnL CORREGIDO: considerar leverage y comisiones
+                    COMISION_TOTAL = 0.001  # 0.1% total (0.05% entrada + 0.05% salida)
+                    
                     if t['direction'] == 'LONG':
-                        pnl = (cur - t['entry']) * t['qty']
+                        cambio_pct = (cur - t['entry']) / t['entry']
+                        pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
                     else:
-                        pnl = (t['entry'] - cur) * t['qty']
+                        cambio_pct = (t['entry'] - cur) / t['entry']
+                        pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
+                    
+                    pnl_pct = (pnl / t['val']) * 100
+                    
                     self.stats['closed'] += 1
                     self.stats['pnl']    += pnl
                     if pnl >= 0: self.stats['wins']   += 1
                     else:        self.stats['losses'] += 1
                     total = self.stats['wins'] + self.stats['losses']
                     wr    = self.stats['wins'] / total * 100 if total else 0
-                    log.info(f"  SYNC: {symbol} cerrado por BingX PnL≈${pnl:+.2f}")
+                    mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
+                    
+                    log.info(f"  SYNC: {symbol} cerrado por BingX PnL=${pnl:+.2f} ({pnl_pct:+.1f}%)")
                     msg = (
                         "<b>CERRADO por BingX (TP/SL)</b>\n"
                         + symbol + "\n"
-                        + "PnL estimado: ${:.2f}\n".format(pnl)
+                        + "PnL: ${:.2f} ({:+.1f}%)\n".format(pnl, pnl_pct)
+                        + "Entry: ${:.4f} → Exit: ${:.4f}\n".format(t['entry'], cur)
+                        + "Capital: ${:.2f} x{}\n".format(t['val'], LEVERAGE)
+                        + "Duracion: {} min\n".format(mins)
                         + "Total PnL: ${:.2f}\n".format(self.stats['pnl'])
                         + "WR: {:.1f}% ({}W/{}L)".format(wr, self.stats['wins'], self.stats['losses'])
                     )
