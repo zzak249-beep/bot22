@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v2.2
+BOT SHORTS PROFESIONAL v2.4
 ════════════════════════════════════════════════
-FIX CRÍTICO v2.2:
-  _cond_order() ahora SIEMPRE usa quantity en contratos para TP/SL.
-  BingX NO soporta quoteOrderQty en STOP_MARKET ni TAKE_PROFIT_MARKET.
-  Antes: enviaba quoteOrderQty → BingX lo ignoraba → sin TP/SL.
-  Ahora: calcula contratos correctamente → TP/SL se fijan siempre.
+FIX CRÍTICO v2.3:
+  1. _qty_contratos() ahora recibe usdt_amount como parámetro.
+     Antes: siempre usaba POSITION_SIZE global (70 USDT) aunque la
+     entrada real era de 8 USDT → contratos 8.75x mayores → BingX
+     rechazaba TP/SL silenciosamente porque la qty > posición real.
+     Ahora: usa el usdt_qty real de la entrada.
 
-MEJORAS anteriores (v2.1):
-  - Filtro no-cripto ampliado (GAS, GASOLINE, SP500, DOWJONES, etc.)
-  - Órdenes LÍMITE → maker fee 0.02% vs taker 0.05%
-  - Filtro tendencia BTC (bloquea shorts si BTC sube >1.5% en 1h)
-  - TP mínimo rentable calculado sobre comisiones reales
-  - Score más exigente si mercado alcista
-  - Cooldown 15 min por par
-  - Filtro de hora baja liquidez
+  2. Eliminado el cap hardcodeado min(POSITION_SIZE, 8.0) en open_trade.
+     Antes: ignoraba MAX_POSITION_SIZE del .env → entraba con $8 siempre.
+     Ahora: usa POSITION_SIZE directamente (respeta el .env).
+
+  3. _place_short_entry y open_trade pasan usdt_qty a _qty_contratos.
+
+FIX CRÍTICO v2.2 (anterior):
+  _cond_order() usa quantity en contratos para TP/SL.
+  BingX NO soporta quoteOrderQty en STOP_MARKET ni TAKE_PROFIT_MARKET.
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re
@@ -70,8 +72,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-COMISION_MAKER  = 0.0004
-COMISION_TAKER  = 0.0010
+COMISION_MAKER  = 0.0002
+COMISION_TAKER  = 0.0005
 COMISION_ACTUAL = COMISION_MAKER if USE_LIMIT_ORDERS else COMISION_TAKER
 TP_MIN_RENTABLE = round((COMISION_ACTUAL / LEVERAGE + 0.002) * 100, 3)
 
@@ -152,8 +154,9 @@ class ShortBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 65)
-        log.info("  BOT SHORTS PROFESIONAL v2.2")
-        log.info("  FIX: TP/SL siempre en contratos (quoteOrderQty no válido)")
+        log.info("  BOT SHORTS PROFESIONAL v2.4")
+        log.info("  FIX v2.4: fees reales 0.02/0.05%, entrada MAKER, TP límite")
+        log.info("  FIX v2.2: TP/SL siempre en contratos")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
         log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
@@ -175,8 +178,8 @@ class ShortBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v2.2 iniciado</b>\n"
-            f"FIX: TP/SL ahora se fijan correctamente\n"
+            f"<b>🔴 Bot SHORTS v2.4 iniciado</b>\n"
+            f"FIX: qty_c ahora coincide con entrada real\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE}"
         )
@@ -282,9 +285,17 @@ class ShortBot:
         except: pass
 
     # ---------------------------------------------------------------- sizing
+    # FIX v2.3: acepta usdt_amount para calcular qty correcta según entrada real
 
-    def _qty_contratos(self, symbol, price):
-        """Calcula cantidad en contratos basada en POSITION_SIZE USDT."""
+    def _qty_contratos(self, symbol, price, usdt_amount=None):
+        """
+        Calcula cantidad en contratos basada en usdt_amount.
+        FIX v2.3: usa usdt_amount en lugar de POSITION_SIZE global,
+        así qty_c coincide con la entrada real y BingX acepta el TP/SL.
+        """
+        if usdt_amount is None:
+            usdt_amount = POSITION_SIZE
+
         info  = self._contracts.get(symbol, {'step':1.0,'prec':2,'ctval':1.0})
         step  = max(info['step'], 0.0001)
         prec  = info['prec']
@@ -292,16 +303,16 @@ class ShortBot:
         ppc   = price * ctval if ctval != 1.0 else price
         if ppc <= 0: return None, 0
 
-        qty = round(math.ceil(POSITION_SIZE / ppc / step) * step, prec)
+        qty = round(math.ceil(usdt_amount / ppc / step) * step, prec)
         val = qty * ppc
 
         i = 0
         while val < MIN_TRADE and i < 500:
             qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
 
-        # Cap: nunca más de POSITION_SIZE * 1.3
-        if val > POSITION_SIZE * 1.3:
-            qty = round(math.floor((POSITION_SIZE * 1.3 / ppc) / step) * step, prec)
+        # Cap: nunca más de usdt_amount * 1.3
+        if val > usdt_amount * 1.3:
+            qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
             val = qty * ppc
 
         log.info(f"    qty_contratos: {qty} × ${ppc:.6f} = ${val:.2f} USDT")
@@ -353,11 +364,9 @@ class ShortBot:
         score_min = MIN_SCORE + (10 if self._btc_change_1h > 0.5 else 0)
         ss, sr = 0, []
 
-        # EMA bajista
         p = min(35, 28 + int(ema_gap * 4)) if ema_gap > 1.5 else min(28, 20 + int(ema_gap * 5))
         ss += p; sr.append(f"EMA-({p})")
 
-        # RSI sobrecomprado
         rsi_max = max(rsi, rsi_r)
         if   rsi_max > 82: ss += 38; sr.append(f"RSI{rsi_max:.0f}(38)")
         elif rsi_max > 76: ss += 30; sr.append(f"RSI{rsi_max:.0f}(30)")
@@ -365,20 +374,17 @@ class ShortBot:
         elif rsi_max > 65: ss += 10; sr.append(f"RSI{rsi_max:.0f}(10)")
         else:              ss -= 20; sr.append(f"RSI{rsi_max:.0f}(-20)")
 
-        # MACD
         if ml < sg and hist < 0:
             p = 22 if abs(hist) > abs(ml) * 0.35 else 15
             ss += p; sr.append(f"MACD-({p})")
         elif ml > 0 and hist > 0:
             ss -= 15; sr.append("MACD+(-15)")
 
-        # Bollinger
         if   bb_pos >= 0.95: ss += 25; sr.append("BB_top(25)")
         elif bb_pos >= 0.85: ss += 17; sr.append("BB_high(17)")
         elif bb_pos >= 0.70: ss += 8;  sr.append("BB_mid+(8)")
         elif bb_pos <  0.40: ss -= 12; sr.append("BB_low(-12)")
 
-        # Volumen
         if vs >= 2.0 and trend_5 < -0.3:
             p = min(18, int(vs*8)); ss += p; sr.append(f"VolVenta{vs:.1f}x({p})")
         elif vs >= 1.5:
@@ -386,17 +392,14 @@ class ShortBot:
         elif vs < 1.2:
             ss -= 8; sr.append("VolBajo(-8)")
 
-        # Tendencia
         if trend_5 < -1.5 and trend_10 < -2.5: ss += 20; sr.append("Bajada--(20)")
         elif trend_5 < -0.8:                    ss += 12; sr.append("Bajada-(12)")
         elif trend_5 > 1.0:                     ss -= 15; sr.append("Subida(-15)")
 
-        # 24h
         if   change > 6.0: p = min(15, int(change*2));   ss += p; sr.append(f"24h+{change:.1f}%({p})")
         elif change > 3.0: p = min(10, int(change*1.5)); ss += p; sr.append(f"24h+{change:.1f}%({p})")
         elif change < -4.0: ss -= 12; sr.append(f"24h{change:.1f}%(-12)")
 
-        # Extra
         if near_high:        ss += 12; sr.append("NearHigh(12)")
         if red_candles >= 3: ss += 10; sr.append(f"Rojas{red_candles}(10)")
         if atr_pct < 0.3:    ss -= 10; sr.append("ATRbajo(-10)")
@@ -415,12 +418,13 @@ class ShortBot:
     def _place_short_entry(self, symbol, usdt_qty, price):
         """
         Entrada: intenta LÍMITE (maker), fallback MERCADO quoteOrderQty, fallback contratos.
-        quoteOrderQty sí funciona en órdenes de entrada normales.
+        FIX v2.3: pasa usdt_qty a _qty_contratos para que qty_c coincida con la entrada.
         """
-        qty_c, _ = self._qty_contratos(symbol, price)
+        # FIX v2.3: usa usdt_qty real, NO POSITION_SIZE global
+        qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
 
         if USE_LIMIT_ORDERS:
-            limit_price = round(price * (1 - LIMIT_OFFSET_PCT / 100), 8)
+            limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)  # SHORT=SELL: precio ENCIMA del mercado → espera en libro → MAKER fee
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol':symbol,'side':'SELL','positionSide':'SHORT',
                 'type':'LIMIT','price':str(limit_price),
@@ -454,29 +458,62 @@ class ShortBot:
 
     def _cond_order(self, symbol, qty_c, stop_price, otype):
         """
-        FIX CRÍTICO v2.2: TP/SL SIEMPRE usan quantity en contratos.
-        BingX NO soporta quoteOrderQty en STOP_MARKET ni TAKE_PROFIT_MARKET.
-        Si se envía quoteOrderQty en estas órdenes → BingX las ignora silenciosamente.
+        FIX v2.4: TP usa TAKE_PROFIT (límite) → maker fee 0.02%.
+                  SL usa STOP_MARKET          → taker fee 0.05% (garantiza ejecución).
+        FIX v2.2: quantity en contratos siempre (BingX ignora quoteOrderQty en TP/SL).
         """
         if not qty_c or qty_c <= 0:
             log.error(f"  {otype} cancelado: qty_c inválido ({qty_c})")
             return False
         try:
-            params = {
-                'symbol':      symbol,
-                'side':        'BUY',
-                'positionSide':'SHORT',
-                'type':        otype,
-                'quantity':    str(qty_c),           # ← SIEMPRE contratos para TP/SL
-                'stopPrice':   str(round(stop_price, 8)),
-            }
+            is_tp = "TAKE" in otype
+            lbl   = "TP" if is_tp else "SL"
+
+            if is_tp:
+                # TP como límite: espera en libro → maker fee 0.02%
+                params = {
+                    'symbol':      symbol,
+                    'side':        'BUY',
+                    'positionSide':'SHORT',
+                    'type':        'TAKE_PROFIT',      # límite (maker)
+                    'quantity':    str(qty_c),
+                    'price':       str(round(stop_price, 8)),
+                    'stopPrice':   str(round(stop_price, 8)),
+                    'timeInForce': 'GTC',
+                }
+            else:
+                # SL sigue como STOP_MARKET → garantiza ejecución aunque sea taker
+                params = {
+                    'symbol':      symbol,
+                    'side':        'BUY',
+                    'positionSide':'SHORT',
+                    'type':        'STOP_MARKET',
+                    'quantity':    str(qty_c),
+                    'stopPrice':   str(round(stop_price, 8)),
+                }
+
             d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
             ok = d.get('code') == 0
-            lbl = "TP" if "TAKE" in otype else "SL"
+            fee_lbl = "maker" if is_tp else "taker"
             if ok:
-                log.info(f"  {lbl} ✅ fijado @ ${stop_price:.6f} (qty={qty_c})")
+                log.info(f"  {lbl} ✅ fijado @ ${stop_price:.6f} (qty={qty_c}, {fee_lbl})")
             else:
-                log.error(f"  {lbl} ❌ ERROR [{d.get('code')}]: {d.get('msg')}")
+                # TP límite fallback a TAKE_PROFIT_MARKET si BingX rechaza
+                if is_tp:
+                    log.warning(f"  TP límite rechazado [{d.get('code')}] — fallback TAKE_PROFIT_MARKET")
+                    params2 = {
+                        'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                        'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
+                        'stopPrice':str(round(stop_price, 8)),
+                    }
+                    d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', params2).json()
+                    ok = d2.get('code') == 0
+                    if ok:
+                        log.info(f"  TP ✅ (fallback mercado) @ ${stop_price:.6f}")
+                    else:
+                        log.error(f"  TP ❌ ERROR [{d2.get('code')}]: {d2.get('msg')}")
+                else:
+                    log.error(f"  {lbl} ❌ ERROR [{d.get('code')}]: {d.get('msg')}")
             return ok
         except Exception as e:
             log.error(f"  {otype} excepción: {e}")
@@ -516,8 +553,12 @@ class ShortBot:
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
 
-        price    = sig['price']
-        usdt_qty = round(max(min(POSITION_SIZE, 8.0), MIN_TRADE), 2)
+        price = sig['price']
+
+        # FIX v2.3: eliminado min(POSITION_SIZE, 8.0) que ignoraba el .env
+        # Ahora respeta MAX_POSITION_SIZE correctamente
+        usdt_qty = round(max(POSITION_SIZE, MIN_TRADE), 2)
+
         tp_price = price * (1 - sig['tp_pct'] / 100)
         sl_price = price * (1 + sig['sl_pct'] / 100)
 
@@ -530,14 +571,13 @@ class ShortBot:
         if not oid:
             log.error(f"  No se pudo abrir {symbol}"); return False
 
-        # Si la entrada fue por contratos, ya tenemos qty_c
-        # Si fue por quoteOrderQty, recalcular qty_c para las órdenes condicionales
+        # Si no se obtuvo qty_c de la entrada, recalcular con usdt_qty real
+        # FIX v2.3: siempre pasar usdt_qty, nunca usar POSITION_SIZE global aquí
         if not qty_c:
-            qty_c, _ = self._qty_contratos(symbol, price)
+            qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
 
         if not qty_c:
             log.error(f"  No se pudo calcular qty_c para TP/SL de {symbol}")
-            # Aún así registrar el trade, sin TP/SL automático
             self.open_trades[symbol] = {
                 'entry':price,'qty_c':0,'usdt_qty':usdt_qty,'method':'quote',
                 'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
@@ -698,7 +738,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v2.2 arrancado\n")
+        log.info("\n▶  Bot SHORT v2.4 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
