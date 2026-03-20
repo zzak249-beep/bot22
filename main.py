@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-BOT DE TRADING PROFESIONAL v3.1 - main.py
-Auto-trading ACTIVADO por defecto
-EMA + RSI + MACD + Bollinger + Trailing Stop + TP/SL automatico
-AJUSTES: 7 USDT por trade (min 5 USDT) + Solo una direccion por moneda
+BOT DE TRADING PROFESIONAL - SOLO SHORTS v1.0
+Estrategia especializada para ventas en corto
+
+OPTIMIZACIONES ESPECÍFICAS SHORT:
+- Score mínimo 80 (muy selectivo)
+- RSI > 75 como mínimo
+- EMA bajista confirmada
+- MACD divergencia bajista
+- Rechazo Bollinger superior
+- Volumen confirmación bajista
+- Capital 7 USDT + PnL real con leverage
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math
@@ -11,7 +18,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 # ============================================================================
-# CONFIGURACION - AUTO_TRADING=true POR DEFECTO
+# CONFIGURACION
 # ============================================================================
 
 def clean(key, default, typ='str'):
@@ -21,25 +28,24 @@ def clean(key, default, typ='str'):
     if typ == 'bool':  return v.lower() == 'true'
     return v
 
-# Credenciales
 BINGX_API_KEY    = os.getenv('BINGX_API_KEY',    '').strip().strip('"').strip("'")
 BINGX_API_SECRET = os.getenv('BINGX_API_SECRET', '').strip().strip('"').strip("'")
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
-# Trading - AJUSTADO: 7 USDT por trade, minimo 5 USDT
-AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')  # <-- CAMBIADO A true
-POSITION_SIZE = clean('MAX_POSITION_SIZE',       '7',    'float')  # <-- 7 USDT por trade
-MIN_TRADE     = clean('MIN_TRADE_USDT',          '5',    'float')  # <-- Minimo 5 USDT
-LEVERAGE      = clean('LEVERAGE',                '3',    'int')
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '3.5',  'float')  # Aumentado
-SL_PCT        = clean('STOP_LOSS_PCT',           '1.0',  'float')  # Más ajustado
-MAX_TRADES    = clean('MAX_OPEN_TRADES',          '2',   'int')  # Más selectivo
-INTERVAL      = clean('CHECK_INTERVAL',          '60',   'int')
-MIN_VOLUME    = clean('MIN_VOLUME_24H',       '500000',  'float')
-MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '80',  'int')
-MIN_SCORE     = clean('MIN_SCORE',               '75',   'float')  # Más selectivo
-TRAILING      = clean('TRAILING_STOP_ENABLED',  'true',  'bool')
+# SHORTS: más conservador que LONGS
+AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
+POSITION_SIZE = clean('MAX_POSITION_SIZE',       '7',   'float')
+MIN_TRADE     = clean('MIN_TRADE_USDT',          '5',   'float')
+LEVERAGE      = clean('LEVERAGE',                '3',   'int')
+TP_PCT        = clean('TAKE_PROFIT_PCT',         '4.0', 'float')  # Mayor TP para SHORT
+SL_PCT        = clean('STOP_LOSS_PCT',           '1.5', 'float')  # Mayor SL (más riesgo)
+MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
+INTERVAL      = clean('CHECK_INTERVAL',         '60',   'int')
+MIN_VOLUME    = clean('MIN_VOLUME_24H',     '500000',   'float')
+MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE', '80',   'int')
+MIN_SCORE     = clean('MIN_SCORE',              '80',   'float')  # MUY selectivo
+TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
 
 BASE_URL = "https://open-api.bingx.com"
 
@@ -51,20 +57,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ============================================================================
-# FIRMA BINGX CORRECTA
+# FIRMA BINGX
 # ============================================================================
 
 def bingx_request(method, endpoint, params):
-    """Request autenticada a BingX - firma correcta"""
     params['timestamp'] = int(time.time() * 1000)
     sp  = sorted(params.items())
     qs  = urlencode(sp)
-    sig = hmac.new(BINGX_API_SECRET.encode('utf-8'), qs.encode('utf-8'), hashlib.sha256).hexdigest()
+    sig = hmac.new(BINGX_API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
     url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
-    hdr = {
-        'X-BX-APIKEY': BINGX_API_KEY,
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
+    hdr = {'X-BX-APIKEY': BINGX_API_KEY, 'Content-Type': 'application/x-www-form-urlencoded'}
     if method == 'GET':
         return requests.get(url, headers=hdr, timeout=10)
     return requests.post(url, headers=hdr, timeout=10)
@@ -74,9 +76,8 @@ def bingx_request(method, endpoint, params):
 # ============================================================================
 
 def calc_ema(prices, period):
-    if not prices or len(prices) < 1: return 0
     if len(prices) < period:
-        return sum(prices) / len(prices)
+        return sum(prices) / len(prices) if prices else 0
     k = 2 / (period + 1)
     e = prices[0]
     for p in prices[1:]:
@@ -84,16 +85,19 @@ def calc_ema(prices, period):
     return e
 
 def calc_rsi(prices, period=14):
-    if len(prices) < period + 1: return 50.0
+    if len(prices) < period + 1:
+        return 50.0
     gains  = [max(0,  prices[i] - prices[i-1]) for i in range(1, len(prices))]
     losses = [max(0, prices[i-1] - prices[i])  for i in range(1, len(prices))]
     ag = sum(gains[-period:])  / period
     al = sum(losses[-period:]) / period
-    if al == 0: return 100.0
+    if al == 0:
+        return 100.0
     return 100 - (100 / (1 + ag / al))
 
 def calc_macd(prices):
-    if len(prices) < 26: return 0, 0, 0
+    if len(prices) < 26:
+        return 0, 0, 0
     fast = calc_ema(prices, 12)
     slow = calc_ema(prices, 26)
     ml   = fast - slow
@@ -102,7 +106,7 @@ def calc_macd(prices):
 
 def calc_bollinger(prices, period=20):
     if len(prices) < period:
-        m = sum(prices) / len(prices) if prices else 0
+        m = sum(prices) / len(prices)
         return m, m, m
     w   = prices[-period:]
     mid = sum(w) / period
@@ -110,7 +114,8 @@ def calc_bollinger(prices, period=20):
     return mid + 2*std, mid, mid - 2*std
 
 def calc_atr(highs, lows, closes, period=14):
-    if len(closes) < 2: return 0
+    if len(closes) < 2:
+        return 0
     trs = []
     for i in range(1, min(len(closes), period+1)):
         trs.append(max(
@@ -121,54 +126,50 @@ def calc_atr(highs, lows, closes, period=14):
     return sum(trs) / len(trs) if trs else 0
 
 def vol_spike(volumes):
-    if len(volumes) < 5: return 1.0
+    if len(volumes) < 5:
+        return 1.0
     avg = sum(volumes[:-1]) / len(volumes[:-1])
     return (volumes[-1] / avg) if avg > 0 else 1.0
 
 # ============================================================================
-# BOT PRINCIPAL
+# BOT SHORT
 # ============================================================================
 
-class TradingBot:
+class ShortTradingBot:
 
     def __init__(self):
         log.info("=" * 70)
-        log.info("BOT TRADING PROFESIONAL v3.2 - OPTIMIZADO RENTABILIDAD")
-        log.info("EMA + RSI + MACD + Bollinger + Trailing Stop MEJORADO")
-        log.info("Score 75+ | TP 3.5% SL 1.0% | Filtros multi-confirmacion")
+        log.info("BOT TRADING PROFESIONAL - SOLO SHORTS v1.0")
+        log.info("Estrategia especializada para ventas en corto")
         log.info("=" * 70)
-        log.info(f"AUTO-TRADING:  {'ON - EJECUTANDO TRADES REALES' if AUTO_TRADING else 'OFF'}")
-        log.info(f"Capital/trade: ${POSITION_SIZE} USDT (min ${MIN_TRADE})")
-        log.info(f"  → IMPORTANTE: debe ser ~7 USDT, NO 100 USDT")
-        log.info(f"Leverage:      {LEVERAGE}x  =>  posicion ${POSITION_SIZE * LEVERAGE}")
-        log.info(f"TP/SL:         {TP_PCT}% / {SL_PCT}%  (RR {TP_PCT/SL_PCT:.1f}:1)")
-        log.info(f"Max trades:    {MAX_TRADES}")
-        log.info(f"Score minimo:  {MIN_SCORE}/100")
-        log.info(f"Trailing stop: {'ON' if TRAILING else 'OFF'} (activa +0.5%)")
-        log.info(f"Volumen min:   ${MIN_VOLUME/1e6:.1f}M")
+        log.info(f"AUTO-TRADING:   {'ON - SHORTS REALES' if AUTO_TRADING else 'OFF'}")
+        log.info(f"Capital:        ${POSITION_SIZE} USDT (min ${MIN_TRADE})")
+        log.info(f"Leverage:       {LEVERAGE}x => posicion ${POSITION_SIZE * LEVERAGE}")
+        log.info(f"TP/SL:          {TP_PCT}% / {SL_PCT}%  (RR {TP_PCT/SL_PCT:.1f}:1)")
+        log.info(f"Max trades:     {MAX_TRADES}")
+        log.info(f"Score minimo:   {MIN_SCORE}/100 (MUY SELECTIVO)")
+        log.info(f"Volumen min:    ${MIN_VOLUME/1e6:.1f}M")
+        log.info(f"Trailing stop:  {'ON' if TRAILING else 'OFF'} (activa +0.5%)")
+        log.info(f"Estrategia:     SOLO SHORTS - RSI>75, EMA bajista, MACD-")
         log.info("=" * 70)
 
-        self.symbols     = []
-        self.open_trades = {}
-        self._contracts  = {}
-        self.stats = {'exec':0, 'closed':0, 'wins':0, 'losses':0, 'pnl':0.0}
+        self.symbols         = []
+        self.open_trades     = {}
+        self._contracts      = {}
+        self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
         self._load_contracts()
         self._get_symbols()
 
-        estado = "AUTO-TRADING ON - ejecutando trades reales" if AUTO_TRADING else "Modo señales (OFF)"
         self._tg(
-            f"<b>Bot v3.3 CORREGIDO iniciado</b>\n"
-            f"{estado}\n"
-            f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}% (RR 3.5:1)\n"
-            f"Score min:{MIN_SCORE} | Trades max:{MAX_TRADES} | Trailing:0.5%\n"
-            f"PnL REAL (considera leverage + comisiones)\n"
-            f"Filtros: Multi-confirmacion | Solo 1 dir/moneda\n"
-            f"Analizando {len(self.symbols)} monedas"
+            f"<b>Bot SHORT v1.0 iniciado</b>\n"
+            f"{'AUTO ON - SHORTS reales' if AUTO_TRADING else 'Solo señales'}\n"
+            f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
+            f"Score min:{MIN_SCORE} (MUY selectivo) | MaxTrades:{MAX_TRADES}\n"
+            f"🔴 SOLO SHORTS - Estrategia optimizada bajista\n"
+            f"Filtros: RSI>75, EMA-, MACD-, BB-high, Vol+"
         )
-
-    # ---------------------------------------------------------------- SETUP
 
     def _verify(self):
         global AUTO_TRADING
@@ -176,8 +177,7 @@ class TradingBot:
             log.info("Modo SEÑALES - trades desactivados")
             return
         if not BINGX_API_KEY or not BINGX_API_SECRET:
-            log.error("BINGX_API_KEY o BINGX_API_SECRET no configurados")
-            log.error("Configura las variables en Railway Settings > Variables")
+            log.error("Credenciales faltantes")
             AUTO_TRADING = False
             return
         log.info(f"API Key: {BINGX_API_KEY[:12]}...")
@@ -187,17 +187,15 @@ class TradingBot:
             if d.get('code') == 0:
                 bal = d.get('data', {})
                 eq  = bal.get('equity', bal.get('balance', '?'))
-                log.info(f"Conexion BingX OK | Balance: ${eq} USDT")
+                log.info(f"BingX OK | Balance: ${eq} USDT")
             else:
                 log.error(f"Error BingX [{d.get('code')}]: {d.get('msg')}")
-                log.error("Verifica que la API tenga permisos de Futures")
                 AUTO_TRADING = False
         except Exception as e:
-            log.error(f"No se pudo conectar a BingX: {e}")
+            log.error(f"Error: {e}")
             AUTO_TRADING = False
 
     def _load_contracts(self):
-        """Cargar step size y precision de cada contrato"""
         try:
             r = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/contracts", timeout=15)
             d = r.json()
@@ -212,308 +210,66 @@ class TradingBot:
             log.warning(f"Error contratos: {e}")
 
     def _get_symbols(self):
-        """
-        SOLO CRIPTOMONEDAS PURAS.
-        Estrategia: whitelist de criptos conocidas + validacion por nombre.
-        JAMAS incluye: acciones, SP500, oro, petroleo, forex, indices.
-        """
-
-        # ================================================================
-        # WHITELIST: solo estas criptos conocidas pueden pasar
-        # Ampliada con las mas populares de BingX
-        # ================================================================
-        CRIPTO_WHITELIST = {
-            # Top por market cap
-            'BTC','ETH','BNB','XRP','SOL','ADA','DOGE','TRX','TON','AVAX',
-            'SHIB','DOT','LINK','MATIC','WBTC','DAI','UNI','LTC','BCH','ATOM',
-            'XLM','ETC','ALGO','FIL','HBAR','VET','MANA','SAND','AXS','THETA',
-            # DeFi
-            'AAVE','COMP','CRV','SNX','YFI','SUSHI','1INCH','BAL','REN','KNC',
-            'MKR','ZRX','LRC','PERP','DYDX','GMX','GNS','RUNE','CAKE','JOE',
-            # Layer 2 y nuevas L1
-            'ARB','OP','MATIC','IMX','METIS','BOBA','ZKS','STRK','MANTA','TAIKO',
-            # Memes
-            'DOGE','SHIB','PEPE','FLOKI','BONK','WIF','MEME','TURBO','NEIRO',
-            'DOGS','HMSTR','PNUT','ACT','GOAT','MOODENG',
-            # Infraestructura
-            'FIL','AR','STORJ','GRT','API3','BAND','OCEAN','ANKR','NMR',
-            # Gaming y NFT
-            'AXS','SAND','MANA','ENJ','GALA','ILV','YGG','MAGIC','PIXEL','PORTAL',
-            # Exchange tokens
-            'BNB','OKB','HT','KCS','GT','MX','FTT',
-            # Interoperabilidad
-            'DOT','ATOM','OSMO','INJ','SEI','SUI','APT','NEAR','ICP','FTM',
-            # Privacidad
-            'XMR','ZEC','DASH','SCRT','ROSE',
-            # Oraculo y datos
-            'LINK','BAND','API3','DIA','TRB','UMA',
-            # Stablecoins algoritmicas (no operar pero por si aparecen)
-            # Otros populares en BingX
-            'TIA','PYTH','JUP','WEN','ONDO','ENA','ETHFI','REZ','BB','NOT',
-            'IO','ZRO','BLAST','LISTA','ZK','BOME','SLERF','W','TNSR',
-            'OMNI','REI','DYM','ALT','JTO','MANTA','AEVO','STRK',
-            'PIXELS','PORTAL','MYRO','WIF','BOME','SLERF',
-            'ORDI','SATS','RATS','MUBI','MMSS','TURT',
-            'CKB','BEFI','MASA','OBOL','ETHENA','ENA',
-            'PONKE','ANALOS','BODEN','TREMP',
-            # Mas populares
-            'LDO','RPL','SSV','SWISE','ANKR','FXS','FRAX',
-            'CVX','CNC','ALCX','TOKE','TEMPLE',
-            'STG','VELO','BTRFLY','OHM','KLIMA',
-            'UMAMI','DOPEX','HEGIC','PREMIA',
-            'MAGIC','TreasureDAO',
-            'GMX','GNS','CAP','MUX',
-            'PENDLE','TIMELESS','APW',
-            'RADIANT','LODE',
-            'ACE','ACM','ACH','ACQ',
-            'KEY','KEEP','NU','T',
-            'COTI','CTSI','CXT','CELR',
-            'LINA','LINEAR','LIT','LTO',
-            'CHESS','BAKE','TKO','XVS',
-            'ALPACA','BELT','BFT','BUNNY',
-            'BABY','BABYSWAP',
-            'HIGH','AUCTION',
-            'JASMY','FLOW','CHZ','ENS',
-            'STX','BLUR','CFX','ID',
-            'HOOK','MAGIC','HIGH','LOKA',
-            'PEOPLE','DUSK','CHESS',
-            'ALPHA','BETA','HARD','WING',
-            'BIFI','AUTO','EGGP',
-            'CREAM','RAMP',
-            'BEL','POND','QKC','QI',
-            'NULS','NKN','NEBL',
-            'WICC','WIN','WAN','WTC',
-            'ZIL','ZEN','ZMT',
-            'KAVA','KDA','KEEP',
-            'IOTA','IOTX','IOST',
-            'HIVE','HEART','HERO',
-            'FORTH','FARM','FIDA',
-            'ERN','ERTHA','ERG',
-            'DENT','DEGO','CTXC',
-            'COMBO','CLV','CITY',
-            'BNX','BIFI','BICO',
-            'AUCTION','ASR','ARPA',
-            'AION','AGLD','ACA',
-            'KSM','KMD','KLV',
-            'IOST','IOT','IOTX',
-            'GTC','GLM','GHST',
-            'FLUX','FLM','FIRO',
-            'EGLD','EDU','ECOX',
-            'CTSI','CTKN','CSP',
-            'COS','COCOS','CELO',
-            'C98','BURGER','BSW',
-            'BOUNCEBIT','BOME',
-            'AVA','AUTO','ASTR',
-            'ALT','ALICE','ALD',
-            'AGIX','AEVO','AERGO',
-            'XNO','XEC','XDC',
-            'VTHO','VOXEL','VITE',
-            'UTK','USTC','UNFI',
-            'TWT','TVK','TRU',
-            'SYN','SWEAT','SWP',
-            'SUPER','STPT','STEP',
-            'SPARTA','SNFT','SLP',
-            'SKL','SFP','SCRT',
-            'RAY','QUICK','QNT',
-            'PYR','PROM','POLYX',
-            'POL','PLA','PIVX',
-            'PHB','PERP','PAXG',
-            'OM','OGN','NFT',
-            'MTL','MSN','MOVR',
-            'MOB','MBOX','MARS',
-            'LOOKS','LON','LITH',
-            'LEVER','LEND',
-            'LA','KUNCI','KP3R',
-            'KNC','KLAY','KINE',
-            'JASMY','IQ','IQBAL',
-            'HXRO','HUNT','HFT',
-            'HAI','GXS','GRS',
-            'GREIP','GPS','GNO',
-            'GFI','GALA','FRONT',
-            'FOR','FOAM','FNCT',
-            'FIO','FERRUM','FEI',
-            'FDUSD','FCON','FCAST',
-            'EVMOS','EVA','EUROC',
-            'EPX','EPAN','EPIC',
-            'ELON','ELF','EDEN',
-            'DUSK','DODO','DIS',
-            'DIMO','DEXT','DENS',
-            'DAR','CZZ','CXT',
-            'CVC','CRO','CPOOL',
-            'COVER','CORE','CONV',
-            'COMB','CMD','CLEO',
-            'CAST','CAMP','BSX',
-            'BRWL','BRISE','BOBA',
-            'BNT','BMX','BLOK',
-            'BLZ','BIFI','BHT',
-            'BEP','BCUT','BCOIN',
-            'BADGER','AXL','AWT',
-            'AVAIL','AURA','ATOLO',
-            'PROS','POLS','POC',
-            'PHTR','PERP','PEAK',
-            'NYAN','NUX','NSFW',
-            'NOIA','NIOX','NIF',
-            'NFTD','NFTB','NEON',
-            'MYC','MVL','MUSK',
-            'MOOV','MONO','MONI',
-            'MON','MOD','MNGO',
-            'MITH','MINI','MILK',
-            'MIKU','MHC','MFT',
-            'MEAN','MCRT','MBX',
-            'LPOOL','LPNT','LOS',
-            'LONG','LOCO','LNR',
-            'LMR','LKY','LIME',
-            'LIKE','LIF3','LFLY',
-            'LAYER','LAZIO','LASER',
-            'LACE','KZEN','KUN',
-            'KRTC','KRS','KRTS',
-            'KOL','KOG','KOBO',
-            'KNOT','KMB','KISHIMOTO',
-            'JUV','JRT','JOB',
-            'JMPT','JET','JAM',
-            'JAB','IZI','ITGR',
-            'IRON','IPAD','IPAY',
-            'IOSG','IONIC','IOI',
-            'INTER','INT','INSUR',
-            'INF','INFI','INDO',
-            'IME','IMPT','IMANITY',
-            'ILSI','ILUS','IHF',
-            'IFC','IDO','IDEX',
-            'IBFK','IAG','HYVE',
-            'HZN','HYN','HYDRA',
-            'HTZ','HSF','HPS',
-            'HPB','HOT','HNT',
-            'HMT','HLG','HIT',
-            'HIRE','HIFI','HFN',
-            'HEX','HENLO','HELLO',
-            'HECTOR','HEC','HBB',
-            'HAL','GZX','GXT',
-            'GZONE','GYM','GWT',
-            'GUSDT','GUM','GOVI',
-            'GOVI','GORILLA','GOM2',
-            'GOLDY','GODE','GNX',
-            'GNFT','GMM','GLAD',
-            'GHX','GHC','GFX',
-            'GET','GES','GEMS',
-            'GEL','GEC','GDX',
-            'GCN','GBT','GBPT',
-        }
-
-        # Patron de nombres tipicos de acciones que NO son cripto:
-        # Mayusculas de 1-4 letras tipicas de NYSE/NASDAQ
-        # Excepciones: BTC, ETH, BNB etc ya estan en whitelist
-        STOCK_PATTERNS = {
-            # Acciones conocidas que podrian colarse
-            'SPX','SPY','QQQ','IWM','DIA','GLD','SLV','USO','UNG',
-            'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','BRK',
-            'JPM','BAC','WFC','GS','MS','C','V','MA','AXP',
-            'JNJ','PFE','MRK','ABBV','BMY','LLY','AMGN',
-            'XOM','CVX','COP','SLB','HAL','BKR','MPC',
-            'CAT','DE','MMM','HON','GE','BA','LMT','RTX',
-            'WMT','TGT','COST','HD','LOW','AMZN',
-            'NFLX','DIS','CMCSA','T','VZ',
-            'COIN','HOOD','MSTR','RIOT','MARA','HUT','BITF',
-            # Materias primas
-            'GOLD','SILVER','OIL','GAS','NATGAS','BRENT','WTI','CRUDE',
+        excl = {
+            'GOLD','SILVER','XAG','XAU','PAXG','XAUT','OIL','BRENT','WTI','CRUDE',
+            'PLATINUM','PALLADIUM','COPPER','NICKEL',
+            'TSLA','AAPL','MSFT','GOOGL','AMZN','META','NVDA','COIN','MSTR',
+            'TESLA','APPLE','MICROSOFT','GOOGLE','AMAZON','FACEBOOK',
+            'SP500','SPX','SPY','QQQ','NASDAQ','DOW','DOWJONES','DJI','RUSSELL',
+            'DAX','FTSE','CAC','NIKKEI','HANG','HSI','BOVESPA','IBEX',
+            'DOW30','DJIA','US30','NAS100','US500',
+            'EUR','GBP','JPY','CHF','AUD','CAD','NZD','100','1000',
+            'EURUSD','GBPUSD','USDJPY','AUDUSD','NZDUSD',
             'WHEAT','CORN','SUGAR','COFFEE','COTTON','LUMBER',
-            'COPPER','NICKEL','ZINC','LEAD','ALUM','TIN',
-            'PLATINUM','PALLADIUM','RHODIUM',
-            # Indices
-            'SP500','DOW','NASDAQ','NIKKEI','DAX','FTSE','CAC','IBEX',
-            'HANG','HSI','ASX','BOVESPA','RTS','MOEX',
-            # Forex
-            'EURUSD','GBPUSD','USDJPY','USDCHF','AUDUSD','USDCAD',
-            'NZDUSD','EURGBP','EURJPY','GBPJPY',
         }
-
-        def is_real_crypto(symbol):
-            base = symbol.replace('-USDT', '').upper()
-
-            # 1. Si empieza con numero -> NO (1000SHIB, 10000LADYS)
-            if base and base[0].isdigit():
-                return False
-
-            # 2. Si esta en patrones de acciones/commodities -> NO
-            if base in STOCK_PATTERNS:
-                return False
-
-            # 3. Si contiene palabras de commodities/acciones -> NO
-            commodity_words = [
-                'GOLD','SILVER','OIL','GAS','BRENT','CRUDE','WHEAT',
-                'CORN','COPPER','NASDAQ','SP500','NIKKEI','FTSE',
-                'TSLA','AAPL','MSFT','NVDA','GOOGL','AMZN','META',
-                'FOREX','STOCK','SHARE','EQUITY','INDEX','INDICE',
-                'XAU','XAG','XPT','XPD',  # codigos de metales
-            ]
-            for word in commodity_words:
-                if word in base:
-                    return False
-
-            # 4. WHITELIST: si esta en la lista de criptos conocidas -> SI
-            if base in CRIPTO_WHITELIST:
-                return True
-
-            # 5. Si no esta en whitelist pero tampoco en blacklist,
-            #    aceptar si tiene entre 2 y 10 caracteres (tipico de cripto)
-            #    y no parece un ticker de accion
-            if 2 <= len(base) <= 10:
-                return True
-
-            return False
-
+        
         try:
             r = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker", timeout=15)
             d = r.json()
             if d.get('code') == 0:
-                items    = []
+                items = []
                 excluded = []
-
                 for t in d.get('data', []):
-                    sym = t.get('symbol', '')
+                    sym = t.get('symbol','')
                     if not sym.endswith('-USDT'):
                         continue
-
-                    if not is_real_crypto(sym):
-                        excluded.append(sym.replace('-USDT', ''))
+                    
+                    base = sym.replace('-USDT','').upper()
+                    
+                    if any(k in base for k in excl):
+                        excluded.append(base)
                         continue
-
+                    
+                    if any(word in base for word in ['DOW','JONES','NASDAQ','INDEX','SP500','STOCK']):
+                        excluded.append(base)
+                        continue
+                    
                     try:
-                        price = float(t.get('lastPrice', 0))
-                        vol   = float(t.get('volume', 0)) * price
-                        if vol < MIN_VOLUME or price < 0.0001:
+                        vol = float(t.get('volume',0)) * float(t.get('lastPrice',0))
+                        if vol < MIN_VOLUME or float(t.get('lastPrice',0)) < 0.0001:
                             continue
-                        items.append({'symbol': sym, 'vol': vol})
+                        items.append({'symbol':sym, 'vol':vol})
                     except:
                         continue
-
+                
                 items.sort(key=lambda x: x['vol'], reverse=True)
                 self.symbols = [x['symbol'] for x in items[:MAX_SYMBOLS]]
-
+                
                 if excluded:
-                    log.info(f"Excluidos ({len(excluded)} no-cripto): {', '.join(excluded[:20])}")
-                log.info(f"✅ {len(self.symbols)} CRIPTOMONEDAS puras seleccionadas")
-                for i, x in enumerate(items[:5], 1):
-                    log.info(f"  {i}. {x['symbol']:15s} Vol:${x['vol']/1e6:.1f}M")
+                    log.info(f"Excluidos {len(excluded)} no-cripto: {', '.join(excluded[:10])}")
+                log.info(f"{len(self.symbols)} criptomonedas para SHORT (vol>${MIN_VOLUME/1e6:.1f}M)")
                 return
-
         except Exception as e:
-            log.warning(f"Error obteniendo simbolos: {e}")
-
-        # Fallback SOLO criptos top
-        log.warning("Usando lista estatica de criptos top")
-        self.symbols = [
-            'BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT',
-            'DOGE-USDT','ADA-USDT','AVAX-USDT','LINK-USDT','DOT-USDT',
-            'MATIC-USDT','UNI-USDT','ATOM-USDT','LTC-USDT','BCH-USDT',
-            'NEAR-USDT','FIL-USDT','APT-USDT','ARB-USDT','OP-USDT',
-            'INJ-USDT','SUI-USDT','SEI-USDT','TIA-USDT','JUP-USDT'
-        ]
+            log.warning(f"Error simbolos: {e}")
+        
+        self.symbols = ['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT',
+                        'DOGE-USDT','ADA-USDT','AVAX-USDT','LINK-USDT','MATIC-USDT']
 
     def _klines(self, symbol, interval='5m', limit=50):
         try:
             r = requests.get(
                 f"{BASE_URL}/openApi/swap/v3/quote/klines",
-                params={'symbol': symbol, 'interval': interval, 'limit': limit},
+                params={'symbol':symbol,'interval':interval,'limit':limit},
                 timeout=10
             )
             d = r.json()
@@ -525,32 +281,33 @@ class TradingBot:
                     [float(x['low'])    for x in k],
                     [float(x['volume']) for x in k],
                 )
-        except: pass
+        except:
+            pass
         return None, None, None, None
 
     def _ticker(self, symbol):
         try:
             r = requests.get(
                 f"{BASE_URL}/openApi/swap/v2/quote/ticker",
-                params={'symbol': symbol}, timeout=8
+                params={'symbol':symbol}, timeout=8
             )
             d = r.json()
             if d.get('code') == 0 and d.get('data'):
                 t = d['data']
                 return {
-                    'price':  float(t.get('lastPrice', 0)),
-                    'change': float(t.get('priceChangePercent', 0)),
+                    'price':  float(t.get('lastPrice',0)),
+                    'change': float(t.get('priceChangePercent',0)),
                 }
-        except: pass
+        except:
+            pass
         return None
 
-    # ---------------------------------------------------------------- SEÑAL
+    # ---------------------------------------------------------------- SEÑAL SHORT
 
     def analyze(self, symbol):
         """
-        Estrategia multi-indicador:
-        EMA 9/21/50 + RSI 14 + MACD + Bollinger + Volumen + Trend
-        Score 0-100. Entra si score >= MIN_SCORE
+        Estrategia ESPECIALIZADA para SHORTS
+        Requiere confirmaciones FUERTES de sobrecompra y reversión bajista
         """
         if symbol in self.open_trades:
             return None
@@ -574,207 +331,130 @@ class TradingBot:
         ml, sg, hist = calc_macd(closes)
         bb_u, bb_m, bb_l = calc_bollinger(closes, 20)
         atr_v = calc_atr(highs, lows, closes, 14)
-        vsp   = vol_spike(volumes)
+        vspike = vol_spike(volumes)
 
-        ema_bull = ema9 > ema21 > ema50
         ema_bear = ema9 < ema21 < ema50
         ema_gap  = abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
         short_trend = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else 0
 
-        # Score LONG - MEJORADO para mayor rentabilidad
-        ls, lr = 0, []
-        
-        # EMA alineación (más peso)
-        if ema_bull:
-            p = 25 + min(15, ema_gap * 8); ls += p; lr.append(f"EMA+({p:.0f})")
-        
-        # RSI oversold (más selectivo)
-        if rsi_v < 25:
-            ls += 30; lr.append("RSI<25(30)")
-        elif rsi_v < 35:
-            ls += 18; lr.append("RSI<35(18)")
-        
-        # MACD confirmación fuerte
-        if ml > sg and hist > 0:
-            if hist > abs(ml) * 0.3:  # Histograma fuerte
-                ls += 25; lr.append("MACD++(25)")
-            else:
-                ls += 15; lr.append("MACD+(15)")
-        
-        # Bollinger Bands
-        if price <= bb_l * 1.003:
-            ls += 20; lr.append("BB-low(20)")
-        elif price <= bb_m * 0.98:
-            ls += 10; lr.append("BB-mid(10)")
-        
-        # Volumen spike fuerte
-        if vsp >= 2.0:
-            p = min(20, vsp * 8); ls += p; lr.append(f"Vol{vsp:.1f}x({p:.0f})")
-        elif vsp >= 1.5:
-            p = min(12, vsp * 5); ls += p; lr.append(f"Vol{vsp:.1f}x({p:.0f})")
-        
-        # Tendencia corto plazo
-        if short_trend > 0.5:
-            ls += 15; lr.append("trend++(15)")
-        elif short_trend > 0.2:
-            ls += 8; lr.append("trend+(8)")
-        
-        # Cambio 24h positivo
-        if change > 2.0:
-            p = min(15, change * 3); ls += p; lr.append(f"24h+{change:.1f}%({p:.0f})")
-        elif change > 0.5:
-            p = min(8, change * 2); ls += p; lr.append(f"24h+{change:.1f}%({p:.0f})")
-        
-        # FILTROS NEGATIVOS (restan puntos)
-        if rsi_v > 65:
-            ls -= 15; lr.append("RSI>65(-15)")
-        if price > bb_u:
-            ls -= 10; lr.append("BB-high(-10)")
-
-        # Score SHORT - MEJORADO para mayor rentabilidad
+        # SCORE SHORT - ESTRATEGIA OPTIMIZADA
         ss, sr = 0, []
         
-        # EMA alineación bajista (más peso)
+        # 1. EMA BAJISTA (CRÍTICO - 35 pts)
         if ema_bear:
-            p = 25 + min(15, ema_gap * 8); ss += p; sr.append(f"EMA-({p:.0f})")
-        
-        # RSI overbought (más selectivo)
-        if rsi_v > 75:
-            ss += 30; sr.append("RSI>75(30)")
-        elif rsi_v > 65:
-            ss += 18; sr.append("RSI>65(18)")
-        
-        # MACD confirmación fuerte
-        if ml < sg and hist < 0:
-            if abs(hist) > abs(ml) * 0.3:  # Histograma fuerte
-                ss += 25; sr.append("MACD--(25)")
+            if ema_gap > 1.5:
+                p = 35 + min(20, ema_gap*12); ss += p; sr.append(f"EMA--({p:.0f})")
             else:
-                ss += 15; sr.append("MACD-(15)")
-        
-        # Bollinger Bands
-        if price >= bb_u * 0.997:
-            ss += 20; sr.append("BB-high(20)")
-        elif price >= bb_m * 1.02:
-            ss += 10; sr.append("BB-mid(10)")
-        
-        # Volumen spike fuerte
-        if vsp >= 2.0:
-            p = min(20, vsp * 8); ss += p; sr.append(f"Vol{vsp:.1f}x({p:.0f})")
-        elif vsp >= 1.5:
-            p = min(12, vsp * 5); ss += p; sr.append(f"Vol{vsp:.1f}x({p:.0f})")
-        
-        # Tendencia corto plazo bajista
-        if short_trend < -0.5:
-            ss += 15; sr.append("trend--(15)")
-        elif short_trend < -0.2:
-            ss += 8; sr.append("trend-(8)")
-        
-        # Cambio 24h negativo
-        if change < -2.0:
-            p = min(15, abs(change) * 3); ss += p; sr.append(f"24h{change:.1f}%({p:.0f})")
-        elif change < -0.5:
-            p = min(8, abs(change) * 2); ss += p; sr.append(f"24h{change:.1f}%({p:.0f})")
-        
-        # FILTROS NEGATIVOS (restan puntos)
-        if rsi_v < 35:
-            ss -= 15; sr.append("RSI<35(-15)")
-        if price < bb_l:
-            ss -= 10; sr.append("BB-low(-10)")
-
-        # TP dinamico por ATR (más agresivo en alta volatilidad)
-        atr_pct = (atr_v / price * 100) if price > 0 else 0
-        tp_dyn  = max(TP_PCT, min(TP_PCT * 2.5, atr_pct * 2.0))
-        
-        # FILTRO: evitar señales débiles o contradictorias
-        # Si ambos scores son bajos, no operar
-        if max(ls, ss) < MIN_SCORE * 0.7:
+                p = 30 + min(12, ema_gap*10); ss += p; sr.append(f"EMA-({p:.0f})")
+        else:
+            # RECHAZAR si no hay EMA bajista
+            sr.append("SinEMA-(-99)")
             return None
         
-        # Filtro de RSI extremo para LONG (evitar comprar muy alto)
-        if ls > ss and ls >= MIN_SCORE and rsi_v <= 70 and price < bb_u:
-            # Confirmación adicional: debe tener al menos 2 indicadores fuertes
-            strong_signals = 0
-            if ema_bull and ema_gap > 0.5: strong_signals += 1
-            if rsi_v < 35: strong_signals += 1
-            if ml > sg and hist > 0: strong_signals += 1
-            if vsp >= 1.5: strong_signals += 1
-            
-            if strong_signals >= 2:
-                return {'signal':'LONG',  'price':price, 'change':change,
-                        'score':ls, 'reasons':' | '.join(lr),
-                        'rsi':rsi_v, 'vol':vsp, 'tp_pct':tp_dyn, 'sl_pct':SL_PCT}
-
-        # Filtro de RSI extremo para SHORT (evitar vender muy bajo)
-        if ss > ls and ss >= MIN_SCORE and rsi_v >= 30 and price > bb_l:
-            # Confirmación adicional: debe tener al menos 2 indicadores fuertes
-            strong_signals = 0
-            if ema_bear and ema_gap > 0.5: strong_signals += 1
-            if rsi_v > 65: strong_signals += 1
-            if ml < sg and hist < 0: strong_signals += 1
-            if vsp >= 1.5: strong_signals += 1
-            
-            if strong_signals >= 2:
-                return {'signal':'SHORT', 'price':price, 'change':change,
-                        'score':ss, 'reasons':' | '.join(sr),
-                        'rsi':rsi_v, 'vol':vsp, 'tp_pct':tp_dyn, 'sl_pct':SL_PCT}
-
+        # 2. RSI OVERBOUGHT EXTREMO (MUY CRÍTICO - 40 pts)
+        if rsi_v > 80:
+            ss += 40; sr.append("RSI>80(40)")
+        elif rsi_v > 75:
+            ss += 32; sr.append("RSI>75(32)")
+        elif rsi_v > 70:
+            ss += 22; sr.append("RSI>70(22)")
+        elif rsi_v > 65:
+            ss += 12; sr.append("RSI>65(12)")
+        else:
+            # PENALIZAR si RSI no está sobrecalentado
+            ss -= 20; sr.append(f"RSI{rsi_v:.0f}(-20)")
+        
+        # 3. MACD BAJISTA (25 pts)
+        if ml < sg and hist < 0:
+            if abs(hist) > abs(ml) * 0.4:  # Histograma MUY negativo
+                ss += 25; sr.append("MACD--(25)")
+            else:
+                ss += 18; sr.append("MACD-(18)")
+        else:
+            # PENALIZAR si MACD no confirma
+            ss -= 15; sr.append("MACD+(-15)")
+        
+        # 4. BOLLINGER SUPERIOR (rechazo de banda - 25 pts)
+        if price >= bb_u * 0.998:
+            ss += 25; sr.append("BB-high(25)")
+        elif price >= bb_m * 1.03:
+            ss += 15; sr.append("BB-mid+(15)")
+        elif price < bb_m:
+            # PENALIZAR si precio bajo
+            ss -= 12; sr.append("BB-low(-12)")
+        
+        # 5. VOLUMEN EN VENTA (20 pts)
+        if vspike >= 2.5 and short_trend < -0.3:
+            p = min(20, vspike*10); ss += p; sr.append(f"VolVenta{vspike:.1f}x({p:.0f})")
+        elif vspike >= 1.8:
+            p = min(15, vspike*8); ss += p; sr.append(f"Vol{vspike:.1f}x({p:.0f})")
+        elif vspike < 1.3:
+            # PENALIZAR bajo volumen
+            ss -= 10; sr.append("VolBajo(-10)")
+        
+        # 6. TENDENCIA BAJISTA (18 pts)
+        if short_trend < -1.5:
+            ss += 18; sr.append("trend--(18)")
+        elif short_trend < -0.5:
+            ss += 12; sr.append("trend-(12)")
+        elif short_trend > 0.5:
+            # PENALIZAR tendencia alcista
+            ss -= 15; sr.append("trend+(-15)")
+        
+        # 7. CAMBIO 24H POSITIVO (sobrecompra - 15 pts)
+        if change > 5.0:
+            p = min(15, change * 2.5); ss += p; sr.append(f"24h+{change:.1f}%({p:.0f})")
+        elif change > 3.0:
+            p = min(10, change * 2); ss += p; sr.append(f"24h+{change:.1f}%({p:.0f})")
+        elif change < -2.0:
+            # PENALIZAR si ya cayó mucho
+            ss -= 12; sr.append(f"24h{change:.1f}%(-12)")
+        
+        # 8. CONFIRMACIÓN ADICIONAL: Precio cerca de máximos recientes
+        recent_high = max(closes[-10:]) if len(closes) >= 10 else price
+        if price >= recent_high * 0.98:
+            ss += 15; sr.append("NearHigh(15)")
+        
+        # TP dinamico más agresivo para SHORT
+        atr_pct = (atr_v / price * 100) if price > 0 else 0
+        tp_dyn  = max(TP_PCT, min(TP_PCT * 3, atr_pct * 2.5))
+        
+        # DECISIÓN: Solo SHORT si score >= MIN_SCORE
+        if ss >= MIN_SCORE:
+            return {'signal':'SHORT', 'price':price,'change':change,'score':ss,
+                    'reasons':' | '.join(sr),'rsi':rsi_v,'vol':vspike,'tp_pct':tp_dyn,'sl_pct':SL_PCT}
+        
         return None
 
-    # ---------------------------------------------------------------- CANTIDAD
-
     def _qty(self, symbol, price):
-        """Calcular cantidad respetando POSITION_SIZE de 7 USDT (min 5 USDT)"""
-        info    = self._contracts.get(symbol, {'step': 1.0, 'prec': 2})
-        step, prec = info['step'], info['prec']
-        
-        # FORZAR: usar exactamente POSITION_SIZE (7 USDT), nunca más
-        # Esto evita que use 100 USDT como en los logs anteriores
-        capital = POSITION_SIZE  # 7 USDT fijo
-        
-        # Solo si es menor que el mínimo, usar MIN_TRADE
+        info  = self._contracts.get(symbol, {'step':1.0,'prec':2})
+        step  = info['step']
+        prec  = info['prec']
+        capital = min(POSITION_SIZE, 7.0)
         if capital < MIN_TRADE:
-            capital = MIN_TRADE  # 5 USDT mínimo
-        
+            capital = MIN_TRADE
         log.info(f"  Calculando cantidad para ${capital:.2f} USDT a precio ${price:.6f}")
-        
-        raw     = capital / price
+        raw   = capital / price
         stepped = math.ceil(raw / step) * step if step > 0 else raw
-        qty     = round(stepped, prec)
-        val     = qty * price
-        
-        # Ajustar si quedo por debajo del minimo
+        qty   = round(stepped, prec)
+        val   = qty * price
         i = 0
         while val < MIN_TRADE and step > 0 and i < 1000:
-            qty += step
-            qty = round(qty, prec)
+            qty += step; qty = round(qty, prec); val = qty * price; i += 1
+        if val > 8:
+            log.warning(f"  Capital ${val:.2f} > 8 USDT, ajustando...")
+            qty = (7.0 / price)
+            qty = round(math.floor(qty / step) * step, prec) if step > 0 else round(qty, prec)
             val = qty * price
-            i += 1
-        
-        # VALIDACIÓN FINAL: nunca permitir más de 10 USDT
-        if val > 10:
-            log.warning(f"  ADVERTENCIA: Capital calculado ${val:.2f} > 10 USDT, ajustando...")
-            qty = (POSITION_SIZE / price)
-            qty = round(math.floor(qty / step) * step, prec)
-            val = qty * price
-        
         log.info(f"  Cantidad final: {qty} (${val:.2f} USDT)")
         return qty, round(val, 4)
 
-    # ---------------------------------------------------------------- VERIFICAR POSICION
-
     def _tiene_posicion_bingx(self, symbol):
-        """
-        Verificar si hay posicion abierta en BingX para este simbolo.
-        Retorna: (tiene_posicion, direccion)
-        tiene_posicion: bool
-        direccion: 'LONG', 'SHORT' o None
-        """
         try:
             r = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol': symbol})
             d = r.json()
             if d.get('code') == 0:
-                posiciones = d.get('data', []) or []
-                for p in posiciones:
+                for p in (d.get('data') or []):
                     amt = float(p.get('positionAmt', 0) or 0)
                     if abs(amt) > 0:
                         direccion = 'LONG' if amt > 0 else 'SHORT'
@@ -783,207 +463,155 @@ class TradingBot:
             log.debug(f"_tiene_posicion_bingx {symbol}: {e}")
         return False, None
 
-    # ---------------------------------------------------------------- ABRIR TRADE
-
     def open_trade(self, symbol, sig):
-        """
-        Abrir posicion con TP y SL automaticos.
-        REGLA: Solo una direccion por moneda.
-        Si ya existe LONG, no permitir SHORT (y viceversa)
-        """
-        price     = sig['price']
-        direction = sig['signal']
-        tp_pct    = sig['tp_pct']
-        sl_pct    = sig['sl_pct']
-
         if not AUTO_TRADING:
-            log.info(f"  SEÑAL {direction} {symbol} score:{sig['score']:.0f} [AUTO-TRADING OFF]")
-            log.info(f"  Para activar: pon AUTO_TRADING_ENABLED=true en Railway Variables")
+            log.info(f"  SEÑAL SHORT {symbol} score:{sig['score']:.0f} [AUTO-TRADING OFF]")
             return False
 
-        # BLOQUEO 1: ya registrado localmente
+        price = sig['price']
+
         if symbol in self.open_trades:
-            log.info(f"  {symbol} ya en open_trades locales - saltando")
             return False
 
-        # BLOQUEO 2: verificar en BingX - solo una direccion por moneda
         if AUTO_TRADING:
             tiene_pos, pos_dir = self._tiene_posicion_bingx(symbol)
             if tiene_pos:
-                if pos_dir == direction:
-                    # Misma direccion - registrar localmente y saltar
-                    log.info(f"  {symbol} ya tiene {direction} en BingX - saltando")
+                if pos_dir == 'SHORT':
+                    log.info(f"  {symbol} ya tiene SHORT en BingX")
                     self.open_trades[symbol] = {
-                        'direction': direction, 'entry': price,
-                        'qty': 0, 'val': 0,
-                        'tp': price*(1+tp_pct/100) if direction=='LONG' else price*(1-tp_pct/100),
-                        'sl': price*(1-sl_pct/100) if direction=='LONG' else price*(1+sl_pct/100),
-                        'tp_pct': tp_pct, 'sl_pct': sl_pct,
-                        'highest': price, 'lowest': price,
-                        'order_id': 'EXISTENTE', 'tp_ok': False, 'sl_ok': False,
-                        'opened_at': datetime.now(), 'score': sig['score'],
+                        'direction': 'SHORT', 'entry': price, 'qty': 0, 'val': 0,
+                        'tp': 0, 'sl': 0, 'tp_pct': sig['tp_pct'], 'sl_pct': sig['sl_pct'],
+                        'highest': price, 'lowest': price, 'order_id': 'EXISTENTE',
+                        'tp_ok': False, 'sl_ok': False, 'opened_at': datetime.now(),
+                        'score': sig['score'],
                     }
                     return False
                 else:
-                    # Direccion contraria - RECHAZAR
-                    log.warning(f"  ⚠️ {symbol} RECHAZADO: ya existe {pos_dir}, queria {direction}")
-                    log.warning(f"  REGLA: Solo una direccion por moneda")
+                    log.warning(f"  ⚠️ {symbol} ya tiene LONG, no puede SHORT")
                     return False
 
         qty, val = self._qty(symbol, price)
         
-        # VALIDACIÓN CRÍTICA: rechazar si capital > 10 USDT
         if val > 10:
-            log.error(f"  {symbol} RECHAZADO: capital ${val:.2f} > 10 USDT (debe ser ~7 USDT)")
-            log.error(f"  Revisa POSITION_SIZE en variables de entorno")
+            log.error(f"  {symbol} RECHAZADO: capital ${val:.2f} > 10 USDT")
             return False
-        
         if val < MIN_TRADE:
-            log.warning(f"  {symbol} rechazado: ${val:.2f} < min ${MIN_TRADE}")
+            log.warning(f"  {symbol} rechazado ${val:.2f} < ${MIN_TRADE}")
             return False
         
-        log.info(f"  ✓ Capital validado: ${val:.2f} USDT (objetivo: ${POSITION_SIZE})")
-        
-        tp = price * (1 + tp_pct/100) if direction == 'LONG' else price * (1 - tp_pct/100)
-        sl = price * (1 - sl_pct/100) if direction == 'LONG' else price * (1 + sl_pct/100)
+        log.info(f"  ✓ Capital validado: ${val:.2f} USDT")
 
-        log.info(f"\n  Abriendo {direction} {symbol}")
-        log.info(f"  Score:{sig['score']:.0f}/100 | RSI:{sig['rsi']:.1f} | Vol:{sig['vol']:.1f}x")
+        tp_pct = sig['tp_pct']
+        sl_pct = sig['sl_pct']
+        tp = price * (1 - tp_pct/100)
+        sl = price * (1 + sl_pct/100)
+
+        log.info(f"\n  Abriendo SHORT {symbol}")
+        log.info(f"  Score:{sig['score']:.0f}/100 RSI:{sig['rsi']:.1f} Vol:{sig['vol']:.1f}x")
         log.info(f"  {sig['reasons']}")
-        log.info(f"  Entry:${price:.6f} | Qty:{qty} (${val:.2f}) | TP:{tp_pct:.1f}% SL:{sl_pct:.1f}%")
+        log.info(f"  Entry:${price:.6f} Qty:{qty} (${val:.2f}) TP:{tp_pct:.1f}% SL:{sl_pct:.1f}%")
 
-        # 1. Orden de mercado
         r = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-            'symbol':       symbol,
-            'side':         'BUY' if direction == 'LONG' else 'SELL',
-            'positionSide': direction,
-            'type':         'MARKET',
-            'quantity':     str(qty),
+            'symbol': symbol,
+            'side':   'SELL',
+            'positionSide': 'SHORT',
+            'type':   'MARKET',
+            'quantity': str(qty),
         })
         d = r.json()
         if d.get('code') != 0:
-            log.error(f"  Error abriendo [{d.get('code')}]: {d.get('msg')}")
+            log.error(f"  Error [{d.get('code')}]: {d.get('msg')}")
             return False
 
-        oid = d.get('data', {}).get('orderId', 'N/A')
-        log.info(f"  POSICION ABIERTA | OrderID: {oid}")
+        oid = d.get('data',{}).get('orderId','N/A')
+        log.info(f"  SHORT ABIERTO ID:{oid}")
 
-        # 2. Take Profit
-        time.sleep(0.5)
-        tp_ok = self._cond_order(symbol, direction, qty, tp, 'TAKE_PROFIT_MARKET')
+        time.sleep(0.4)
+        tp_ok = self._cond_order(symbol, qty, tp, 'TAKE_PROFIT_MARKET')
+        time.sleep(0.4)
+        sl_ok = self._cond_order(symbol, qty, sl, 'STOP_MARKET')
 
-        # 3. Stop Loss
-        time.sleep(0.5)
-        sl_ok = self._cond_order(symbol, direction, qty, sl, 'STOP_MARKET')
-
-        # Registrar
         self.open_trades[symbol] = {
-            'direction':  direction,
-            'entry':      price,
-            'qty':        qty,
-            'val':        val,
-            'tp':         tp,
-            'sl':         sl,
-            'tp_pct':     tp_pct,
-            'sl_pct':     sl_pct,
-            'highest':    price,
-            'lowest':     price,
-            'order_id':   oid,
-            'tp_ok':      tp_ok,
-            'sl_ok':      sl_ok,
-            'opened_at':  datetime.now(),
-            'score':      sig['score'],
+            'direction': 'SHORT', 'entry': price, 'qty': qty, 'val': val,
+            'tp': tp, 'sl': sl, 'tp_pct': tp_pct, 'sl_pct': sl_pct,
+            'highest': price, 'lowest': price, 'order_id': oid,
+            'tp_ok': tp_ok, 'sl_ok': sl_ok, 'opened_at': datetime.now(),
+            'score': sig['score'],
         }
         self.stats['exec'] += 1
 
         self._tg(
-            f"<b>TRADE ABIERTO</b>\n"
-            f"{direction} {symbol} | Score:{sig['score']:.0f}/100\n"
+            f"<b>SHORT ABIERTO</b>\n"
+            f"{symbol} | Score:{sig['score']:.0f}/100\n"
             f"Entry: ${price:.4f}\n"
-            f"{'OK' if tp_ok else 'ERR'} TP: ${tp:.4f} (+{tp_pct:.1f}%)\n"
-            f"{'OK' if sl_ok else 'ERR'} SL: ${sl:.4f} (-{sl_pct:.1f}%)\n"
-            f"Capital: ${val:.2f} USDT\n"
-            f"Leverage: {LEVERAGE}x → Posicion: ${val * LEVERAGE:.2f}\n"
+            f"{'OK' if tp_ok else 'ERR'} TP: ${tp:.4f} (-{tp_pct:.1f}%)\n"
+            f"{'OK' if sl_ok else 'ERR'} SL: ${sl:.4f} (+{sl_pct:.1f}%)\n"
+            f"Capital: ${val:.2f} x{LEVERAGE} = ${val*LEVERAGE:.2f}\n"
             f"Cantidad: {qty}\n"
             f"{sig['reasons']}"
         )
         return True
 
-    def _cond_order(self, symbol, direction, qty, stop_price, otype):
-        """Colocar orden TP o SL condicional"""
+    def _cond_order(self, symbol, qty, stop_price, otype):
         try:
             r = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol':       symbol,
-                'side':         'SELL' if direction == 'LONG' else 'BUY',
-                'positionSide': direction,
-                'type':         otype,
-                'quantity':     str(qty),
-                'stopPrice':    str(round(stop_price, 6)),
+                'symbol': symbol,
+                'side':   'BUY',
+                'positionSide': 'SHORT',
+                'type':   otype,
+                'quantity': str(qty),
+                'stopPrice': str(round(stop_price, 6)),
             })
             d = r.json()
+            ok = d.get('code') == 0
             lbl = "TP" if "TAKE" in otype else "SL"
-            if d.get('code') == 0:
+            if ok:
                 log.info(f"  {lbl} OK @ ${stop_price:.6f}")
-                return True
-            log.warning(f"  {lbl} ERR [{d.get('code')}]: {d.get('msg')}")
-            return False
+            else:
+                log.warning(f"  {lbl} ERR [{d.get('code')}]: {d.get('msg')}")
+            return ok
         except Exception as e:
             log.warning(f"  {otype} exc: {e}")
             return False
 
-    # ---------------------------------------------------------------- CERRAR TRADE
-
     def close_trade(self, symbol, cur_price, reason):
-        """Cerrar posicion (backup si BingX no ejecuto TP/SL)"""
         if symbol not in self.open_trades:
             return False
         t = self.open_trades[symbol]
         try:
             r = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol':       symbol,
-                'side':         'SELL' if t['direction'] == 'LONG' else 'BUY',
-                'positionSide': t['direction'],
-                'type':         'MARKET',
-                'quantity':     str(t['qty']),
+                'symbol': symbol,
+                'side':   'BUY',
+                'positionSide': 'SHORT',
+                'type':   'MARKET',
+                'quantity': str(t['qty']),
             })
             d = r.json()
             if d.get('code') == 0:
-                # PnL CORREGIDO: considerar leverage y comisiones
-                # Comisión BingX: 0.05% entrada + 0.05% salida = 0.1% total
-                COMISION_TOTAL = 0.001  # 0.1%
-                
-                if t['direction'] == 'LONG':
-                    # PnL sin leverage
-                    pnl_sin_lev = (cur_price - t['entry']) * t['qty']
-                    # PnL real = (cambio % * capital * leverage) - comisiones
-                    cambio_pct = (cur_price - t['entry']) / t['entry']
-                    pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
-                else:
-                    # SHORT
-                    pnl_sin_lev = (t['entry'] - cur_price) * t['qty']
-                    cambio_pct = (t['entry'] - cur_price) / t['entry']
-                    pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
-                
-                pnl_pct = (pnl / t['val']) * 100  # % sobre capital invertido (sin leverage)
+                COMISION_TOTAL = 0.001
+                cambio_pct = (t['entry'] - cur_price) / t['entry']
+                pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
+                pnl_pct = (pnl / t['val']) * 100
                 
                 self.stats['closed'] += 1
                 self.stats['pnl']    += pnl
                 if pnl > 0: self.stats['wins']   += 1
                 else:        self.stats['losses'] += 1
+                
                 total = self.stats['wins'] + self.stats['losses']
-                wr    = self.stats['wins'] / total * 100 if total else 0
-                mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
-
-                log.info(f"  CERRADO({reason}) {symbol} PnL:${pnl:+.2f}({pnl_pct:+.1f}%) dur:{mins}min")
+                wr = self.stats['wins'] / total * 100 if total else 0
+                mins = int((datetime.now() - t['opened_at']).total_seconds() / 60)
+                
+                log.info(f"  CERRADO({reason}) {symbol} PnL:${pnl:+.2f}({pnl_pct:+.1f}%) {mins}min")
                 self._tg(
-                    f"<b>CERRADO - {reason}</b>\n"
+                    f"<b>SHORT CERRADO - {reason}</b>\n"
                     f"{symbol}\n"
                     f"PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
                     f"Entry: ${t['entry']:.4f} → Exit: ${cur_price:.4f}\n"
                     f"Capital: ${t['val']:.2f} x{LEVERAGE}\n"
                     f"Duracion: {mins} min\n"
                     f"Total PnL: ${self.stats['pnl']:+.2f}\n"
-                    f"Win Rate: {wr:.1f}% ({self.stats['wins']}W/{self.stats['losses']}L)"
+                    f"WR: {wr:.1f}% ({self.stats['wins']}W/{self.stats['losses']}L)"
                 )
                 del self.open_trades[symbol]
                 return True
@@ -991,13 +619,7 @@ class TradingBot:
             log.error(f"  Error cerrando {symbol}: {e}")
         return False
 
-    # ---------------------------------------------------------------- MONITOR
-
     async def _sync_con_bingx(self):
-        """
-        Sincronizar open_trades con posiciones reales de BingX.
-        Si BingX ya cerro una posicion (TP/SL ejecutado), eliminarla del dict local.
-        """
         if not self.open_trades or not AUTO_TRADING:
             return
         try:
@@ -1005,59 +627,48 @@ class TradingBot:
             d = r.json()
             if d.get('code') != 0:
                 return
+            
             posiciones_bingx = {}
             for p in (d.get('data') or []):
                 sym = p.get('symbol','')
                 amt = float(p.get('positionAmt', 0) or 0)
                 if abs(amt) > 0:
                     posiciones_bingx[sym] = amt
-
+            
             for symbol in list(self.open_trades.keys()):
                 if symbol not in posiciones_bingx:
                     t = self.open_trades[symbol]
-                    # BingX ya no tiene posicion -> fue cerrada por TP/SL
-                    tk = self._ticker(symbol)
-                    cur = tk['price'] if tk else t['entry']
-                    
-                    # PnL CORREGIDO: considerar leverage y comisiones
-                    COMISION_TOTAL = 0.001  # 0.1% total (0.05% entrada + 0.05% salida)
-                    
-                    if t['direction'] == 'LONG':
-                        cambio_pct = (cur - t['entry']) / t['entry']
-                        pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
-                    else:
+                    if t.get('order_id') not in ('EXTERNO', 'EXISTENTE', ''):
+                        tk = self._ticker(symbol)
+                        cur = tk['price'] if tk else t['entry']
+                        
+                        COMISION_TOTAL = 0.001
                         cambio_pct = (t['entry'] - cur) / t['entry']
                         pnl = (t['val'] * LEVERAGE * cambio_pct) - (t['val'] * LEVERAGE * COMISION_TOTAL)
-                    
-                    pnl_pct = (pnl / t['val']) * 100
-                    
-                    self.stats['closed'] += 1
-                    self.stats['pnl']    += pnl
-                    if pnl >= 0: self.stats['wins']   += 1
-                    else:        self.stats['losses'] += 1
-                    total = self.stats['wins'] + self.stats['losses']
-                    wr    = self.stats['wins'] / total * 100 if total else 0
-                    mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
-                    
-                    log.info(f"  SYNC: {symbol} cerrado por BingX PnL=${pnl:+.2f} ({pnl_pct:+.1f}%)")
-                    msg = (
-                        "<b>CERRADO por BingX (TP/SL)</b>\n"
-                        + symbol + "\n"
-                        + "PnL: ${:.2f} ({:+.1f}%)\n".format(pnl, pnl_pct)
-                        + "Entry: ${:.4f} → Exit: ${:.4f}\n".format(t['entry'], cur)
-                        + "Capital: ${:.2f} x{}\n".format(t['val'], LEVERAGE)
-                        + "Duracion: {} min\n".format(mins)
-                        + "Total PnL: ${:.2f}\n".format(self.stats['pnl'])
-                        + "WR: {:.1f}% ({}W/{}L)".format(wr, self.stats['wins'], self.stats['losses'])
-                    )
-                    self._tg(msg)
+                        pnl_pct = (pnl / t['val']) * 100
+                        
+                        self.stats['closed'] += 1
+                        self.stats['pnl']    += pnl
+                        if pnl >= 0: self.stats['wins']   += 1
+                        else:        self.stats['losses'] += 1
+                        
+                        total = self.stats['wins'] + self.stats['losses']
+                        wr = self.stats['wins'] / total * 100 if total else 0
+                        mins = int((datetime.now() - t['opened_at']).total_seconds() / 60)
+                        
+                        log.info(f"  SYNC: {symbol} cerrado por BingX PnL=${pnl:+.2f}")
+                        self._tg(
+                            f"<b>SHORT CERRADO por BingX</b>\n{symbol}\n"
+                            f"PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
+                            f"Entry: ${t['entry']:.4f} → Exit: ${cur:.4f}\n"
+                            f"Duracion: {mins} min\n"
+                            f"Total: ${self.stats['pnl']:+.2f} | WR:{wr:.1f}%"
+                        )
                     del self.open_trades[symbol]
         except Exception as e:
-            log.debug(f"_sync_con_bingx: {e}")
+            log.debug(f"sync: {e}")
 
     async def monitor_trades(self):
-        """Monitorear trades abiertos con trailing stop y cierre automatico"""
-        # Sincronizar con BingX primero
         await self._sync_con_bingx()
         
         for symbol in list(self.open_trades.keys()):
@@ -1067,51 +678,27 @@ class TradingBot:
                 if not tk: continue
                 cur = tk['price']
 
-                if t['direction'] == 'LONG':
-                    pnl_pct = (cur - t['entry']) / t['entry'] * 100
-                    hit_tp  = cur >= t['tp']
-                    hit_sl  = cur <= t['sl']
-                    
-                    # Trailing stop MEJORADO: activar con 0.5% ganancia
-                    if TRAILING and cur > t['highest']:
-                        t['highest'] = cur
-                        if pnl_pct >= 0.5:  # Activar más temprano
-                            # SL más agresivo: proteger 60% de la ganancia
-                            profit = cur - t['entry']
-                            new_sl = t['entry'] + (profit * 0.6)
-                            if new_sl > t['sl']:
-                                t['sl'] = new_sl
-                                log.info(f"  Trailing SL {symbol} -> ${new_sl:.4f} (protege {pnl_pct*0.6:.1f}%)")
-                else:
-                    pnl_pct = (t['entry'] - cur) / t['entry'] * 100
-                    hit_tp  = cur <= t['tp']
-                    hit_sl  = cur >= t['sl']
-                    
-                    # Trailing stop MEJORADO para SHORT
-                    if TRAILING and cur < t['lowest']:
-                        t['lowest'] = cur
-                        if pnl_pct >= 0.5:  # Activar más temprano
-                            # SL más agresivo: proteger 60% de la ganancia
-                            profit = t['entry'] - cur
-                            new_sl = t['entry'] - (profit * 0.6)
-                            if new_sl < t['sl']:
-                                t['sl'] = new_sl
-                                log.info(f"  Trailing SL {symbol} -> ${new_sl:.4f} (protege {pnl_pct*0.6:.1f}%)")
+                pnl_pct = (t['entry'] - cur) / t['entry'] * 100
+                hit_tp  = cur <= t['tp']
+                hit_sl  = cur >= t['sl']
+                
+                if TRAILING and cur < t['lowest']:
+                    t['lowest'] = cur
+                    if pnl_pct >= 0.5:
+                        profit = t['entry'] - cur
+                        new_sl = t['entry'] - (profit * 0.65)
+                        if new_sl < t['sl']:
+                            t['sl'] = new_sl
+                            log.info(f"  Trailing SL SHORT {symbol} -> ${new_sl:.4f}")
 
                 if abs(pnl_pct) > 0.4:
-                    log.info(
-                        f"  {symbol} {t['direction']} "
-                        f"PnL:{pnl_pct:+.1f}% ${cur:.4f} | "
-                        f"TP:${t['tp']:.4f} SL:${t['sl']:.4f}"
-                    )
+                    log.info(f"  {symbol} SHORT PnL:{pnl_pct:+.1f}% ${cur:.4f} SL:${t['sl']:.4f}")
 
                 if hit_tp:   self.close_trade(symbol, cur, "TAKE PROFIT")
                 elif hit_sl: self.close_trade(symbol, cur, "STOP LOSS")
 
             except Exception as e:
                 log.debug(f"Monitor {symbol}: {e}")
-
-    # ---------------------------------------------------------------- TELEGRAM
 
     def _tg(self, msg):
         try:
@@ -1123,11 +710,9 @@ class TradingBot:
                 )
         except: pass
 
-    # ---------------------------------------------------------------- LOOP PRINCIPAL
-
     async def run(self):
-        log.info("\nBot arrancado - trading automatico\n")
-        iteration    = 0
+        log.info("\nBot SHORT arrancado\n")
+        iteration = 0
         last_refresh = 0
 
         while True:
@@ -1135,7 +720,6 @@ class TradingBot:
                 iteration += 1
                 now = time.time()
 
-                # Actualizar lista monedas cada 10 min
                 if now - last_refresh > 600:
                     log.info("Actualizando monedas...")
                     self._get_symbols()
@@ -1147,17 +731,14 @@ class TradingBot:
                 log.info(f"\n{'='*70}")
                 log.info(
                     f"#{iteration} {datetime.now().strftime('%H:%M:%S')} | "
-                    f"Trades:{len(self.open_trades)}/{MAX_TRADES} | "
+                    f"SHORTS:{len(self.open_trades)}/{MAX_TRADES} | "
                     f"PnL:${self.stats['pnl']:+.2f} | "
-                    f"WR:{wr:.1f}% ({self.stats['wins']}W/{self.stats['losses']}L)"
+                    f"WR:{wr:.1f}%({self.stats['wins']}W/{self.stats['losses']}L)"
                 )
-                log.info(f"AUTO-TRADING: {'ON' if AUTO_TRADING else 'OFF'}")
                 log.info(f"{'='*70}\n")
 
-                # 1. Monitorear posiciones abiertas
                 await self.monitor_trades()
 
-                # 2. Buscar nuevas señales
                 if len(self.open_trades) < MAX_TRADES:
                     found = 0
                     for i, sym in enumerate(self.symbols):
@@ -1167,37 +748,30 @@ class TradingBot:
                         if sig:
                             found += 1
                             log.info(
-                                f"  SEÑAL {sig['signal']} {sym} "
-                                f"score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} "
-                                f"Vol:{sig['vol']:.1f}x"
+                                f"  SEÑAL SHORT {sym} "
+                                f"score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} Vol:{sig['vol']:.1f}x"
                             )
                             self.open_trade(sym, sig)
                         await asyncio.sleep(0.15)
-                        if (i + 1) % 20 == 0:
+                        if (i+1) % 20 == 0:
                             log.info(f"  {i+1}/{len(self.symbols)} analizadas")
 
-                    log.info(f"\n  {len(self.symbols)} monedas | {found} señales encontradas")
+                    log.info(f"\n  {len(self.symbols)} monedas | {found} señales SHORT")
                 else:
-                    log.info(f"  Max trades ({MAX_TRADES}) alcanzado - solo monitoreando")
+                    log.info(f"  Max SHORTS ({MAX_TRADES}) - esperando")
 
-                log.info(f"\n  Proxima iteracion en {INTERVAL}s\n")
+                log.info(f"\n  Proxima en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
 
             except KeyboardInterrupt:
-                log.info("Bot detenido")
-                break
+                log.info("Detenido"); break
             except Exception as e:
-                log.error(f"Error en loop: {e}")
+                log.error(f"Error loop: {e}")
                 await asyncio.sleep(15)
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 async def main():
     try:
-        await TradingBot().run()
+        await ShortTradingBot().run()
     except Exception as e:
         log.error(f"Error fatal: {e}")
 
