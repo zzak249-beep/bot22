@@ -1,32 +1,20 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v2.6
+BOT SHORTS PROFESIONAL v2.7.0
 ════════════════════════════════════════════════
-FIX CRÍTICO v2.3:
-  1. _qty_contratos() ahora recibe usdt_amount como parámetro.
-     Antes: siempre usaba POSITION_SIZE global (70 USDT) aunque la
-     entrada real era de 8 USDT → contratos 8.75x mayores → BingX
-     rechazaba TP/SL silenciosamente porque la qty > posición real.
-     Ahora: usa el usdt_qty real de la entrada.
-
-  2. Eliminado el cap hardcodeado min(POSITION_SIZE, 8.0) en open_trade.
-     Antes: ignoraba MAX_POSITION_SIZE del .env → entraba con $8 siempre.
-     Ahora: usa POSITION_SIZE directamente (respeta el .env).
-
-  3. _place_short_entry y open_trade pasan usdt_qty a _qty_contratos.
-
-FIX CRÍTICO v2.2 (anterior):
-  _cond_order() usa quantity en contratos para TP/SL.
-  BingX NO soporta quoteOrderQty en STOP_MARKET ni TAKE_PROFIT_MARKET.
+FIXES v2.7.0:
+  1. CRÍTICO: Eliminado quoteOrderQty en entrada — causaba trades de <$1
+     Ahora SIEMPRE usa quantity (contratos) calculados correctamente
+  2. Verificación de balance ANTES de abrir trade
+  3. Reconciliación de posiciones SHORT al arrancar con TP/SL
+  4. Detección explícita de "Insufficient margin" → aborta sin dejar posición sin TP/SL
+  5. _posiciones_reales_bingx() verifica BingX, no solo memoria interna
+  6. Balance actualizado en cada ciclo
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-
-# ============================================================================
-# CONFIGURACION
-# ============================================================================
 
 def clean(key, default, typ='str'):
     v = os.getenv(key, str(default))
@@ -45,25 +33,24 @@ BINGX_API_SECRET = os.getenv('BINGX_API_SECRET', '').strip().strip('"').strip("'
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
-AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
-POSITION_SIZE = clean('MAX_POSITION_SIZE',       '7',   'float')
-MIN_TRADE     = clean('MIN_TRADE_USDT',          '5',   'float')
-LEVERAGE      = clean('LEVERAGE',                '3',   'int')
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '1.5', 'float')
-SL_PCT        = clean('STOP_LOSS_PCT',           '1.01','float')
-MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
-INTERVAL      = clean('CHECK_INTERVAL',         '120',  'int')
-MIN_VOLUME    = clean('MIN_VOLUME_24H',       '50000',  'float')
-MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE', '90',   'int')
-MIN_SCORE     = clean('MIN_SCORE',              '75',   'float')
-TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
-USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',      'true', 'bool')
-BTC_BULL_BLOCK_PCT = clean('BTC_BULL_BLOCK_PCT',    '1.5',  'float')
+AUTO_TRADING       = clean('AUTO_TRADING_ENABLED',   'true',  'bool')
+POSITION_SIZE      = clean('MAX_POSITION_SIZE',        '7',   'float')
+MIN_TRADE          = clean('MIN_TRADE_USDT',           '5',   'float')
+LEVERAGE           = clean('LEVERAGE',                 '3',   'int')
+TP_PCT             = clean('TAKE_PROFIT_PCT',          '1.5', 'float')
+SL_PCT             = clean('STOP_LOSS_PCT',            '1.0', 'float')
+MAX_TRADES         = clean('MAX_OPEN_TRADES',          '2',   'int')
+INTERVAL           = clean('CHECK_INTERVAL',          '120',  'int')
+MIN_VOLUME         = clean('MIN_VOLUME_24H',       '500000',  'float')
+MAX_SYMBOLS        = clean('MAX_SYMBOLS_TO_ANALYZE',   '50',  'int')
+MIN_SCORE          = clean('MIN_SCORE',                '80',  'float')
+TRAILING           = clean('TRAILING_STOP_ENABLED',  'true',  'bool')
+USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',       'true',  'bool')
+BTC_BULL_BLOCK_PCT = clean('BTC_BULL_BLOCK_PCT',      '1.5',  'float')
 
 LIMIT_OFFSET_PCT = 0.05
 SKIP_HOURS_UTC   = {0, 1}
-
-BASE_URL = "https://open-api.bingx.com"
+BASE_URL         = "https://open-api.bingx.com"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,10 +63,6 @@ COMISION_MAKER  = 0.0002
 COMISION_TAKER  = 0.0005
 COMISION_ACTUAL = COMISION_MAKER if USE_LIMIT_ORDERS else COMISION_TAKER
 TP_MIN_RENTABLE = round((COMISION_ACTUAL / LEVERAGE + 0.002) * 100, 3)
-
-# ============================================================================
-# API BINGX — con retry
-# ============================================================================
 
 def bingx_request(method, endpoint, params, retries=2):
     for attempt in range(retries + 1):
@@ -99,10 +82,6 @@ def bingx_request(method, endpoint, params, retries=2):
                 log.warning(f"  retry {attempt+1}: {e}"); time.sleep(1.5)
             else:
                 raise
-
-# ============================================================================
-# INDICADORES
-# ============================================================================
 
 def calc_ema(prices, period):
     if not prices: return 0
@@ -144,44 +123,44 @@ def vol_spike(volumes):
     avg = sum(volumes[:-1]) / len(volumes[:-1])
     return (volumes[-1] / avg) if avg > 0 else 1.0
 
-# ============================================================================
-# BOT
-# ============================================================================
-
 class ShortBot:
 
     def __init__(self):
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 65)
-        log.info("  BOT SHORTS PROFESIONAL v2.6")
-        log.info("  FIX v2.6: fees reales 0.02/0.05%, entrada MAKER, TP límite")
-        log.info("  FIX v2.2: TP/SL siempre en contratos")
+        log.info("  BOT SHORTS PROFESIONAL v2.7.0")
+        log.info("  FIX: qty contratos siempre, balance check, reconciliación")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
         log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
         log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR:{TP_PCT/SL_PCT:.1f}:1")
-        log.info(f"  TP mín:    {TP_MIN_RENTABLE}% (cubre comisiones)")
-        log.info(f"  Órdenes:   {fee_lbl}")
-        log.info(f"  BTC filtro:{BTC_BULL_BLOCK_PCT}% | Cooldown:15min")
+        log.info(f"  TP mín:    {TP_MIN_RENTABLE}%")
+        log.info(f"  Fee:       {fee_lbl}")
+        log.info(f"  Score mín: {MIN_SCORE}")
+        log.info(f"  Max trades:{MAX_TRADES}")
         log.info("=" * 65)
 
-        self.symbols         = []
-        self.open_trades     = {}
-        self._contracts      = {}
-        self._cooldowns      = {}
-        self._last_report    = datetime.now()
-        self._btc_change_1h  = 0.0
+        self.symbols        = []
+        self.open_trades    = {}
+        self._contracts     = {}
+        self._cooldowns     = {}
+        self._last_report   = datetime.now()
+        self._btc_change_1h = 0.0
+        self._balance       = 0.0
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
         self._load_contracts()
         self._get_symbols()
+        self._reconciliar_posiciones()
+
         self._tg(
-            f"<b>🔴 Bot SHORTS v2.6 iniciado</b>\n"
-            f"FIX: qty_c ahora coincide con entrada real\n"
+            f"<b>🔴 Bot SHORTS v2.7.0 iniciado</b>\n"
+            f"FIX: qty contratos siempre correctos\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
-            f"Fee: {fee_lbl} | Score≥{MIN_SCORE}"
+            f"Fee: {fee_lbl} | Score≥{MIN_SCORE}\n"
+            f"Balance: ${self._balance:.2f} USDT"
         )
 
     # ---------------------------------------------------------------- setup
@@ -190,16 +169,43 @@ class ShortBot:
         global AUTO_TRADING
         if not AUTO_TRADING: return
         if not BINGX_API_KEY or not BINGX_API_SECRET:
+            log.error("  API keys vacías — modo SEÑALES")
             AUTO_TRADING = False; return
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
             if d.get('code') == 0:
-                eq = d.get('data',{}).get('equity', d.get('data',{}).get('balance','?'))
-                log.info(f"BingX OK | Balance: ${eq} USDT")
+                eq = float(d.get('data',{}).get('equity', d.get('data',{}).get('balance', 0)) or 0)
+                self._balance = eq
+                log.info(f"BingX OK | Balance: ${eq:.2f} USDT")
+                if eq < MIN_TRADE:
+                    log.error(f"  Balance ${eq:.2f} < mínimo ${MIN_TRADE} — modo SEÑALES")
+                    self._tg(f"⚠️ Balance insuficiente: ${eq:.2f} USDT. Deposita más.")
+                    AUTO_TRADING = False
             else:
                 log.error(f"BingX [{d.get('code')}]: {d.get('msg')}"); AUTO_TRADING = False
         except Exception as e:
             log.error(f"Error API: {e}"); AUTO_TRADING = False
+
+    def _update_balance(self):
+        """Actualiza balance en cada ciclo."""
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
+            if d.get('code') == 0:
+                eq = float(d.get('data',{}).get('equity', d.get('data',{}).get('balance', 0)) or 0)
+                self._balance = eq
+                return eq
+        except: pass
+        return self._balance
+
+    def _balance_suficiente(self):
+        """FIX v2.7: Verifica balance real antes de abrir trade."""
+        bal = self._update_balance()
+        needed = POSITION_SIZE / LEVERAGE
+        if bal < needed:
+            log.warning(f"  Balance ${bal:.2f} < margen necesario ${needed:.2f} — skip")
+            self._tg(f"⚠️ Balance insuficiente: ${bal:.2f} USDT (necesario: ${needed:.2f})")
+            return False
+        return True
 
     def _load_contracts(self):
         try:
@@ -245,12 +251,67 @@ class ShortBot:
                     except: continue
                 items.sort(key=lambda x: x['vol'], reverse=True)
                 self.symbols = [x['symbol'] for x in items[:MAX_SYMBOLS]]
-                log.info(f"Pares: {len(self.symbols)} | Excluidos no-cripto: {len(excl)}")
+                log.info(f"Pares: {len(self.symbols)} | Excluidos: {len(excl)}")
                 return
         except Exception as e:
             log.warning(f"Error símbolos: {e}")
-        self.symbols = ['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT',
-                        'DOGE-USDT','ADA-USDT','AVAX-USDT','LINK-USDT','DOT-USDT']
+        self.symbols = ['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT']
+
+    def _reconciliar_posiciones(self):
+        """FIX v2.7: Al arrancar detecta SHORTs propios del bot en BingX."""
+        if not AUTO_TRADING: return
+        log.info("  🔍 Reconciliando posiciones SHORT en BingX...")
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
+            if d.get('code') != 0: return
+            recuperadas = 0
+            for p in (d.get('data') or []):
+                try: amt = float(p.get('positionAmt', 0) or 0)
+                except: continue
+                if amt >= 0: continue  # Solo SHORTs (negativos)
+                sym = p.get('symbol', '')
+                if not sym: continue
+                try:
+                    lev = int(float(p.get('leverage', 0) or 0))
+                except: lev = 0
+                if lev != 0 and lev != LEVERAGE:
+                    log.info(f"  ⏭ {sym} ignorado — leverage {lev}x ≠ {LEVERAGE}x")
+                    continue
+                try:
+                    entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
+                except: entry = 0
+                if entry <= 0:
+                    tk = self._ticker(sym)
+                    entry = tk['price'] if tk else 0
+                if entry <= 0: continue
+                qty_c    = abs(amt)
+                tp_price = entry * (1 - TP_PCT / 100)
+                sl_price = entry * (1 + SL_PCT / 100)
+                tp_ok = self._cond_order(sym, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
+                time.sleep(0.3)
+                sl_ok = self._cond_order(sym, qty_c, sl_price, 'STOP_MARKET')
+                self.open_trades[sym] = {
+                    'entry':entry,'qty_c':qty_c,'usdt_qty':POSITION_SIZE,
+                    'tp':tp_price,'sl':sl_price,'tp_pct':TP_PCT,'sl_pct':SL_PCT,
+                    'lowest':entry,'order_id':'RECONCILIADO',
+                    'tp_ok':tp_ok,'sl_ok':sl_ok,
+                    'opened_at':datetime.now(),'score':0,
+                }
+                recuperadas += 1
+                log.info(f"  📉 {sym} SHORT reconciliado | entry=${entry:.6f} qty={qty_c} | TP:{'✅' if tp_ok else '❌'} SL:{'✅' if sl_ok else '❌'}")
+            log.info(f"  ✅ Reconciliación: {recuperadas} posiciones SHORT registradas")
+        except Exception as e:
+            log.error(f"  Error reconciliación: {e}")
+
+    def _posiciones_reales_bingx(self):
+        """FIX v2.7: Cuenta SHORTs reales en BingX."""
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
+            if d.get('code') == 0:
+                return sum(1 for p in (d.get('data') or [])
+                           if float(p.get('positionAmt', 0) or 0) < 0)
+        except: pass
+        return len(self.open_trades)
 
     # ---------------------------------------------------------------- datos
 
@@ -285,17 +346,13 @@ class ShortBot:
         except: pass
 
     # ---------------------------------------------------------------- sizing
-    # FIX v2.3: acepta usdt_amount para calcular qty correcta según entrada real
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
         """
-        Calcula cantidad en contratos basada en usdt_amount.
-        FIX v2.3: usa usdt_amount en lugar de POSITION_SIZE global,
-        así qty_c coincide con la entrada real y BingX acepta el TP/SL.
+        FIX v2.7: SIEMPRE calcula qty en contratos.
+        NUNCA uses quoteOrderQty — BingX ejecuta el mínimo posible con ese parámetro.
         """
-        if usdt_amount is None:
-            usdt_amount = POSITION_SIZE
-
+        if usdt_amount is None: usdt_amount = POSITION_SIZE
         info  = self._contracts.get(symbol, {'step':1.0,'prec':2,'ctval':1.0})
         step  = max(info['step'], 0.0001)
         prec  = info['prec']
@@ -310,7 +367,6 @@ class ShortBot:
         while val < MIN_TRADE and i < 500:
             qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
 
-        # Cap: nunca más de usdt_amount * 1.3
         if val > usdt_amount * 1.3:
             qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
             val = qty * ppc
@@ -318,7 +374,7 @@ class ShortBot:
         log.info(f"    qty_contratos: {qty} × ${ppc:.6f} = ${val:.2f} USDT")
         return qty, round(val, 4)
 
-    # ---------------------------------------------------------------- análisis
+    # ---------------------------------------------------------------- filtros
 
     def _cooldown_ok(self, symbol):
         ts = self._cooldowns.get(symbol)
@@ -326,6 +382,8 @@ class ShortBot:
 
     def _hora_ok(self):
         return datetime.utcnow().hour not in SKIP_HOURS_UTC
+
+    # ---------------------------------------------------------------- análisis
 
     def analyze(self, symbol):
         if symbol in self.open_trades or not self._cooldown_ok(symbol): return None
@@ -357,9 +415,9 @@ class ShortBot:
         trend_5  = (closes[-1] - closes[-6])  / closes[-6]  * 100 if len(closes) >= 6  else 0
         trend_10 = (closes[-1] - closes[-11]) / closes[-11] * 100 if len(closes) >= 11 else 0
         bb_pos   = (price - bb_l) / (bb_u - bb_l) if (bb_u - bb_l) > 0 else 0.5
-        near_high    = price >= max(closes[-15:]) * 0.98 if len(closes) >= 15 else False
-        red_candles  = sum(1 for i in range(-4, 0) if opens and closes[i] < opens[i]) if opens else 0
-        atr_pct      = (atr / price * 100) if price > 0 else 0
+        near_high   = price >= max(closes[-15:]) * 0.98 if len(closes) >= 15 else False
+        red_candles = sum(1 for i in range(-4, 0) if opens and closes[i] < opens[i]) if opens else 0
+        atr_pct     = (atr / price * 100) if price > 0 else 0
 
         score_min = MIN_SCORE + (10 if self._btc_change_1h > 0.5 else 0)
         ss, sr = 0, []
@@ -417,56 +475,48 @@ class ShortBot:
 
     def _place_short_entry(self, symbol, usdt_qty, price):
         """
-        Entrada: intenta LÍMITE (maker), fallback MERCADO quoteOrderQty, fallback contratos.
-        FIX v2.3: pasa usdt_qty a _qty_contratos para que qty_c coincida con la entrada.
+        FIX v2.7 CRÍTICO: SIEMPRE usa quantity (contratos).
+        NUNCA quoteOrderQty — BingX ejecuta mínimo posible con ese param.
         """
-        # FIX v2.3: usa usdt_qty real, NO POSITION_SIZE global
-        qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
+        qty_c, val = self._qty_contratos(symbol, price, usdt_qty)
+        if not qty_c:
+            log.error(f"  No se pudo calcular qty_c para {symbol}")
+            return None, None
+
+        log.info(f"  Abriendo SHORT {symbol}: {qty_c} contratos = ${val:.2f} USDT")
 
         if USE_LIMIT_ORDERS:
-            # FIX v2.6: LIMIT necesita quantity (contratos), NO quoteOrderQty
-            # BingX ignora quoteOrderQty en LIMIT → ejecutaba 1 contrato (~$0.35) en vez de $70
-            if not qty_c:
-                log.warning("  qty_c=0 — no se puede colocar límite, fallback mercado")
-            else:
-                limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)
-                d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                    'symbol':symbol,'side':'SELL','positionSide':'SHORT',
-                    'type':'LIMIT','price':str(limit_price),
-                    'quantity':str(qty_c),'timeInForce':'GTC',
-                }).json()
-                if d.get('code') == 0:
-                    log.info(f"  ENTRADA LÍMITE OK {qty_c} contratos @ ${limit_price:.6f} (~${usdt_qty}) maker")
-                    return d.get('data',{}).get('orderId','OK'), qty_c
-                log.warning(f"  Límite falló [{d.get('code')}] — fallback mercado")
+            limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)
+            d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
+                'symbol':symbol,'side':'SELL','positionSide':'SHORT',
+                'type':'LIMIT','price':str(limit_price),
+                'quantity':str(qty_c),'timeInForce':'GTC',
+            }).json()
+            if d.get('code') == 0:
+                log.info(f"  ENTRADA LÍMITE OK {qty_c} contratos @ ${limit_price:.6f} maker")
+                return d.get('data',{}).get('orderId','OK'), qty_c
+            if 'margin' in str(d.get('msg','')).lower() or d.get('code') in [101204, 80012]:
+                log.error(f"  Insufficient margin — abortando")
+                return None, None
+            log.warning(f"  Límite falló [{d.get('code')}] — fallback mercado")
 
-        # Mercado con quoteOrderQty
+        # FIX v2.7: SIEMPRE quantity en contratos, NUNCA quoteOrderQty
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-            'symbol':symbol,'side':'SELL','positionSide':'SHORT',
-            'type':'MARKET','quoteOrderQty':str(round(usdt_qty,2)),
-        }).json()
-        if d.get('code') == 0:
-            log.info(f"  ENTRADA MERCADO OK ${usdt_qty}")
-            return d.get('data',{}).get('orderId','OK'), qty_c
-
-        # Fallback contratos
-        log.warning(f"  quoteOrderQty falló [{d.get('code')}] — fallback contratos")
-        if not qty_c: return None, None
-        d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'SELL','positionSide':'SHORT',
             'type':'MARKET','quantity':str(qty_c),
         }).json()
-        if d2.get('code') == 0:
-            return d2.get('data',{}).get('orderId','OK'), qty_c
-        log.error(f"  Todos los métodos fallaron [{d2.get('code')}]: {d2.get('msg')}")
+        if d.get('code') == 0:
+            log.info(f"  ENTRADA MERCADO OK {qty_c} contratos (${val:.2f}) taker")
+            return d.get('data',{}).get('orderId','OK'), qty_c
+
+        if 'margin' in str(d.get('msg','')).lower():
+            log.error(f"  Insufficient margin — abortando")
+            return None, None
+
+        log.error(f"  Entrada fallida [{d.get('code')}]: {d.get('msg')}")
         return None, None
 
     def _cond_order(self, symbol, qty_c, stop_price, otype):
-        """
-        FIX v2.6: TP usa TAKE_PROFIT (límite) → maker fee 0.02%.
-                  SL usa STOP_MARKET          → taker fee 0.05% (garantiza ejecución).
-        FIX v2.2: quantity en contratos siempre (BingX ignora quoteOrderQty en TP/SL).
-        """
         if not qty_c or qty_c <= 0:
             log.error(f"  {otype} cancelado: qty_c inválido ({qty_c})")
             return False
@@ -475,63 +525,46 @@ class ShortBot:
             lbl   = "TP" if is_tp else "SL"
 
             if is_tp:
-                # TP como límite: espera en libro → maker fee 0.02%
                 params = {
-                    'symbol':      symbol,
-                    'side':        'BUY',
-                    'positionSide':'SHORT',
-                    'type':        'TAKE_PROFIT',      # límite (maker)
-                    'quantity':    str(qty_c),
-                    'price':       str(round(stop_price, 8)),
-                    'stopPrice':   str(round(stop_price, 8)),
-                    'timeInForce': 'GTC',
+                    'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                    'type':'TAKE_PROFIT','quantity':str(qty_c),
+                    'price':str(round(stop_price, 8)),
+                    'stopPrice':str(round(stop_price, 8)),'timeInForce':'GTC',
                 }
             else:
-                # SL sigue como STOP_MARKET → garantiza ejecución aunque sea taker
                 params = {
-                    'symbol':      symbol,
-                    'side':        'BUY',
-                    'positionSide':'SHORT',
-                    'type':        'STOP_MARKET',
-                    'quantity':    str(qty_c),
-                    'stopPrice':   str(round(stop_price, 8)),
+                    'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                    'type':'STOP_MARKET','quantity':str(qty_c),
+                    'stopPrice':str(round(stop_price, 8)),
                 }
 
             d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
             ok = d.get('code') == 0
-            fee_lbl = "maker" if is_tp else "taker"
             if ok:
-                log.info(f"  {lbl} ✅ fijado @ ${stop_price:.6f} (qty={qty_c}, {fee_lbl})")
+                log.info(f"  {lbl} ✅ @ ${stop_price:.6f} qty={qty_c}")
             else:
-                # TP límite fallback a TAKE_PROFIT_MARKET si BingX rechaza
                 if is_tp:
-                    log.warning(f"  TP límite rechazado [{d.get('code')}] — fallback TAKE_PROFIT_MARKET")
-                    params2 = {
-                        'symbol':symbol,'side':'BUY','positionSide':'SHORT',
-                        'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
-                        'stopPrice':str(round(stop_price, 8)),
-                    }
-                    d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', params2).json()
+                    log.warning(f"  TP límite rechazado — fallback mercado")
+                    p2 = {'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                          'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
+                          'stopPrice':str(round(stop_price,8))}
+                    d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
                     ok = d2.get('code') == 0
-                    if ok:
-                        log.info(f"  TP ✅ (fallback mercado) @ ${stop_price:.6f}")
-                    else:
-                        log.error(f"  TP ❌ ERROR [{d2.get('code')}]: {d2.get('msg')}")
+                    if ok: log.info(f"  TP ✅ fallback @ ${stop_price:.6f}")
+                    else:  log.error(f"  TP ❌ [{d2.get('code')}]: {d2.get('msg')}")
                 else:
-                    log.error(f"  {lbl} ❌ ERROR [{d.get('code')}]: {d.get('msg')}")
+                    log.error(f"  {lbl} ❌ [{d.get('code')}]: {d.get('msg')}")
             return ok
         except Exception as e:
-            log.error(f"  {otype} excepción: {e}")
-            return False
+            log.error(f"  {otype} excepción: {e}"); return False
 
     def _close_short(self, symbol, t):
-        """Cierre: usa contratos si los tenemos, quoteOrderQty como fallback."""
         qty_c = t.get('qty_c', 0)
-        usdt  = t.get('usdt_qty', POSITION_SIZE)
         if qty_c and qty_c > 0:
             params = {'symbol':symbol,'side':'BUY','positionSide':'SHORT',
                       'type':'MARKET','quantity':str(qty_c),'reduceOnly':'true'}
         else:
+            usdt = t.get('usdt_qty', POSITION_SIZE)
             params = {'symbol':symbol,'side':'BUY','positionSide':'SHORT',
                       'type':'MARKET','quoteOrderQty':str(round(usdt,2)),'reduceOnly':'true'}
         return bingx_request('POST', '/openApi/swap/v2/trade/order', params).json().get('code') == 0
@@ -547,15 +580,8 @@ class ShortBot:
         except: pass
         return False, None
 
-    # ---------------------------------------------------------------- lifecycle
-
     def _esperar_posicion(self, symbol, timeout=30):
-        """
-        FIX v2.6: Espera hasta que BingX confirme la posición abierta.
-        Devuelve (qty_real, entry_real) o (None, None) si timeout.
-        Sin esto, el TP/SL se coloca antes de que exista la posición → BingX lo rechaza.
-        """
-        log.info(f"  Esperando confirmación de posición {symbol} (max {timeout}s)...")
+        log.info(f"  Esperando posición SHORT {symbol} (max {timeout}s)...")
         for i in range(timeout):
             try:
                 d = bingx_request('GET', '/openApi/swap/v2/user/positions',
@@ -563,20 +589,18 @@ class ShortBot:
                 if d.get('code') == 0:
                     for p in (d.get('data') or []):
                         amt = float(p.get('positionAmt', 0) or 0)
-                        if abs(amt) > 0:
-                            entry_real = float(p.get('avgPrice', 0) or
-                                               p.get('entryPrice', 0) or 0)
+                        if amt < 0:  # SHORT = negativo
+                            entry_real = float(p.get('avgPrice', 0) or p.get('entryPrice', 0) or 0)
                             qty_real   = abs(amt)
-                            log.info(f"  Posición confirmada: qty={qty_real} entry=${entry_real:.6f} ({i+1}s)")
+                            log.info(f"  ✅ SHORT confirmado: qty={qty_real} entry=${entry_real:.6f} ({i+1}s)")
                             return qty_real, entry_real
             except Exception as e:
-                log.debug(f"  _esperar_posicion {symbol}: {e}")
+                log.debug(f"  _esperar: {e}")
             time.sleep(1)
-        log.warning(f"  Timeout {timeout}s — posición no apareció en BingX")
+        log.warning(f"  ⏱ Timeout {timeout}s")
         return None, None
 
-    def _cancelar_ordenes_abiertas(self, symbol):
-        """Cancela todas las órdenes pendientes de un símbolo (ej: LIMIT no ejecutada)."""
+    def _cancelar_ordenes(self, symbol):
         try:
             d = bingx_request('GET', '/openApi/swap/v2/trade/openOrders',
                               {'symbol': symbol}).json()
@@ -588,28 +612,29 @@ class ShortBot:
                                       {'symbol': symbol, 'orderId': str(oid)})
                         log.info(f"  Orden {oid} cancelada")
         except Exception as e:
-            log.debug(f"  _cancelar_ordenes {symbol}: {e}")
+            log.debug(f"  _cancelar: {e}")
+
+    # ---------------------------------------------------------------- lifecycle
 
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
-            log.info(f"  [SEÑAL] SHORT {symbol} score:{sig['score']:.0f}")
-            return False
+            log.info(f"  [SEÑAL] SHORT {symbol} score:{sig['score']:.0f}"); return False
         if symbol in self.open_trades: return False
+
+        # FIX v2.7: verificar balance ANTES de abrir
+        if not self._balance_suficiente():
+            return False
 
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
 
-        price = sig['price']
-
-        # FIX v2.3: eliminado min(POSITION_SIZE, 8.0) que ignoraba el .env
-        # Ahora respeta MAX_POSITION_SIZE correctamente
+        price    = sig['price']
         usdt_qty = round(max(POSITION_SIZE, MIN_TRADE), 2)
-
         tp_price = price * (1 - sig['tp_pct'] / 100)
         sl_price = price * (1 + sig['sl_pct'] / 100)
 
         log.info(f"\n  ➤ SHORT {symbol}")
-        log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | BB:{sig['bb_pos']}%")
+        log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | Balance:${self._balance:.2f}")
         log.info(f"  {sig['reasons']}")
         log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}%")
 
@@ -617,41 +642,20 @@ class ShortBot:
         if not oid:
             log.error(f"  No se pudo abrir {symbol}"); return False
 
-        # Si no se obtuvo qty_c de la entrada, recalcular con usdt_qty real
-        # FIX v2.3: siempre pasar usdt_qty, nunca usar POSITION_SIZE global aquí
-        if not qty_c:
-            qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
-
-        if not qty_c:
-            log.error(f"  No se pudo calcular qty_c para TP/SL de {symbol}")
-            self.open_trades[symbol] = {
-                'entry':price,'qty_c':0,'usdt_qty':usdt_qty,'method':'quote',
-                'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
-                'lowest':price,'order_id':oid,'tp_ok':False,'sl_ok':False,
-                'opened_at':datetime.now(),'score':sig['score'],
-            }
-            self._tg(f"⚠️ SHORT {symbol} abierto SIN TP/SL — qty_c=0. Fijar manual.")
-            return True
-
-        # FIX v2.6: esperar a que BingX confirme la posición antes de poner TP/SL
-        # Si ponemos TP/SL antes de que exista la posición → BingX los rechaza silenciosamente
         qty_real, entry_real = self._esperar_posicion(symbol, timeout=30)
 
         if qty_real is None:
-            # La orden LIMIT no se ejecutó en 30s → cancelar y entrar a mercado
-            log.warning(f"  LIMIT no ejecutada en 30s → cancelando y entrando a MERCADO")
-            self._cancelar_ordenes_abiertas(symbol)
+            log.warning(f"  LIMIT no ejecutada → cancelando + MARKET")
+            self._cancelar_ordenes(symbol)
             time.sleep(0.5)
             d_mkt = bingx_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol':symbol,'side':'SELL','positionSide':'SHORT',
                 'type':'MARKET','quantity':str(qty_c),
             }).json()
             if d_mkt.get('code') == 0:
-                log.info(f"  Fallback MERCADO OK")
                 qty_real, entry_real = self._esperar_posicion(symbol, timeout=15)
             if qty_real is None:
-                log.error(f"  No se pudo confirmar posición {symbol} — abortando TP/SL")
-                self._tg(f"⚠️ {symbol} abierto SIN TP/SL — posición no confirmada. Fijar manual.")
+                self._tg(f"⚠️ SHORT {symbol} SIN TP/SL — no confirmado. Fijar manual.")
                 self.open_trades[symbol] = {
                     'entry':price,'qty_c':qty_c,'usdt_qty':usdt_qty,
                     'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
@@ -660,53 +664,41 @@ class ShortBot:
                 }
                 return True
 
-        # Usar entry real de BingX si está disponible
         if entry_real and entry_real > 0:
             tp_price = entry_real * (1 - sig['tp_pct'] / 100)
             sl_price = entry_real * (1 + sig['sl_pct'] / 100)
-            log.info(f"  Entry real BingX: ${entry_real:.6f} | TP:${tp_price:.6f} SL:${sl_price:.6f}")
 
-        # Usar qty real de BingX para que coincida exactamente con la posición
-        qty_para_tpsl = qty_real if qty_real else qty_c
+        qty_final   = qty_real if qty_real else qty_c
+        entry_final = entry_real if (entry_real and entry_real > 0) else price
 
-        tp_ok = self._cond_order(symbol, qty_para_tpsl, tp_price, 'TAKE_PROFIT_MARKET')
+        tp_ok = self._cond_order(symbol, qty_final, tp_price, 'TAKE_PROFIT_MARKET')
         time.sleep(0.3)
-        sl_ok = self._cond_order(symbol, qty_para_tpsl, sl_price, 'STOP_MARKET')
+        sl_ok = self._cond_order(symbol, qty_final, sl_price, 'STOP_MARKET')
 
-        if not tp_ok or not sl_ok:
-            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en 3s")
-            time.sleep(3)
-            if not tp_ok:
-                tp_ok = self._cond_order(symbol, qty_para_tpsl, tp_price, 'TAKE_PROFIT_MARKET')
-            if not sl_ok:
-                sl_ok = self._cond_order(symbol, qty_para_tpsl, sl_price, 'STOP_MARKET')
-            # Tercer intento si aún falla
-            if not tp_ok or not sl_ok:
-                log.warning(f"  TP:{tp_ok} SL:{sl_ok} — tercer intento en 5s")
-                time.sleep(5)
-                if not tp_ok:
-                    tp_ok = self._cond_order(symbol, qty_para_tpsl, tp_price, 'TAKE_PROFIT_MARKET')
-                if not sl_ok:
-                    sl_ok = self._cond_order(symbol, qty_para_tpsl, sl_price, 'STOP_MARKET')
+        for delay in [3, 5]:
+            if tp_ok and sl_ok: break
+            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en {delay}s")
+            time.sleep(delay)
+            if not tp_ok: tp_ok = self._cond_order(symbol, qty_final, tp_price, 'TAKE_PROFIT_MARKET')
+            if not sl_ok: sl_ok = self._cond_order(symbol, qty_final, sl_price, 'STOP_MARKET')
 
         self.open_trades[symbol] = {
-            'entry':price,'qty_c':qty_c,'usdt_qty':usdt_qty,'method':'contracts',
+            'entry':entry_final,'qty_c':qty_final,'usdt_qty':usdt_qty,
             'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
-            'lowest':price,'order_id':oid,'tp_ok':tp_ok,'sl_ok':sl_ok,
+            'lowest':entry_final,'order_id':oid,'tp_ok':tp_ok,'sl_ok':sl_ok,
             'opened_at':datetime.now(),'score':sig['score'],
         }
         self.stats['exec'] += 1
 
-        status_tp = "✅" if tp_ok else "❌ FIJARLO MANUAL"
-        status_sl = "✅" if sl_ok else "❌ FIJARLO MANUAL"
+        stp = "✅" if tp_ok else "❌ FIJAR MANUAL"
+        ssl = "✅" if sl_ok else "❌ FIJAR MANUAL"
         self._tg(
-            f"<b>🔴 SHORT ABIERTO</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/100\n"
-            f"Entrada: ${price:.6f}\n"
-            f"{status_tp} TP: ${tp_price:.6f} (-{sig['tp_pct']:.2f}%)\n"
-            f"{status_sl} SL: ${sl_price:.6f} (+{sig['sl_pct']:.1f}%)\n"
-            f"Capital: ${usdt_qty} x{LEVERAGE} = ${usdt_qty*LEVERAGE:.1f} USDT\n"
-            f"Contratos: {qty_c} | RSI:{sig['rsi']:.0f} BB:{sig['bb_pos']}%\n"
-            f"{sig['reasons']}"
+            f"<b>🔴 SHORT ABIERTO</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}\n"
+            f"Entrada: ${entry_final:.6f}\n"
+            f"{stp} TP: ${tp_price:.6f} (-{sig['tp_pct']:.2f}%)\n"
+            f"{ssl} SL: ${sl_price:.6f} (+{sig['sl_pct']:.1f}%)\n"
+            f"Capital: ${usdt_qty} x{LEVERAGE} | Balance: ${self._balance:.2f}\n"
+            f"RSI:{sig['rsi']:.0f} | {sig['reasons']}"
         )
         return True
 
@@ -714,21 +706,17 @@ class ShortBot:
         if symbol not in self.open_trades: return False
         t = self.open_trades[symbol]
         self._close_short(symbol, t)
-
         cambio  = (t['entry'] - cur_price) / t['entry']
         pnl     = (t['usdt_qty'] * LEVERAGE * cambio) - (t['usdt_qty'] * LEVERAGE * COMISION_ACTUAL)
         pnl_pct = (pnl / t['usdt_qty']) * 100
-
         self.stats['closed'] += 1
         self.stats['pnl']    += pnl
         if pnl > 0: self.stats['wins']   += 1
         else:        self.stats['losses'] += 1
-
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
         mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
         emoji = "✅" if pnl > 0 else "❌"
-
         log.info(f"  {emoji} {reason} {symbol} PnL:${pnl:+.3f}({pnl_pct:+.1f}%) {mins}min")
         self._tg(
             f"<b>{emoji} SHORT CERRADO — {reason}</b>\n<b>{symbol}</b>\n"
@@ -740,8 +728,6 @@ class ShortBot:
         self._cooldowns[symbol] = time.time()
         del self.open_trades[symbol]
         return True
-
-    # ---------------------------------------------------------------- monitor
 
     async def _sync_bingx(self):
         if not self.open_trades or not AUTO_TRADING: return
@@ -760,10 +746,10 @@ class ShortBot:
                     pnl     = (t['usdt_qty'] * LEVERAGE * cambio) - (t['usdt_qty'] * LEVERAGE * COMISION_ACTUAL)
                     pnl_pct = (pnl / t['usdt_qty']) * 100
                     self.stats['closed'] += 1; self.stats['pnl'] += pnl
-                    if pnl >= 0: self.stats['wins']   += 1
+                    if pnl >= 0: self.stats['wins'] += 1
                     else:        self.stats['losses'] += 1
                     total = self.stats['wins'] + self.stats['losses']
-                    wr    = self.stats['wins'] / total * 100 if total else 0
+                    wr = self.stats['wins'] / total * 100 if total else 0
                     emoji = "✅" if pnl >= 0 else "❌"
                     mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
                     self._tg(f"<b>{emoji} SHORT cerrado BingX</b>\n<b>{sym}</b>\n"
@@ -783,7 +769,6 @@ class ShortBot:
                 if not tk: continue
                 cur     = tk['price']
                 pnl_pct = (t['entry'] - cur) / t['entry'] * 100
-
                 if TRAILING and cur < t['lowest']:
                     t['lowest'] = cur
                     if pnl_pct >= 0.6:
@@ -791,10 +776,8 @@ class ShortBot:
                         if new_sl < t['sl']:
                             t['sl'] = new_sl
                             log.info(f"  Trailing SL {sym}: ${new_sl:.6f}")
-
                 if abs(pnl_pct) > 0.3:
-                    log.info(f"  {sym}: {pnl_pct:+.2f}% | cur:${cur:.6f}")
-
+                    log.info(f"  {sym}: {pnl_pct:+.2f}% | ${cur:.6f}")
                 if cur <= t['tp']:   self.close_trade(sym, cur, "TAKE PROFIT")
                 elif cur >= t['sl']: self.close_trade(sym, cur, "STOP LOSS")
             except Exception as e:
@@ -805,16 +788,12 @@ class ShortBot:
         self._last_report = datetime.now()
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
-        pos_txt = "".join(
-            f"  {sym}: {(t['entry']-( self._ticker(sym) or {'price':t['entry']})['price'])/t['entry']*100:+.2f}%\n"
-            for sym, t in self.open_trades.items()
-        )
         self._tg(
-            f"<b>📊 Reporte horario</b>\n"
+            f"<b>📊 Reporte horario SHORTS</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES} | BTC 1h:{self._btc_change_1h:+.2f}%\n"
-            + (pos_txt if pos_txt else "  sin posiciones\n")
+            f"Balance: ${self._balance:.2f} USDT"
         )
 
     def _tg(self, msg):
@@ -824,10 +803,8 @@ class ShortBot:
                     json={'chat_id':TELEGRAM_CHAT,'text':msg,'parse_mode':'HTML'}, timeout=6)
         except: pass
 
-    # ---------------------------------------------------------------- loop
-
     async def run(self):
-        log.info("\n▶  Bot SHORT v2.6 arrancado\n")
+        log.info("\n▶  Bot SHORTS v2.7.0 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -836,23 +813,27 @@ class ShortBot:
                     self._get_symbols(); last_refresh = time.time()
 
                 self._update_btc_trend()
+                self._update_balance()
 
                 total = self.stats['wins'] + self.stats['losses']
                 wr    = self.stats['wins'] / total * 100 if total else 0
-                btc_st = "⚠️ BLOQUEADO" if self._btc_change_1h >= BTC_BULL_BLOCK_PCT else "OK"
-                hora_st = "🌙 HORA BAJA" if not self._hora_ok() else "☀️"
+                btc_st  = "⚠️ BLOQUEADO" if self._btc_change_1h >= BTC_BULL_BLOCK_PCT else "OK"
+                hora_st = "🌙 BAJA" if not self._hora_ok() else "☀️"
 
                 log.info(f"\n{'='*65}")
                 log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
                          f"Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
                          f"PnL:${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
-                log.info(f"  BTC 1h:{self._btc_change_1h:+.2f}% {btc_st} | {hora_st}")
+                log.info(f"  Balance:${self._balance:.2f} | BTC:{self._btc_change_1h:+.2f}% {btc_st} | {hora_st}")
                 log.info(f"{'='*65}\n")
 
                 await self.monitor_trades()
                 self._reporte_horario()
 
-                if len(self.open_trades) < MAX_TRADES:
+                pos_reales = self._posiciones_reales_bingx()
+                if pos_reales >= MAX_TRADES:
+                    log.info(f"  Max trades SHORT ({pos_reales}/{MAX_TRADES}) en BingX — esperando")
+                elif len(self.open_trades) < MAX_TRADES:
                     found = 0
                     for i, sym in enumerate(self.symbols):
                         if len(self.open_trades) >= MAX_TRADES: break
