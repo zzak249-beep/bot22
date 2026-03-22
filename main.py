@@ -174,7 +174,9 @@ class ShortBot:
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
             if d.get('code') == 0:
-                eq = float(d.get('data',{}).get('equity', d.get('data',{}).get('balance', 0)) or 0)
+                data = d.get('data', {})
+                if isinstance(data, list): data = data[0] if data else {}
+                eq = float(str(data.get('equity', data.get('balance', data.get('availableMargin', data.get('availableBalance', 0)))) or 0))
                 self._balance = eq
                 log.info(f"BingX OK | Balance: ${eq:.2f} USDT")
                 if eq < MIN_TRADE:
@@ -191,7 +193,9 @@ class ShortBot:
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
             if d.get('code') == 0:
-                eq = float(d.get('data',{}).get('equity', d.get('data',{}).get('balance', 0)) or 0)
+                data = d.get('data', {})
+                if isinstance(data, list): data = data[0] if data else {}
+                eq = float(str(data.get('equity', data.get('balance', data.get('availableMargin', data.get('availableBalance', 0)))) or 0))
                 self._balance = eq
                 return eq
         except: pass
