@@ -619,24 +619,50 @@ class ShortBot:
         except: pass
         return False, None
 
-    def _esperar_posicion(self, symbol, timeout=30):
+    def _set_leverage(self, symbol):
+        """FIX v2.7: Establece el leverage correcto en BingX antes de abrir."""
+        try:
+            d = bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
+                'symbol': symbol,
+                'side': 'SHORT',
+                'leverage': str(LEVERAGE),
+            }).json()
+            if d.get('code') == 0:
+                log.info(f"  Leverage {LEVERAGE}x configurado en BingX para {symbol}")
+            else:
+                log.warning(f"  Leverage no configurado [{d.get('code')}]: {d.get('msg')}")
+        except Exception as e:
+            log.debug(f"  _set_leverage: {e}")
+
+    def _esperar_posicion(self, symbol, timeout=45):
+        """FIX v2.7: Detecta SHORT correctamente — amt<0 O positionSide=SHORT."""
         log.info(f"  Esperando posición SHORT {symbol} (max {timeout}s)...")
         for i in range(timeout):
             try:
                 d = bingx_request('GET', '/openApi/swap/v2/user/positions',
                                   {'symbol': symbol}).json()
                 if d.get('code') == 0:
-                    for p in (d.get('data') or []):
-                        amt = float(p.get('positionAmt', 0) or 0)
-                        if amt < 0:  # SHORT = negativo
-                            entry_real = float(p.get('avgPrice', 0) or p.get('entryPrice', 0) or 0)
-                            qty_real   = abs(amt)
+                    data = d.get('data') or []
+                    if i < 5: log.info(f"  [debug {i+1}s] positions: {str(data)[:150]}")
+                    for p in data:
+                        try: amt = float(p.get('positionAmt', 0) or 0)
+                        except: amt = 0
+                        pos_side = str(p.get('positionSide', '')).upper()
+                        # SHORT: amt negativo O positionSide=SHORT con cualquier cantidad
+                        is_short = (amt < 0) or (pos_side == 'SHORT' and abs(amt) > 0)
+                        if is_short:
+                            try:
+                                entry_real = float(p.get('avgPrice') or
+                                                   p.get('entryPrice') or
+                                                   p.get('averagePrice') or 0)
+                            except: entry_real = 0
+                            qty_real = abs(amt)
                             log.info(f"  ✅ SHORT confirmado: qty={qty_real} entry=${entry_real:.6f} ({i+1}s)")
                             return qty_real, entry_real
             except Exception as e:
                 log.debug(f"  _esperar: {e}")
             time.sleep(1)
-        log.warning(f"  ⏱ Timeout {timeout}s")
+        log.warning(f"  ⏱ Timeout {timeout}s — posición no detectada")
         return None, None
 
     def _cancelar_ordenes(self, symbol):
@@ -671,6 +697,9 @@ class ShortBot:
         usdt_qty = round(max(POSITION_SIZE, MIN_TRADE), 2)
         tp_price = price * (1 - sig['tp_pct'] / 100)
         sl_price = price * (1 + sig['sl_pct'] / 100)
+
+        # FIX v2.7: configurar leverage ANTES de abrir
+        self._set_leverage(symbol)
 
         log.info(f"\n  ➤ SHORT {symbol}")
         log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | Balance:${self._balance:.2f}")
