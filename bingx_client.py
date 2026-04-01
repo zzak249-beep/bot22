@@ -127,11 +127,13 @@ class BingXClient:
         return data.get("data", [])
 
     def get_open_position(self, symbol: str) -> Optional[dict]:
-        """Retorna la posición abierta activa o None."""
+        """Retorna la posicion abierta activa o None."""
         positions = self.get_positions(symbol)
+        logger.debug(f"Posiciones raw de BingX ({symbol}): {positions}")
         for pos in positions:
             amt = float(pos.get("positionAmt", 0))
             if abs(amt) > 0:
+                logger.info(f"Posicion activa: amt={amt} side={pos.get('positionSide')} avgPrice={pos.get('avgPrice')}")
                 return pos
         return None
 
@@ -154,49 +156,60 @@ class BingXClient:
                            position_side: str = "BOTH") -> dict:
         """
         side          : BUY | SELL
-        position_side : BOTH (one-way) | LONG | SHORT (hedge mode)
+        position_side : BOTH (one-way mode, defecto) | LONG | SHORT (hedge mode)
         quantity      : Cantidad en moneda base (ej. 0.001 BTC)
+        Nota: BingX puede rechazar positionSide si el modo no coincide.
         """
         params = {
-            "symbol": symbol,
-            "side": side,
+            "symbol":       symbol,
+            "side":         side,
             "positionSide": position_side,
-            "type": "MARKET",
-            "quantity": quantity,
+            "type":         "MARKET",
+            "quantity":     quantity,
         }
         data = self._post("/openApi/swap/v2/trade/order", params)
         order = data.get("data", {}).get("order", {})
-        logger.info(f"✅ Orden ejecutada: {side} {quantity} {symbol} → orderId={order.get('orderId')}")
+        logger.info(f"Orden: {side} {quantity} {symbol} orderId={order.get('orderId')}")
         return order
 
     def close_all_positions(self, symbol: str) -> dict:
         """
-        Cierra la posicion abierta usando orden de mercado con reduceOnly.
-        Mas fiable que el endpoint closeAllPositions (error 109400).
+        Cierra la posicion abierta usando orden de mercado opuesta.
+        BingX Swap V2 NO soporta reduceOnly en ordenes de mercado.
+        La direccion se obtiene de positionSide o del signo de positionAmt.
         """
         pos = self.get_open_position(symbol)
         if pos is None:
-            logger.info(f"Sin posicion abierta para {symbol}, nada que cerrar")
+            logger.info(f"Sin posicion abierta para {symbol}")
             return {}
 
         amt = float(pos.get("positionAmt", 0))
         if amt == 0:
             return {}
 
-        close_side = "SELL" if amt > 0 else "BUY"
+        # BingX puede devolver positionSide="LONG"/"SHORT" o amt con signo
+        pos_side = pos.get("positionSide", "")
+        if pos_side == "LONG":
+            close_side = "SELL"
+        elif pos_side == "SHORT":
+            close_side = "BUY"
+        else:
+            # one-way mode: usar signo de positionAmt
+            close_side = "SELL" if amt > 0 else "BUY"
+
         quantity = abs(amt)
 
+        # Parametros minimos para cerrar en one-way mode (sin reduceOnly)
         params = {
             "symbol":       symbol,
             "side":         close_side,
             "positionSide": "BOTH",
             "type":         "MARKET",
             "quantity":     quantity,
-            "reduceOnly":   "true",
         }
         data = self._post("/openApi/swap/v2/trade/order", params)
         order = data.get("data", {}).get("order", {})
-        logger.info(f"Posicion cerrada: {close_side} {quantity} {symbol} -> orderId={order.get('orderId')}")
+        logger.info(f"Posicion cerrada: {close_side} {quantity} {symbol} orderId={order.get('orderId')}")
         return data
 
     def cancel_all_orders(self, symbol: str):
