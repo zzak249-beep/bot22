@@ -164,11 +164,33 @@ class BingXClient:
         return order
 
     def close_all_positions(self, symbol: str) -> dict:
-        """Cierra todas las posiciones del símbolo."""
-        data = self._post("/openApi/swap/v2/trade/closeAllPositions", {
-            "symbol": symbol,
-        })
-        logger.info(f"✅ Posiciones cerradas: {symbol}")
+        """
+        Cierra la posicion abierta usando orden de mercado con reduceOnly.
+        Mas fiable que el endpoint closeAllPositions (error 109400).
+        """
+        pos = self.get_open_position(symbol)
+        if pos is None:
+            logger.info(f"Sin posicion abierta para {symbol}, nada que cerrar")
+            return {}
+
+        amt = float(pos.get("positionAmt", 0))
+        if amt == 0:
+            return {}
+
+        close_side = "SELL" if amt > 0 else "BUY"
+        quantity = abs(amt)
+
+        params = {
+            "symbol":       symbol,
+            "side":         close_side,
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     quantity,
+            "reduceOnly":   "true",
+        }
+        data = self._post("/openApi/swap/v2/trade/order", params)
+        order = data.get("data", {}).get("order", {})
+        logger.info(f"Posicion cerrada: {close_side} {quantity} {symbol} -> orderId={order.get('orderId')}")
         return data
 
     def cancel_all_orders(self, symbol: str):
