@@ -33,7 +33,9 @@ class BingXClient:
     # ───────────────────────── AUTH ─────────────────────────
 
     def _sign(self, params: dict) -> str:
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        # BingX firma el query string SIN ordenar (orden de insercion)
+        # sorted() rompe la firma -> error 100001
+        query = "&".join(f"{k}={v}" for k, v in params.items())
         return hmac.new(
             self.secret_key.encode("utf-8"),
             query.encode("utf-8"),
@@ -50,7 +52,9 @@ class BingXClient:
         params["timestamp"] = self._ts()
         if self.demo:
             params["demoTradingFlag"] = "true"
-        params["signature"] = self._sign(params)
+        # signature siempre al final, fuera del payload a firmar
+        sig = self._sign(params)
+        params["signature"] = sig
         try:
             r = self.session.get(f"{BASE_URL}{path}", params=params, timeout=10)
             r.raise_for_status()
@@ -67,7 +71,9 @@ class BingXClient:
         params["timestamp"] = self._ts()
         if self.demo:
             params["demoTradingFlag"] = "true"
-        params["signature"] = self._sign(params)
+        # signature siempre al final, fuera del payload a firmar
+        sig = self._sign(params)
+        params["signature"] = sig
         try:
             r = self.session.post(f"{BASE_URL}{path}", params=params, timeout=10)
             r.raise_for_status()
