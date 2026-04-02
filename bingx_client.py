@@ -1,6 +1,14 @@
 """
-Cliente BingX Perpetual Futures (Swap V2)
+Cliente BingX Perpetual Futures (Swap V2) — v2 FIX
 Docs: https://bingx-api.github.io/docs/#/swapV2/
+
+FIXES v2:
+  FIX-1  get_open_position() detecta correctamente LONG/SHORT en Hedge mode
+         Antes: amt > 0 → "long" (incorrecto en Hedge mode)
+         Ahora: usa positionSide explícito de la respuesta API
+  FIX-2  close_all_positions() usa positionSide correcto (no BOTH fijo)
+  FIX-3  place_market_order() acepta positionSide dinámico
+  FIX-4  send_telegram() añadido para notificaciones
 """
 
 import hmac
@@ -20,10 +28,13 @@ class BingXError(Exception):
 
 
 class BingXClient:
-    def __init__(self, api_key: str, secret_key: str, demo: bool = False):
+    def __init__(self, api_key: str, secret_key: str, demo: bool = False,
+                 telegram_token: str = "", telegram_chat: str = ""):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.demo = demo  # Si True, usa cuenta demo de BingX
+        self.demo = demo
+        self.telegram_token = telegram_token
+        self.telegram_chat  = telegram_chat
         self.session = requests.Session()
         self.session.headers.update({
             "X-BX-APIKEY": api_key,
@@ -33,8 +44,6 @@ class BingXClient:
     # ───────────────────────── AUTH ─────────────────────────
 
     def _sign(self, params: dict) -> str:
-        # BingX firma el query string SIN ordenar (orden de insercion)
-        # sorted() rompe la firma -> error 100001
         query = "&".join(f"{k}={v}" for k, v in params.items())
         return hmac.new(
             self.secret_key.encode("utf-8"),
@@ -52,7 +61,6 @@ class BingXClient:
         params["timestamp"] = self._ts()
         if self.demo:
             params["demoTradingFlag"] = "true"
-        # signature siempre al final, fuera del payload a firmar
         sig = self._sign(params)
         params["signature"] = sig
         try:
@@ -61,7 +69,6 @@ class BingXClient:
             data = r.json()
         except requests.RequestException as e:
             raise BingXError(f"GET {path} falló: {e}") from e
-
         if data.get("code", 0) != 0:
             raise BingXError(f"API error {data.get('code')}: {data.get('msg')}")
         return data
@@ -71,7 +78,6 @@ class BingXClient:
         params["timestamp"] = self._ts()
         if self.demo:
             params["demoTradingFlag"] = "true"
-        # signature siempre al final, fuera del payload a firmar
         sig = self._sign(params)
         params["signature"] = sig
         try:
@@ -80,18 +86,31 @@ class BingXClient:
             data = r.json()
         except requests.RequestException as e:
             raise BingXError(f"POST {path} falló: {e}") from e
-
         if data.get("code", 0) != 0:
             raise BingXError(f"API error {data.get('code')}: {data.get('msg')}")
         return data
 
+    # ─────────────────────── TELEGRAM ─────────────────────────
+
+    def send_telegram(self, msg: str):
+        """
+        FIX-4: Envía notificación a Telegram.
+        Requiere TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID en el .env
+        """
+        if not self.telegram_token or not self.telegram_chat:
+            return
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                json={"chat_id": self.telegram_chat, "text": msg, "parse_mode": "HTML"},
+                timeout=6
+            )
+        except Exception as e:
+            logger.warning(f"Telegram error: {e}")
+
     # ─────────────────────── MARKET DATA ─────────────────────
 
     def get_klines(self, symbol: str, interval: str = "15m", limit: int = 500) -> list:
-        """
-        Retorna velas OHLCV.
-        interval: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w, 1M
-        """
         data = self._get("/openApi/swap/v2/quote/klines", {
             "symbol": symbol,
             "interval": interval,
@@ -117,7 +136,6 @@ class BingXClient:
     # ─────────────────────── ACCOUNT ─────────────────────────
 
     def get_balance(self) -> float:
-        """Retorna USDT disponible para margin."""
         data = self._get("/openApi/swap/v2/user/balance")
         balance_info = data.get("data", {}).get("balance", {})
         return float(balance_info.get("availableMargin", 0))
@@ -127,20 +145,45 @@ class BingXClient:
         return data.get("data", [])
 
     def get_open_position(self, symbol: str) -> Optional[dict]:
-        """Retorna la posicion abierta activa o None."""
+        """
+        FIX-1: Detecta correctamente LONG/SHORT en Hedge mode.
+        Antes: solo miraba positionAmt != 0 → podía devolver un SHORT
+               y sync_position() lo interpretaba como LONG (amt > 0).
+        Ahora: devuelve el primer registro con posición real,
+               y añade campo 'detected_side' con LONG/SHORT explícito.
+        """
         positions = self.get_positions(symbol)
         logger.debug(f"Posiciones raw de BingX ({symbol}): {positions}")
         for pos in positions:
-            amt = float(pos.get("positionAmt", 0))
-            if abs(amt) > 0:
-                logger.info(f"Posicion activa: amt={amt} side={pos.get('positionSide')} avgPrice={pos.get('avgPrice')}")
-                return pos
+            amt      = float(pos.get("positionAmt", 0) or 0)
+            pos_side = str(pos.get("positionSide", "")).upper()
+
+            if abs(amt) == 0:
+                continue
+
+            # Detectar lado real:
+            # - Hedge mode: positionSide = "LONG" o "SHORT" (explícito)
+            # - One-Way mode: positionSide = "BOTH", lado por signo de amt
+            if pos_side == "LONG":
+                detected_side = "long"
+            elif pos_side == "SHORT":
+                detected_side = "short"
+            elif pos_side == "BOTH":
+                detected_side = "long" if amt > 0 else "short"
+            else:
+                detected_side = "long" if amt > 0 else "short"
+
+            pos["detected_side"] = detected_side
+            logger.info(
+                f"Posicion activa: amt={amt} positionSide={pos_side} "
+                f"→ detected={detected_side} avgPrice={pos.get('avgPrice')}"
+            )
+            return pos
         return None
 
     # ─────────────────────── TRADING ─────────────────────────
 
     def set_leverage(self, symbol: str, leverage: int):
-        """Ajusta el apalancamiento para ambos lados."""
         for side in ("LONG", "SHORT"):
             try:
                 self._post("/openApi/swap/v2/trade/leverage", {
@@ -150,15 +193,13 @@ class BingXClient:
                 })
                 logger.debug(f"Leverage {leverage}x configurado para {symbol} {side}")
             except BingXError as e:
-                logger.warning(f"set_leverage: {e}")
+                logger.warning(f"set_leverage {side}: {e}")
 
     def place_market_order(self, symbol: str, side: str, quantity: float,
                            position_side: str = "BOTH") -> dict:
         """
-        side          : BUY | SELL
-        position_side : BOTH (one-way mode, defecto) | LONG | SHORT (hedge mode)
-        quantity      : Cantidad en moneda base (ej. 0.001 BTC)
-        Nota: BingX puede rechazar positionSide si el modo no coincide.
+        FIX-3: position_side ahora se pasa explícitamente desde bot.py
+        según el modo de la cuenta (One-Way=BOTH, Hedge=LONG/SHORT).
         """
         params = {
             "symbol":       symbol,
@@ -169,54 +210,56 @@ class BingXClient:
         }
         data = self._post("/openApi/swap/v2/trade/order", params)
         order = data.get("data", {}).get("order", {})
-        logger.info(f"Orden: {side} {quantity} {symbol} orderId={order.get('orderId')}")
+        logger.info(f"Orden: {side} {quantity} {symbol} positionSide={position_side} orderId={order.get('orderId')}")
         return order
 
     def close_all_positions(self, symbol: str) -> dict:
         """
-        Cierra la posicion abierta usando orden de mercado opuesta.
-        BingX Swap V2 NO soporta reduceOnly en ordenes de mercado.
-        La direccion se obtiene de positionSide o del signo de positionAmt.
+        FIX-2: Usa el positionSide correcto al cerrar.
+        - Hedge mode LONG → SELL con positionSide=LONG
+        - Hedge mode SHORT → BUY con positionSide=SHORT
+        - One-Way mode → usa BOTH (comportamiento original)
         """
         pos = self.get_open_position(symbol)
         if pos is None:
             logger.info(f"Sin posicion abierta para {symbol}")
             return {}
 
-        amt = float(pos.get("positionAmt", 0))
-        if amt == 0:
-            return {}
+        amt      = float(pos.get("positionAmt", 0) or 0)
+        pos_side = str(pos.get("positionSide", "BOTH")).upper()
+        detected = pos.get("detected_side", "long")
 
-        # BingX puede devolver positionSide="LONG"/"SHORT" o amt con signo
-        pos_side = pos.get("positionSide", "")
-        if pos_side == "LONG":
-            close_side = "SELL"
-        elif pos_side == "SHORT":
-            close_side = "BUY"
-        else:
-            # one-way mode: usar signo de positionAmt
-            close_side = "SELL" if amt > 0 else "BUY"
+        if abs(amt) == 0:
+            return {}
 
         quantity = abs(amt)
 
-        # Parametros minimos para cerrar en one-way mode (sin reduceOnly)
+        if pos_side in ("LONG", "SHORT"):
+            # Hedge mode: el positionSide debe coincidir con la posición a cerrar
+            close_side      = "SELL" if pos_side == "LONG" else "BUY"
+            close_pos_side  = pos_side  # LONG o SHORT
+        else:
+            # One-Way mode (BOTH): usar signo de amt
+            close_side      = "SELL" if amt > 0 else "BUY"
+            close_pos_side  = "BOTH"
+
         params = {
             "symbol":       symbol,
             "side":         close_side,
-            "positionSide": "BOTH",
+            "positionSide": close_pos_side,
             "type":         "MARKET",
             "quantity":     quantity,
         }
         data = self._post("/openApi/swap/v2/trade/order", params)
         order = data.get("data", {}).get("order", {})
-        logger.info(f"Posicion cerrada: {close_side} {quantity} {symbol} orderId={order.get('orderId')}")
+        logger.info(
+            f"Posicion cerrada: {close_side} {quantity} {symbol} "
+            f"positionSide={close_pos_side} orderId={order.get('orderId')}"
+        )
         return data
 
     def cancel_all_orders(self, symbol: str):
-        """Cancela todas las órdenes abiertas."""
         try:
-            self._post("/openApi/swap/v2/trade/cancelAllOpenOrders", {
-                "symbol": symbol,
-            })
+            self._post("/openApi/swap/v2/trade/cancelAllOpenOrders", {"symbol": symbol})
         except BingXError as e:
             logger.warning(f"cancel_all_orders: {e}")
