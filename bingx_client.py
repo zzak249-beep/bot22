@@ -1,13 +1,12 @@
 """
-Cliente BingX — v2.1
+Cliente BingX — v2.2
 FIXES:
   FIX-A  close_all_positions: cierra posición a posición con positionSide correcto
-         El endpoint /closeAllPositions da 109400 en hedge mode — sustituido
-         por órdenes individuales SELL/BUY con positionSide=LONG/SHORT
-  FIX-B  set_leverage: en hedge mode hay que llamarlo para LONG y SHORT por separado
-         "side": "BOTH" solo funciona en one-way mode
-  FIX-C  place_market_order: positionSide siempre incluido (era comentado)
-         Sin positionSide BingX no sabe qué lado abrir en hedge mode → 109400
+  FIX-B  set_leverage: llama para LONG, SHORT y BOTH por separado (hedge mode)
+  FIX-C  place_market_order: positionSide siempre incluido en hedge mode
+  FIX-D  _request (CRÍTICO — error 100001): construye URL manualmente igual
+         que wyckoff_bot.py que SÍ funciona. Antes params=params hacía que
+         requests recodificara floats/bools diferente → signature mismatch.
 """
 
 import hashlib
@@ -44,17 +43,14 @@ class BingXClient:
         self.base_url = (
             "https://open-api-vst.bingx.com" if demo else "https://open-api.bingx.com"
         )
-
-        self.session = requests.Session()
-        self.session.headers.update({
+        self.headers = {
             "X-BX-APIKEY": self.api_key,
-            "Content-Type": "application/json",
-        })
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
 
-    # ─────────────────── firma / request ────────────────────────────────────
+    # ─────────────────── firma / request ─────────────────────────────────────
 
-    def _sign(self, params: Dict[str, Any]) -> str:
-        qs = urlencode(sorted(params.items()))
+    def _sign(self, qs: str) -> str:
         return hmac.new(
             self.secret_key.encode("utf-8"),
             qs.encode("utf-8"),
@@ -68,31 +64,57 @@ class BingXClient:
         params: Optional[Dict] = None,
         signed: bool = True,
     ) -> Any:
+        """
+        FIX-D: URL construida manualmente — mismo patrón que wyckoff_bot.py.
+
+        Problema anterior: requests.post(url, params=dict) recodifica valores
+        (float 0.0044 → '0.0044' pero a veces con precisión extra, bool True →
+        'True' en lugar de 'true') creando un query string distinto al que
+        se firmó → error 100001 signature mismatch.
+
+        Solución: convertir todos los valores a str explícitamente, construir
+        el query string una sola vez, firmarlo, y pasar la URL completa a
+        requests sin ningún parámetro extra.
+        """
         if params is None:
             params = {}
 
-        if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["signature"] = self._sign(params)
+        # Todos los valores a string antes de firmar
+        str_params: Dict[str, str] = {}
+        for k, v in params.items():
+            if isinstance(v, float):
+                str_params[k] = f"{v:.6g}"      # evita notación científica
+            elif isinstance(v, bool):
+                str_params[k] = "true" if v else "false"
+            else:
+                str_params[k] = str(v)
 
-        url = f"{self.base_url}{endpoint}"
+        if signed:
+            str_params["timestamp"] = str(int(time.time() * 1000))
+            qs  = urlencode(sorted(str_params.items()))
+            sig = self._sign(qs)
+            url = f"{self.base_url}{endpoint}?{qs}&signature={sig}"
+        else:
+            qs  = urlencode(sorted(str_params.items()))
+            url = f"{self.base_url}{endpoint}?{qs}" if qs else f"{self.base_url}{endpoint}"
+
+        logger.debug(f"{method} {endpoint} | {str_params}")
 
         try:
             if method == "GET":
-                resp = self.session.get(url, params=params, timeout=10)
+                resp = requests.get(url, headers=self.headers, timeout=10)
             elif method == "POST":
-                resp = self.session.post(url, params=params, timeout=10)
+                resp = requests.post(url, headers=self.headers, timeout=10)
             elif method == "DELETE":
-                resp = self.session.delete(url, params=params, timeout=10)
+                resp = requests.delete(url, headers=self.headers, timeout=10)
             else:
                 raise ValueError(f"Método no soportado: {method}")
 
             data = resp.json()
-            logger.debug(f"{method} {endpoint} → code:{data.get('code')}")
 
             if data.get("code") != 0:
-                msg = f"API error {data.get('code')}: {data.get('msg', 'Unknown error')}"
-                logger.error(f"{msg} | endpoint:{endpoint} | params:{params}")
+                msg = f"API error {data.get('code')}: {data.get('msg', 'Unknown')}"
+                logger.error(f"{msg} | {endpoint} | {str_params}")
                 raise BingXError(msg)
 
             return data.get("data", data)
@@ -100,14 +122,14 @@ class BingXClient:
         except requests.exceptions.RequestException as e:
             raise BingXError(f"Network error: {e}")
 
-    # ─────────────────── balance / velas ────────────────────────────────────
+    # ─────────────────── balance / velas ─────────────────────────────────────
 
     def get_balance(self) -> float:
         data = self._request("GET", "/openApi/swap/v2/user/balance")
         if isinstance(data, dict):
-            balance_info = data.get("balance", {})
-            if isinstance(balance_info, dict):
-                return float(balance_info.get("balance", 0))
+            bal = data.get("balance", {})
+            if isinstance(bal, dict):
+                return float(bal.get("balance", 0))
         if isinstance(data, list):
             for item in data:
                 if item.get("asset") == "USDT":
@@ -124,7 +146,7 @@ class BingXClient:
             logger.error(f"Error klines {symbol}: {e}")
             return []
 
-    # ─────────────────── posiciones ─────────────────────────────────────────
+    # ─────────────────── posiciones ──────────────────────────────────────────
 
     def get_positions(self, symbol: str) -> List[Dict]:
         try:
@@ -148,14 +170,10 @@ class BingXClient:
                 return pos
         return None
 
-    # ─────────────────── leverage ────────────────────────────────────────────
+    # ─────────────────── leverage ─────────────────────────────────────────────
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """
-        FIX-B: En hedge mode hay que configurar leverage para LONG y SHORT
-        por separado. "side": "BOTH" solo funciona en one-way.
-        Intentamos los tres por si acaso.
-        """
+        """FIX-B: hedge mode requiere LONG y SHORT por separado."""
         success = False
         for side in ("LONG", "SHORT", "BOTH"):
             try:
@@ -164,17 +182,17 @@ class BingXClient:
                     "/openApi/swap/v2/trade/leverage",
                     {"symbol": symbol, "leverage": leverage, "side": side},
                 )
-                logger.info(f"{symbol}: leverage {leverage}x configurado (side={side})")
+                logger.info(f"{symbol}: leverage {leverage}x OK (side={side})")
                 success = True
             except BingXError as e:
-                # Ignorar errores de "ya configurado" o side no válido
-                if "leverage" in str(e).lower() or "110025" in str(e):
+                err = str(e)
+                if "110025" in err or "leverage" in err.lower():
                     success = True
                 else:
-                    logger.debug(f"set_leverage side={side}: {e}")
+                    logger.debug(f"leverage side={side}: {e}")
         return success
 
-    # ─────────────────── órdenes ─────────────────────────────────────────────
+    # ─────────────────── órdenes ──────────────────────────────────────────────
 
     def place_market_order(
         self,
@@ -183,46 +201,34 @@ class BingXClient:
         quantity: float,
         position_side: Optional[str] = None,
     ) -> Dict:
-        """
-        FIX-C: positionSide siempre incluido en hedge mode.
-        Sin él BingX no sabe qué lado abrir → error 109400.
-        """
+        """FIX-C + FIX-D: positionSide correcto, cantidad como string seguro."""
         params: Dict[str, Any] = {
             "symbol":   symbol,
-            "side":     side.upper(),   # BUY | SELL
+            "side":     side.upper(),
             "type":     "MARKET",
             "quantity": quantity,
         }
-
-        # En hedge mode positionSide es obligatorio
         if position_side and position_side.upper() != "BOTH":
             params["positionSide"] = position_side.upper()
 
-        logger.info(f"{symbol}: orden MARKET {side} qty={quantity} posSide={position_side}")
+        logger.info(f"{symbol}: MARKET {side} qty={quantity} posSide={position_side}")
         try:
             data = self._request("POST", "/openApi/swap/v2/trade/order", params)
-            logger.info(f"{symbol}: orden ejecutada OK")
+            logger.info(f"{symbol}: orden OK ✅")
             return data
         except BingXError:
-            # Si falla con positionSide, intentar sin él (one-way)
-            if position_side and "positionSide" in params:
-                logger.warning(f"{symbol}: reintentando sin positionSide...")
+            if "positionSide" in params:
+                logger.warning(f"{symbol}: reintentando sin positionSide…")
                 params.pop("positionSide")
                 data = self._request("POST", "/openApi/swap/v2/trade/order", params)
-                logger.info(f"{symbol}: orden ejecutada OK (sin positionSide)")
+                logger.info(f"{symbol}: orden OK (sin positionSide) ✅")
                 return data
             raise
 
     def close_all_positions(self, symbol: str) -> bool:
         """
-        FIX-A (crítico): El endpoint /closeAllPositions da error 109400 en
-        hedge mode porque necesita positionSide por posición.
-
-        Solución: obtener posiciones abiertas y cerrar cada una individualmente
-        con la orden correcta:
-          - LONG → side=SELL, positionSide=LONG
-          - SHORT → side=BUY, positionSide=SHORT
-          - BOTH (one-way) → lado contrario + reduceOnly=true
+        FIX-A: cierra cada posición individualmente con positionSide correcto.
+        El endpoint /closeAllPositions da error 109400 en hedge mode.
         """
         try:
             positions = self.get_positions(symbol)
@@ -233,17 +239,14 @@ class BingXClient:
                 if amt == 0:
                     continue
 
-                ps   = str(pos.get("positionSide", "BOTH")).upper()
-                qty  = abs(amt)
+                ps  = str(pos.get("positionSide", "BOTH")).upper()
+                qty = abs(amt)
 
                 if ps == "LONG":
-                    close_side = "SELL"
-                    close_ps   = "LONG"
+                    close_side, close_ps = "SELL", "LONG"
                 elif ps == "SHORT":
-                    close_side = "BUY"
-                    close_ps   = "SHORT"
+                    close_side, close_ps = "BUY", "SHORT"
                 else:
-                    # One-way mode
                     close_side = "SELL" if amt > 0 else "BUY"
                     close_ps   = None
 
@@ -253,7 +256,6 @@ class BingXClient:
                     "type":     "MARKET",
                     "quantity": qty,
                 }
-
                 if close_ps:
                     params["positionSide"] = close_ps
                 else:
@@ -261,11 +263,11 @@ class BingXClient:
 
                 try:
                     self._request("POST", "/openApi/swap/v2/trade/order", params)
-                    logger.info(f"{symbol}: cerrada posición {ps} qty={qty} ✅")
+                    logger.info(f"{symbol}: cerrada {ps} qty={qty} ✅")
                     closed += 1
                 except BingXError as e:
                     logger.error(f"{symbol}: error cerrando {ps}: {e}")
-                    # Último recurso: reduceOnly sin positionSide
+                    # Último recurso
                     try:
                         fallback: Dict[str, Any] = {
                             "symbol":     symbol,
@@ -275,20 +277,20 @@ class BingXClient:
                             "reduceOnly": "true",
                         }
                         self._request("POST", "/openApi/swap/v2/trade/order", fallback)
-                        logger.info(f"{symbol}: cerrada con fallback reduceOnly ✅")
+                        logger.info(f"{symbol}: fallback OK ✅")
                         closed += 1
                     except BingXError as e2:
-                        logger.error(f"{symbol}: fallback también falló: {e2}")
+                        logger.error(f"{symbol}: fallback falló: {e2}")
 
-            if closed == 0 and not positions:
-                logger.info(f"{symbol}: sin posiciones abiertas que cerrar")
+            if not positions:
+                logger.info(f"{symbol}: sin posiciones abiertas")
             return closed > 0
 
         except Exception as e:
-            logger.error(f"{symbol}: close_all_positions error inesperado: {e}")
+            logger.error(f"{symbol}: close_all_positions error: {e}")
             return False
 
-    # ─────────────────── telegram ────────────────────────────────────────────
+    # ─────────────────── telegram ─────────────────────────────────────────────
 
     def send_telegram(self, message: str):
         if not self.telegram_token or not self.telegram_chat:
@@ -300,9 +302,9 @@ class BingXClient:
                 timeout=5,
             )
         except Exception as e:
-            logger.debug(f"Telegram error: {e}")
+            logger.debug(f"Telegram: {e}")
 
-    # ─────────────────── símbolo ────────────────────────────────────────────
+    # ─────────────────── símbolo ──────────────────────────────────────────────
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
         try:
@@ -311,9 +313,9 @@ class BingXClient:
                 for item in data:
                     if item.get("symbol") == symbol:
                         return {
-                            "minQty":          float(item.get("minTradeNum", 0.001)),
-                            "qtyStep":         float(item.get("quantityPrecision", 0.001)),
-                            "pricePrecision":  int(item.get("pricePrecision", 2)),
+                            "minQty":         float(item.get("minTradeNum", 0.001)),
+                            "qtyStep":        float(item.get("quantityPrecision", 0.001)),
+                            "pricePrecision": int(item.get("pricePrecision", 2)),
                         }
         except Exception as e:
             logger.error(f"get_symbol_info {symbol}: {e}")
