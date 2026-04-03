@@ -1,19 +1,7 @@
 """
-Bot de Scalping — Zero Lag + Trend Reversal Probability
-Estrategia: https://youtube.com/@WhaleAnalytics
-Deploy: Railway | Exchange: BingX Perpetual Futures
-
-FIXES v2:
-  FIX-1  sync_position() usa detected_side de bingx_client (Hedge mode correcto)
-         Antes: amt>0 → "long", incorrecto si BingX tiene SHORT con amt>0
-  FIX-2  ENTRY_MAX_PROB default cambiado de 0.30 → 0.65
-         Con 0.30 el bot nunca entraba (prob siempre ~55%)
-         0.65 significa "entrar si prob de reversión < 65%" — más razonable
-  FIX-3  Telegram notificaciones añadidas en entradas, salidas y errores
-         Requiere TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID en variables Railway
-  FIX-4  handle_entry usa positionSide correcto (LONG/SHORT en Hedge mode)
-         Detecta automáticamente si la cuenta es Hedge o One-Way
-  FIX-5  Reporte de estado cada N ciclos vía Telegram
+Bot de Scalping Multi-Symbol — Zero Lag + Trend Reversal Probability
+LONG + SHORT | Escanea todos los pares disponibles en BingX
+v3.0 — Multi-Symbol Scanner
 """
 
 import os
@@ -27,8 +15,6 @@ from dotenv import load_dotenv
 from bingx_client import BingXClient, BingXError
 from strategy import calculate_signals
 
-# ─────────────────────────── SETUP ───────────────────────────
-
 load_dotenv()
 
 logging.basicConfig(
@@ -41,34 +27,43 @@ logger = logging.getLogger(__name__)
 
 # ──────────────────────── CONFIG ─────────────────────────────
 
-def _env(key: str, default=None, cast=str):
+def _env(key, default=None, cast=str):
     val = os.getenv(key, default)
     if val is None:
-        raise EnvironmentError(f"Variable de entorno requerida no encontrada: {key}")
+        raise EnvironmentError(f"Variable requerida no encontrada: {key}")
     return cast(val)
-
 
 API_KEY        = _env("BINGX_API_KEY")
 SECRET_KEY     = _env("BINGX_SECRET_KEY")
 TELEGRAM_TOKEN = _env("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = _env("TELEGRAM_CHAT_ID",   "")
-SYMBOL         = _env("SYMBOL",         "BTC-USDT")
 TIMEFRAME      = _env("TIMEFRAME",      "15m")
 LEVERAGE       = _env("LEVERAGE",       "5",    int)
 RISK_PCT       = _env("RISK_PCT",       "0.05", float)
 ZLEMA_LENGTH   = _env("ZLEMA_LENGTH",   "70",   int)
 BAND_MULT      = _env("BAND_MULT",      "1.2",  float)
 OSC_PERIOD     = _env("OSC_PERIOD",     "20",   int)
-# FIX-2: cambiado de 0.30 a 0.65 — con 0.30 nunca entraba (prob ~55% siempre)
 ENTRY_MAX_PROB = _env("ENTRY_MAX_PROB", "0.65", float)
 EXIT_PROB      = _env("EXIT_PROB",      "0.84", float)
 CHECK_INTERVAL = _env("CHECK_INTERVAL", "60",   int)
 DEMO_MODE      = _env("DEMO_MODE",      "false").lower() == "true"
 MIN_BALANCE    = _env("MIN_BALANCE",    "10",   float)
-# Modo de cuenta: "hedge" o "oneway" (detectado automáticamente si no se configura)
-POSITION_MODE  = _env("POSITION_MODE",  "auto")    # auto | hedge | oneway
-# Reporte Telegram cada N ciclos (0 = desactivado)
+POSITION_MODE  = _env("POSITION_MODE",  "auto")
 REPORT_EVERY   = _env("REPORT_EVERY",   "60",   int)
+# Multi-symbol config
+MAX_OPEN_TRADES = _env("MAX_OPEN_TRADES", "3",       int)
+MIN_VOLUME_24H  = _env("MIN_VOLUME_24H",  "1000000", float)  # USDT
+MAX_SYMBOLS     = _env("MAX_SYMBOLS",     "50",      int)
+SCAN_INTERVAL   = _env("SCAN_INTERVAL",   "300",     int)    # re-scan de símbolos cada 5min
+ALLOW_SHORT     = _env("ALLOW_SHORT",     "true").lower() == "true"
+COOLDOWN_MIN    = _env("COOLDOWN_MIN",    "15",      int)    # minutos entre trades mismo par
+
+# Símbolos excluidos (derivados, índices, materias primas)
+EXCLUDED = {
+    'DOW','SP500','GOLD','SILVER','XAU','OIL','BRENT',
+    'EUR','GBP','JPY','TSLA','AAPL','MSFT','NVDA',
+    'COIN','MSTR','WHEAT','CORN',
+}
 
 # ──────────────────────── STATE ──────────────────────────────
 
@@ -79,17 +74,19 @@ client = BingXClient(
     telegram_chat=TELEGRAM_CHAT,
 )
 
-state = {
-    "position":      None,   # "long" | "short" | None
-    "entry_price":   None,
-    "entry_qty":     None,
-    "position_side": None,   # "LONG" | "SHORT" | "BOTH" — para cerrar correctamente
+# open_trades: {symbol: {position, entry_price, entry_qty, position_side, opened_at}}
+open_trades: dict = {}
+cooldowns:   dict = {}   # {symbol: timestamp_fin_cooldown}
+symbols:     list = []
+last_scan_ts: float = 0
+
+stats = {
     "cycle":         0,
     "wins":          0,
     "losses":        0,
-    "start_balance": None,
-    "account_mode":  None,   # "hedge" | "oneway" — detectado al arrancar
     "total_pnl":     0.0,
+    "start_balance": None,
+    "account_mode":  None,
 }
 
 # ─────────────────────── HELPERS ─────────────────────────────
@@ -98,344 +95,412 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
 
-def get_ohlcv() -> pd.DataFrame:
-    klines = client.get_klines(SYMBOL, TIMEFRAME, limit=500)
-    if not klines:
-        raise RuntimeError("Sin datos de velas")
-    df = pd.DataFrame(klines)
-    if isinstance(klines[0], dict):
-        df = df.rename(columns={"o": "open", "h": "high", "l": "low",
-                                 "c": "close", "v": "volume"})
-    else:
-        df.columns = ["open_time", "open", "high", "low", "close", "volume"] + list(
-            range(len(df.columns) - 6)
-        )
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"])
-    return df.reset_index(drop=True)
-
-
-def calculate_qty(balance: float, price: float) -> float:
-    usdt_exposure = balance * RISK_PCT * LEVERAGE
-    qty = usdt_exposure / price
-    qty = round(qty, 3)
-    return max(qty, 0.001)
-
-
 def detect_account_mode() -> str:
-    """
-    FIX-4: Detecta automáticamente si la cuenta está en Hedge o One-Way mode.
-    En Hedge mode, BingX devuelve posiciones con positionSide=LONG o SHORT.
-    En One-Way mode, devuelve positionSide=BOTH.
-    """
     if POSITION_MODE.lower() in ("hedge", "oneway"):
-        logger.info(f"Modo de cuenta configurado manualmente: {POSITION_MODE}")
         return POSITION_MODE.lower()
-    # Intentar detectar mirando una posición de prueba o el campo de las posiciones
     try:
-        positions = client.get_positions(SYMBOL)
+        positions = client.get_positions("BTC-USDT")
         for pos in positions:
             side = str(pos.get("positionSide", "")).upper()
             if side in ("LONG", "SHORT"):
-                logger.info("Cuenta en modo HEDGE detectado")
+                logger.info("Modo HEDGE detectado")
                 return "hedge"
             elif side == "BOTH":
-                logger.info("Cuenta en modo ONE-WAY detectado")
+                logger.info("Modo ONE-WAY detectado")
                 return "oneway"
-        # Sin posiciones abiertas — asumir hedge (BingX default en nuevas cuentas)
-        logger.info("Sin posiciones para detectar modo — asumiendo HEDGE")
+        logger.info("Sin posiciones — asumiendo HEDGE")
         return "hedge"
     except Exception as e:
         logger.warning(f"No se pudo detectar modo: {e} — asumiendo HEDGE")
         return "hedge"
 
 
-def sync_position():
-    """
-    FIX-1: Usa detected_side de get_open_position() para detectar LONG/SHORT
-    correctamente en Hedge mode.
-    Antes: state["position"] = "long" if amt > 0 else "short"
-    → incorrecto en Hedge mode donde un SHORT puede tener amt > 0
-    """
-    pos = client.get_open_position(SYMBOL)
-    if pos is None:
-        state["position"]      = None
-        state["entry_price"]   = None
-        state["entry_qty"]     = None
-        state["position_side"] = None
+def get_symbols() -> list:
+    """Obtiene todos los pares USDT con volumen suficiente, ordenados por volumen."""
+    global symbols, last_scan_ts
+    now = time.time()
+    if symbols and (now - last_scan_ts) < SCAN_INTERVAL:
+        return symbols
+
+    try:
+        import requests as req
+        d = req.get(
+            "https://open-api.bingx.com/openApi/swap/v2/quote/ticker",
+            timeout=15,
+        ).json()
+        if d.get("code") != 0:
+            return symbols or ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+
+        items = []
+        for t in d.get("data", []):
+            sym = t.get("symbol", "")
+            if not sym.endswith("-USDT"):
+                continue
+            base = sym.replace("-USDT", "").upper()
+            if any(ex in base for ex in EXCLUDED):
+                continue
+            try:
+                price = float(t.get("lastPrice", 0))
+                vol   = float(t.get("volume", 0)) * price
+                if vol < MIN_VOLUME_24H or price < 0.000001:
+                    continue
+                items.append({"symbol": sym, "vol": vol})
+            except Exception:
+                continue
+
+        items.sort(key=lambda x: x["vol"], reverse=True)
+        symbols = [x["symbol"] for x in items[:MAX_SYMBOLS]]
+        last_scan_ts = now
+        logger.info(f"Símbolos actualizados: {len(symbols)}")
+        return symbols
+
+    except Exception as e:
+        logger.warning(f"Error obteniendo símbolos: {e}")
+        return symbols or ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+
+
+def get_ohlcv(symbol: str) -> pd.DataFrame:
+    klines = client.get_klines(symbol, TIMEFRAME, limit=500)
+    if not klines:
+        raise RuntimeError(f"Sin datos de velas para {symbol}")
+    df = pd.DataFrame(klines)
+    if isinstance(klines[0], dict):
+        df = df.rename(columns={"o": "open", "h": "high", "l": "low",
+                                 "c": "close", "v": "volume"})
     else:
-        # FIX-1: usar detected_side calculado en bingx_client.py
-        state["position"]      = pos.get("detected_side", "long")
-        state["entry_price"]   = float(pos.get("avgPrice", 0))
-        state["entry_qty"]     = abs(float(pos.get("positionAmt", 0)))
-        # Guardar positionSide real para el cierre correcto
-        state["position_side"] = str(pos.get("positionSide", "BOTH")).upper()
+        df.columns = ["open_time", "open", "high", "low", "close", "volume"] + \
+                     list(range(len(df.columns) - 6))
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
 
 
-def log_banner():
-    mode = "DEMO" if DEMO_MODE else "REAL MONEY"
-    logger.info("=" * 60)
-    logger.info(f"  Zero Lag Scalping Bot v2  |  {mode}")
-    logger.info(f"  {SYMBOL} | {TIMEFRAME} | {LEVERAGE}x leverage")
-    logger.info(f"  Riesgo: {RISK_PCT:.0%}/op | Entrada: prob<{ENTRY_MAX_PROB:.0%} | Salida: prob>={EXIT_PROB:.0%}")
-    logger.info(f"  ZLEMA:{ZLEMA_LENGTH} | BandMult:{BAND_MULT} | OscPeriod:{OSC_PERIOD}")
-    logger.info(f"  Telegram: {'ON' if TELEGRAM_TOKEN and TELEGRAM_CHAT else 'OFF'}")
-    logger.info(f"  Modo cuenta: {state.get('account_mode', 'detectando...')}")
-    logger.info("=" * 60)
+def calculate_qty(balance: float, price: float) -> float:
+    usdt_exposure = balance * RISK_PCT * LEVERAGE
+    qty = round(usdt_exposure / price, 3)
+    return max(qty, 0.001)
 
 
-def log_state(signals: dict, balance: float):
-    trend_str = "ALCISTA" if signals["trend"] == 1 else "BAJISTA"
-    pos_str = state["position"] or "Sin posicion"
-    prob = signals["probability"]
+def is_on_cooldown(symbol: str) -> bool:
+    ts = cooldowns.get(symbol)
+    if not ts:
+        return False
+    if time.time() > ts:
+        del cooldowns[symbol]
+        return False
+    return True
 
-    logger.info(
-        f"[{now_utc()}] #{state['cycle']} | "
-        f"${signals['close']:.4f} | "
-        f"Tendencia: {trend_str} | "
-        f"Prob: {prob:.1%} | "
-        f"Pos: {pos_str} | "
-        f"Balance: {balance:.2f} USDT"
-    )
+
+def set_cooldown(symbol: str):
+    cooldowns[symbol] = time.time() + COOLDOWN_MIN * 60
+
+
+def sync_all_positions():
+    """Sincroniza open_trades con las posiciones reales en BingX."""
+    try:
+        import requests as req
+        d = client._request("GET", "/openApi/swap/v2/user/positions", {})
+        real = {}
+        for p in (d if isinstance(d, list) else []):
+            amt = float(p.get("positionAmt", 0))
+            if amt != 0:
+                sym = p.get("symbol", "")
+                ps  = str(p.get("positionSide", "BOTH")).upper()
+                real[sym] = {
+                    "position":      "long" if (ps == "LONG" or (ps == "BOTH" and amt > 0)) else "short",
+                    "entry_price":   float(p.get("avgPrice", 0) or p.get("entryPrice", 0)),
+                    "entry_qty":     abs(amt),
+                    "position_side": ps,
+                    "opened_at":     open_trades.get(sym, {}).get("opened_at", datetime.now(timezone.utc)),
+                }
+        # Eliminar trades que ya no están en BingX
+        for sym in list(open_trades.keys()):
+            if sym not in real:
+                logger.info(f"  [SYNC] {sym} cerrado externamente — eliminando del estado")
+                del open_trades[sym]
+        # Añadir posiciones reales que no teníamos registradas
+        for sym, info in real.items():
+            if sym not in open_trades:
+                logger.info(f"  [SYNC] Recuperando {info['position'].upper()} {sym}")
+                open_trades[sym] = info
+    except Exception as e:
+        logger.warning(f"sync_all_positions error: {e}")
 
 
 # ─────────────────────── CORE LOGIC ──────────────────────────
 
-def handle_exit(signals: dict, reason: str):
-    if state["position"] is None:
+def handle_exit(symbol: str, signals: dict, reason: str):
+    if symbol not in open_trades:
         return
 
-    entry   = state["entry_price"] or 0
-    current = signals["close"]
-    pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
-    if state["position"] == "short":
-        pnl_pct = -pnl_pct
+    t         = open_trades[symbol]
+    entry     = t["entry_price"]
+    current   = signals["close"]
+    direction = t["position"]
+    qty       = t["entry_qty"]
 
-    # Estimar PnL en USDT
-    qty     = state["entry_qty"] or 0
-    pnl_usd = qty * (current - entry) * (1 if state["position"] == "long" else -1)
-    state["total_pnl"] += pnl_usd
+    pnl_pct = ((current - entry) / entry * 100) if direction == "long" \
+               else ((entry - current) / entry * 100)
+    pnl_usd = qty * (current - entry) * (1 if direction == "long" else -1)
+    stats["total_pnl"] += pnl_usd
 
-    logger.info(f"CERRANDO {state['position'].upper()} | {reason} | PnL: {pnl_pct:+.2f}%")
+    logger.info(f"  CERRANDO {direction.upper()} {symbol} | {reason} | PnL: {pnl_pct:+.2f}%")
 
-    # FIX-3: Notificación Telegram al cerrar
     emoji = "✅" if pnl_pct > 0 else "❌"
+    mins  = int((datetime.now(timezone.utc) - t["opened_at"]).total_seconds() / 60)
     client.send_telegram(
-        f"<b>{emoji} CERRADO {state['position'].upper()} — {reason}</b>\n"
-        f"Par: {SYMBOL} | TF: {TIMEFRAME}\n"
-        f"Entrada: ${entry:.4f} | Salida: ${current:.4f}\n"
+        f"<b>{emoji} CERRADO {direction.upper()} — {reason}</b>\n"
+        f"Par: {symbol} | TF: {TIMEFRAME}\n"
+        f"Entrada: ${entry:.4f} | Salida: ${current:.4f} | {mins}min\n"
         f"PnL: {pnl_pct:+.2f}% (${pnl_usd:+.4f} USDT)\n"
-        f"PnL total sesión: ${state['total_pnl']:+.4f} USDT"
+        f"PnL total sesión: ${stats['total_pnl']:+.4f} USDT\n"
+        f"Posiciones abiertas: {len(open_trades)-1}/{MAX_OPEN_TRADES}"
     )
 
-    client.close_all_positions(SYMBOL)
+    client.close_all_positions(symbol)
 
     if pnl_pct > 0:
-        state["wins"] += 1
+        stats["wins"] += 1
     else:
-        state["losses"] += 1
+        stats["losses"] += 1
 
-    state["position"]      = None
-    state["entry_price"]   = None
-    state["entry_qty"]     = None
-    state["position_side"] = None
-    time.sleep(2)
+    set_cooldown(symbol)
+    del open_trades[symbol]
+    time.sleep(1)
 
 
-def handle_entry(signals: dict, direction: str, balance: float):
+def handle_entry(symbol: str, signals: dict, direction: str, balance: float):
     price = signals["close"]
     qty   = calculate_qty(balance, price)
-
     if qty <= 0:
-        logger.warning("Cantidad calculada es 0, operacion omitida")
         return
 
-    side = "BUY" if direction == "long" else "SELL"
+    side     = "BUY" if direction == "long" else "SELL"
+    acc_mode = stats.get("account_mode", "hedge")
+    pos_side = ("LONG" if direction == "long" else "SHORT") if acc_mode == "hedge" else "BOTH"
 
-    # FIX-4: usar positionSide correcto según modo de cuenta
-    account_mode = state.get("account_mode", "hedge")
-    if account_mode == "hedge":
-        pos_side = "LONG" if direction == "long" else "SHORT"
-    else:
-        pos_side = "BOTH"
-
-    logger.info(
-        f"ABRIENDO {direction.upper()} | "
-        f"Precio: ${price:.4f} | Qty: {qty} | "
-        f"Prob: {signals['probability']:.1%} | positionSide: {pos_side}"
-    )
+    logger.info(f"  ABRIENDO {direction.upper()} {symbol} | ${price:.4f} qty={qty} prob={signals['probability']:.1%}")
 
     try:
-        client.set_leverage(SYMBOL, LEVERAGE)
-        client.place_market_order(SYMBOL, side, qty, position_side=pos_side)
-        state["position"]      = direction
-        state["entry_price"]   = price
-        state["entry_qty"]     = qty
-        state["position_side"] = pos_side
+        client.set_leverage(symbol, LEVERAGE)
+        client.place_market_order(symbol, side, qty, position_side=pos_side)
 
-        # FIX-3: Notificación Telegram al abrir
+        open_trades[symbol] = {
+            "position":      direction,
+            "entry_price":   price,
+            "entry_qty":     qty,
+            "position_side": pos_side,
+            "opened_at":     datetime.now(timezone.utc),
+        }
+
         emoji = "🟢" if direction == "long" else "🔴"
         trend_str = "ALCISTA" if signals["trend"] == 1 else "BAJISTA"
         client.send_telegram(
-            f"<b>{emoji} ABIERTO {direction.upper()}</b>\n"
-            f"Par: {SYMBOL} | TF: {TIMEFRAME} | {LEVERAGE}x\n"
-            f"Precio entrada: ${price:.4f}\n"
-            f"Cantidad: {qty} | positionSide: {pos_side}\n"
-            f"Tendencia: {trend_str} | Prob reversión: {signals['probability']:.1%}\n"
-            f"Balance: ${balance:.2f} USDT"
+            f"<b>{emoji} ABIERTO {direction.upper()} [Multi-Symbol]</b>\n"
+            f"Par: {symbol} | TF: {TIMEFRAME} | {LEVERAGE}x\n"
+            f"Precio: ${price:.4f} | Qty: {qty}\n"
+            f"Tendencia: {trend_str} | Prob rev: {signals['probability']:.1%}\n"
+            f"Balance: ${balance:.2f} USDT\n"
+            f"Posiciones: {len(open_trades)}/{MAX_OPEN_TRADES}"
         )
 
     except BingXError as e:
-        logger.error(f"Error al abrir orden: {e}")
-        # FIX-3: Notificar error por Telegram
-        client.send_telegram(f"<b>Error abriendo {direction.upper()} {SYMBOL}</b>\n{e}")
+        logger.error(f"  Error abriendo {symbol}: {e}")
+        client.send_telegram(f"<b>⚠️ Error abriendo {direction.upper()} {symbol}</b>\n{e}")
 
 
-def send_status_report(signals: dict, balance: float):
-    """FIX-3: Reporte periódico de estado vía Telegram."""
-    total = state["wins"] + state["losses"]
-    wr = state["wins"] / total * 100 if total > 0 else 0
-    pos_str = f"{state['position'].upper()} @ ${state['entry_price']:.4f}" \
-              if state["position"] else "Sin posicion"
-    trend_str = "ALCISTA" if signals["trend"] == 1 else "BAJISTA"
+def analyze_symbol(symbol: str, balance: float):
+    """Analiza un símbolo y actúa según señales."""
+    # Si ya tiene posición abierta → gestionar salida
+    if symbol in open_trades:
+        t = open_trades[symbol]
+        try:
+            df      = get_ohlcv(symbol)
+            signals = calculate_signals(df, ZLEMA_LENGTH, BAND_MULT, OSC_PERIOD)
+        except Exception as e:
+            logger.debug(f"  {symbol} error señales: {e}")
+            return
 
-    client.send_telegram(
-        f"<b>Reporte #{state['cycle']} — {SYMBOL}</b>\n"
-        f"Balance: ${balance:.2f} USDT\n"
-        f"Posicion: {pos_str}\n"
-        f"Tendencia: {trend_str} | Prob: {signals['probability']:.1%}\n"
-        f"Trades: {total} | WR: {wr:.1f}% ({state['wins']}W/{state['losses']}L)\n"
-        f"PnL sesion: ${state['total_pnl']:+.4f} USDT"
-    )
+        direction = t["position"]
+        prob      = signals["probability"]
 
-
-def run_cycle():
-    state["cycle"] += 1
-
-    # 1. Sincronizar posición
-    try:
-        sync_position()
-    except BingXError as e:
-        logger.error(f"No se pudo sincronizar posicion: {e}")
+        if prob >= EXIT_PROB:
+            handle_exit(symbol, signals, f"Prob reversión {prob:.1%}")
+            return
+        if direction == "long" and signals["trend"] == -1:
+            handle_exit(symbol, signals, "Tendencia viró a bajista")
+            return
+        if direction == "short" and signals["trend"] == 1:
+            handle_exit(symbol, signals, "Tendencia viró a alcista")
+            return
         return
 
-    # 2. Velas y señales
+    # Sin posición → buscar entrada si hay slots libres
+    if len(open_trades) >= MAX_OPEN_TRADES:
+        return
+    if is_on_cooldown(symbol):
+        return
+
     try:
-        df = get_ohlcv()
+        df      = get_ohlcv(symbol)
         signals = calculate_signals(df, ZLEMA_LENGTH, BAND_MULT, OSC_PERIOD)
     except Exception as e:
-        logger.error(f"Error calculando senales: {e}")
+        logger.debug(f"  {symbol} error señales: {e}")
         return
 
-    # 3. Balance
-    try:
-        balance = client.get_balance()
-    except BingXError as e:
-        logger.error(f"Error obteniendo balance: {e}")
+    if balance < MIN_BALANCE:
+        return
+    if signals["probability"] >= ENTRY_MAX_PROB:
         return
 
-    log_state(signals, balance)
+    if signals["bullish_entry"]:
+        handle_entry(symbol, signals, "long", balance)
+    elif ALLOW_SHORT and signals["bearish_entry"]:
+        handle_entry(symbol, signals, "short", balance)
 
-    # FIX-3: Reporte periódico
-    if REPORT_EVERY > 0 and state["cycle"] % REPORT_EVERY == 0:
-        send_status_report(signals, balance)
 
-    trend   = signals["trend"]
-    prob    = signals["probability"]
-    bull_in = signals["bullish_entry"]
-    bear_in = signals["bearish_entry"]
+def send_report(balance: float):
+    total = stats["wins"] + stats["losses"]
+    wr    = stats["wins"] / total * 100 if total > 0 else 0
+    pos_lines = ""
+    for sym, t in open_trades.items():
+        try:
+            import requests as req
+            tk = req.get(
+                "https://open-api.bingx.com/openApi/swap/v2/quote/ticker",
+                params={"symbol": sym}, timeout=5,
+            ).json()
+            cur = float(tk["data"]["lastPrice"]) if tk.get("code") == 0 else t["entry_price"]
+        except Exception:
+            cur = t["entry_price"]
+        d   = t["position"]
+        pct = ((cur - t["entry_price"]) / t["entry_price"] * 100) if d == "long" \
+              else ((t["entry_price"] - cur) / t["entry_price"] * 100)
+        pos_lines += f"  {d.upper()} {sym}: {pct:+.2f}%\n"
 
-    # 4. LÓGICA DE SALIDA
-    if state["position"] is not None:
-        if prob >= EXIT_PROB:
-            handle_exit(signals, f"Prob reversion {prob:.1%} >= {EXIT_PROB:.1%}")
-            return
-        if state["position"] == "long" and trend == -1:
-            handle_exit(signals, "Tendencia viro a bajista")
-            return
-        if state["position"] == "short" and trend == 1:
-            handle_exit(signals, "Tendencia viro a alcista")
-            return
-
-    # 5. LÓGICA DE ENTRADA
-    if state["position"] is None:
-        if balance < MIN_BALANCE:
-            logger.warning(f"Balance insuficiente: {balance:.2f} < {MIN_BALANCE} USDT")
-            return
-
-        if prob >= ENTRY_MAX_PROB:
-            logger.info(
-                f"Esperando: prob {prob:.1%} >= {ENTRY_MAX_PROB:.1%} "
-                f"(necesita ser MENOR para entrar)"
-            )
-            return
-
-        if bull_in:
-            handle_entry(signals, "long", balance)
-        elif bear_in:
-            handle_entry(signals, "short", balance)
-        else:
-            logger.info("Sin senal de entrada en esta barra")
+    client.send_telegram(
+        f"<b>📊 Reporte Multi-Symbol Bot #{stats['cycle']}</b>\n"
+        f"Balance: ${balance:.2f} USDT\n"
+        f"Abiertos: {len(open_trades)}/{MAX_OPEN_TRADES}\n"
+        f"{pos_lines or '  sin posiciones\n'}"
+        f"Trades: {total} | WR: {wr:.1f}% ({stats['wins']}W/{stats['losses']}L)\n"
+        f"PnL sesión: ${stats['total_pnl']:+.4f} USDT"
+    )
 
 
 # ─────────────────────── MAIN LOOP ───────────────────────────
 
 def main():
-    # Detectar modo de cuenta antes de arrancar
-    state["account_mode"] = detect_account_mode()
+    stats["account_mode"] = detect_account_mode()
 
-    log_banner()
+    logger.info("=" * 65)
+    logger.info("  Zero Lag Multi-Symbol Bot v3.0  |  LONG + SHORT")
+    logger.info(f"  TF:{TIMEFRAME} | LEV:{LEVERAGE}x | MaxTrades:{MAX_OPEN_TRADES}")
+    logger.info(f"  Riesgo:{RISK_PCT:.0%}/op | MaxSymbols:{MAX_SYMBOLS}")
+    logger.info(f"  Entrada:prob<{ENTRY_MAX_PROB:.0%} | Salida:prob>={EXIT_PROB:.0%}")
+    logger.info(f"  Modo cuenta: {stats['account_mode'].upper()}")
+    logger.info(f"  Shorts: {'ON' if ALLOW_SHORT else 'OFF'}")
+    logger.info("=" * 65)
 
     if DEMO_MODE:
-        logger.warning("MODO DEMO ACTIVADO — No se usa dinero real")
-    else:
-        logger.warning("MODO REAL — Se utilizara dinero real en BingX")
-        time.sleep(3)
+        logger.warning("MODO DEMO — sin dinero real")
 
     try:
-        state["start_balance"] = client.get_balance()
-        logger.info(f"Balance inicial: ${state['start_balance']:.2f} USDT")
+        stats["start_balance"] = client.get_balance()
+        logger.info(f"Balance inicial: ${stats['start_balance']:.2f} USDT")
     except BingXError as e:
-        logger.error(f"No se pudo conectar con BingX: {e}")
+        logger.error(f"No se pudo conectar: {e}")
         sys.exit(1)
 
-    # FIX-3: Notificación de arranque
+    sync_all_positions()
+    get_symbols()
+
     client.send_telegram(
-        f"<b>Bot Zero Lag iniciado</b>\n"
-        f"Par: {SYMBOL} | TF: {TIMEFRAME} | {LEVERAGE}x\n"
-        f"Modo: {'DEMO' if DEMO_MODE else 'REAL'} | Cuenta: {state['account_mode'].upper()}\n"
-        f"Entrada: prob<{ENTRY_MAX_PROB:.0%} | Salida: prob>={EXIT_PROB:.0%}\n"
-        f"Balance: ${state['start_balance']:.2f} USDT\n"
-        f"Telegram: OK"
+        f"<b>🚀 Multi-Symbol Bot v3.0 iniciado</b>\n"
+        f"TF:{TIMEFRAME} | LEV:{LEVERAGE}x | Max:{MAX_OPEN_TRADES} trades\n"
+        f"Símbolos: {len(symbols)} | Shorts: {'ON' if ALLOW_SHORT else 'OFF'}\n"
+        f"Modo: {'DEMO' if DEMO_MODE else 'REAL'} | Cuenta: {stats['account_mode'].upper()}\n"
+        f"Balance: ${stats['start_balance']:.2f} USDT"
     )
 
     while True:
         try:
-            run_cycle()
-        except KeyboardInterrupt:
-            logger.info("Bot detenido por el usuario")
-            total = state["wins"] + state["losses"]
-            wr = state["wins"] / total * 100 if total > 0 else 0
+            stats["cycle"] += 1
+            cycle = stats["cycle"]
+
+            # Re-escanear símbolos periódicamente
+            syms = get_symbols()
+
+            # Sincronizar posiciones con BingX
+            sync_all_positions()
+
             try:
-                final_balance = client.get_balance()
-                pnl = final_balance - state["start_balance"]
-                logger.info(f"Trades: {total} | WR: {wr:.1f}%")
-                logger.info(f"Balance final: ${final_balance:.2f} (PnL: ${pnl:+.2f})")
+                balance = client.get_balance()
+            except BingXError as e:
+                logger.error(f"Error balance: {e}")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            total = stats["wins"] + stats["losses"]
+            wr    = stats["wins"] / total * 100 if total > 0 else 0
+            logger.info(
+                f"\n{'='*65}\n"
+                f"  #{cycle} {now_utc()} | Balance:${balance:.2f} | "
+                f"Pos:{len(open_trades)}/{MAX_OPEN_TRADES} | "
+                f"WR:{wr:.1f}% | PnL:${stats['total_pnl']:+.4f}\n"
+                f"{'='*65}"
+            )
+
+            # 1. Gestionar posiciones abiertas primero
+            for sym in list(open_trades.keys()):
+                analyze_symbol(sym, balance)
+                time.sleep(0.2)
+
+            # 2. Buscar nuevas entradas si hay slots
+            if len(open_trades) < MAX_OPEN_TRADES:
+                logger.info(f"  Escaneando {len(syms)} símbolos…")
+                found = 0
+                for i, sym in enumerate(syms):
+                    if len(open_trades) >= MAX_OPEN_TRADES:
+                        break
+                    if sym in open_trades:
+                        continue
+                    analyze_symbol(sym, balance)
+                    if sym in open_trades:
+                        found += 1
+                    time.sleep(0.15)
+                    if (i + 1) % 20 == 0:
+                        logger.info(f"  …{i+1}/{len(syms)} analizados | {found} entradas")
+                logger.info(f"  Scan completo: {found} nuevas entradas")
+            else:
+                logger.info(f"  Max trades alcanzado ({MAX_OPEN_TRADES}) — solo monitoreando")
+
+            # Reporte periódico
+            if REPORT_EVERY > 0 and cycle % REPORT_EVERY == 0:
+                send_report(balance)
+
+            logger.info(f"  Próximo ciclo en {CHECK_INTERVAL}s\n")
+            time.sleep(CHECK_INTERVAL)
+
+        except KeyboardInterrupt:
+            logger.info("Bot detenido")
+            try:
+                final = client.get_balance()
+                pnl   = final - stats["start_balance"]
+                total = stats["wins"] + stats["losses"]
+                wr    = stats["wins"] / total * 100 if total > 0 else 0
                 client.send_telegram(
-                    f"<b>Bot detenido</b>\n"
+                    f"<b>Bot Multi-Symbol detenido</b>\n"
                     f"Trades: {total} | WR: {wr:.1f}%\n"
-                    f"Balance final: ${final_balance:.2f} USDT\n"
-                    f"PnL sesion: ${pnl:+.2f} USDT"
+                    f"Balance final: ${final:.2f} USDT (PnL: ${pnl:+.2f})"
                 )
             except Exception:
                 pass
             sys.exit(0)
         except Exception as e:
-            logger.error(f"Error inesperado: {e}", exc_info=True)
-            client.send_telegram(f"<b>Error inesperado en bot {SYMBOL}</b>\n{e}")
-
-        time.sleep(CHECK_INTERVAL)
+            logger.error(f"Error inesperado ciclo #{cycle}: {e}", exc_info=True)
+            client.send_telegram(f"<b>⚠️ Error en Multi-Symbol Bot</b>\n{e}")
+            time.sleep(20)
 
 
 if __name__ == "__main__":
