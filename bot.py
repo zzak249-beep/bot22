@@ -378,11 +378,12 @@ def send_report(balance: float):
               else ((t["entry_price"] - cur) / t["entry_price"] * 100)
         pos_lines += f"  {d.upper()} {sym}: {pct:+.2f}%\n"
 
+    no_pos = "  sin posiciones\n"
     client.send_telegram(
         f"<b>📊 Reporte Multi-Symbol Bot #{stats['cycle']}</b>\n"
         f"Balance: ${balance:.2f} USDT\n"
         f"Abiertos: {len(open_trades)}/{MAX_OPEN_TRADES}\n"
-        f"{pos_lines or '  sin posiciones\n'}"
+        f"{pos_lines if pos_lines else no_pos}"
         f"Trades: {total} | WR: {wr:.1f}% ({stats['wins']}W/{stats['losses']}L)\n"
         f"PnL sesión: ${stats['total_pnl']:+.4f} USDT"
     )
