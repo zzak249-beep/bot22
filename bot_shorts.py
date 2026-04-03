@@ -77,6 +77,8 @@ MIN_VOLUME_24H  = _senv("MIN_VOLUME_24H",  "1000000", float)
 MAX_SYMBOLS     = _senv("MAX_SYMBOLS",     "60",      int)
 SCAN_INTERVAL   = _senv("SCAN_INTERVAL",   "300",     int)
 COOLDOWN_MIN    = _senv("COOLDOWN_MIN",    "20",      int)
+TP_PCT          = _senv("TP_PCT",          "2.0",     float)  # % take profit shorts
+SL_PCT          = _senv("SL_PCT",          "1.0",     float)  # % stop loss shorts
 
 # Filtros adicionales específicos para shorts
 # Solo entrar short si el precio cayó al menos X% en las últimas N velas
@@ -329,18 +331,30 @@ def handle_short_entry(symbol: str, signals: dict, balance: float):
         client.set_leverage(symbol, LEVERAGE)
         client.place_market_order(symbol, "SELL", qty, position_side=pos_side)
 
+        tp_price = price * (1 - TP_PCT / 100)
+        sl_price = price * (1 + SL_PCT / 100)
+
         open_trades[symbol] = {
             "position":      "short",
             "entry_price":   price,
             "entry_qty":     qty,
             "position_side": pos_side,
+            "tp_price":      tp_price,
+            "sl_price":      sl_price,
             "opened_at":     datetime.now(timezone.utc),
         }
 
+        # Colocar TP y SL en BingX
+        tp_sl = client.place_tp_sl(symbol, "short", qty, tp_price, sl_price, position_side=pos_side)
+
+        tp_icon = "✅" if tp_sl["tp"] else "❌"
+        sl_icon = "✅" if tp_sl["sl"] else "❌"
         client.send_telegram(
             f"<b>🔴 SHORT ABIERTO [Short Specialist]</b>\n"
             f"Par: {symbol} | TF: {TIMEFRAME} | {LEVERAGE}x\n"
             f"Precio: ${price:.4f} | Qty: {qty}\n"
+            f"TP {tp_icon}: ${tp_price:.4f} (-{TP_PCT}%)\n"
+            f"SL {sl_icon}: ${sl_price:.4f} (+{SL_PCT}%)\n"
             f"Prob reversión: {signals['probability']:.1%} (< {ENTRY_MAX_PROB:.0%})\n"
             f"Balance: ${balance:.2f} USDT\n"
             f"Posiciones: {len(open_trades)}/{MAX_OPEN_TRADES}"
