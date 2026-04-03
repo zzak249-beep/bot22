@@ -1,46 +1,77 @@
-# ========================================
-# COPIA Y PEGA ESTO EN RAILWAY → SETTINGS → VARIABLES
-# ========================================
+# ════════════════════════════════════════════════════════════════════
+# RAILWAY — VARIABLES DE ENTORNO
+# ════════════════════════════════════════════════════════════════════
+# Tienes DOS opciones para desplegar:
+#
+# OPCIÓN A — Un solo proyecto Railway con DOS servicios (recomendado)
+#   Servicio 1 (bot.py):        Procfile → worker: python bot.py
+#   Servicio 2 (bot_shorts.py): Procfile → worker: python bot_shorts.py
+#   → Cada servicio tiene sus propias variables
+#
+# OPCIÓN B — Mismo servicio, variables con prefijo SH_ para el short bot
+#   bot_shorts.py lee SH_XXXX primero, luego XXXX como fallback
+# ════════════════════════════════════════════════════════════════════
 
-# === API CREDENTIALS (OBLIGATORIAS) ===
+
+# ════════════════════════════════════════════════════════════════════
+# VARIABLES COMUNES (ambos bots)
+# ════════════════════════════════════════════════════════════════════
+
 BINGX_API_KEY=TU_API_KEY_AQUI
-BINGX_API_SECRET=TU_SECRET_AQUI
+BINGX_SECRET_KEY=TU_SECRET_KEY_AQUI
 
-# === TELEGRAM (OPCIONAL) ===
-TELEGRAM_BOT_TOKEN=tu_token
-TELEGRAM_CHAT_ID=tu_chat_id
+TELEGRAM_BOT_TOKEN=TU_TOKEN_AQUI
+TELEGRAM_CHAT_ID=TU_CHAT_ID_AQUI
 
-# === TRADING MODE ===
-AUTO_TRADING_ENABLED=true
+DEMO_MODE=false
+POSITION_MODE=auto
 
-# === CAPITAL Y LEVERAGE ===
-MAX_POSITION_SIZE=30
-LEVERAGE=3
 
-# === TP/SL AGRESIVOS ===
-TAKE_PROFIT_PCT=2.0
-STOP_LOSS_PCT=1.0
+# ════════════════════════════════════════════════════════════════════
+# BOT LONG+SHORT  (bot.py — Multi-Symbol)
+# ════════════════════════════════════════════════════════════════════
 
-# === TRAILING STOP ===
-TRAILING_ACTIVATION=0.8
-TRAILING_DISTANCE=0.4
-
-# === UMBRALES ULTRA-BAJOS (GENERA MUCHAS SEÑALES) ===
-MIN_CHANGE_PCT=0.3
-MIN_CONFIDENCE=45
-
-# === GESTIÓN ===
-MAX_OPEN_TRADES=5
+TIMEFRAME=15m
+LEVERAGE=5
+RISK_PCT=0.05
+MAX_OPEN_TRADES=3
+MAX_SYMBOLS=50
+MIN_VOLUME_24H=1000000
+ZLEMA_LENGTH=70
+BAND_MULT=1.2
+OSC_PERIOD=20
+ENTRY_MAX_PROB=0.65
+EXIT_PROB=0.84
+COOLDOWN_MIN=15
+MIN_BALANCE=10
 CHECK_INTERVAL=60
+REPORT_EVERY=60
+ALLOW_SHORT=true
+SCAN_INTERVAL=300
 
-# ========================================
-# IMPORTANTE: 
-# - MIN_CONFIDENCE=45 (muy bajo = muchas señales)
-# - MIN_CHANGE_PCT=0.3 (muy bajo = detecta mínimos movimientos)
-# - CHECK_INTERVAL=60 (cada minuto = muy rápido)
-# 
-# Con esta configuración deberías ver:
-# ✅ 15-25 señales por hora
-# ✅ 5-10 trades ejecutados por hora
-# ✅ Muy activo y rentable
-# ========================================
+
+# ════════════════════════════════════════════════════════════════════
+# BOT SHORTS  (bot_shorts.py)
+# Prefijo SH_ para variables distintas al bot principal
+# ════════════════════════════════════════════════════════════════════
+
+SH_RISK_PCT=0.03
+SH_MAX_SYMBOLS=60
+SH_ENTRY_MAX_PROB=0.60
+SH_EXIT_PROB=0.80
+SH_COOLDOWN_MIN=20
+SH_MIN_DROP_PCT=0.3
+SH_MAX_PUMP_PCT=5.0
+
+
+# ════════════════════════════════════════════════════════════════════
+# PROCFILE
+# ════════════════════════════════════════════════════════════════════
+# Bot multi-symbol:   worker: python bot.py
+# Bot solo shorts:    worker: python bot_shorts.py
+# ════════════════════════════════════════════════════════════════════
+# NOTAS
+# • BINGX_SECRET_KEY — nombre exacto (no BINGX_API_SECRET)
+# • API key necesita permisos Perpetual Futures Trade
+# • NO activar Permitir retiros
+# ════════════════════════════════════════════════════════════════════
