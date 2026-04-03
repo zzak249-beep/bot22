@@ -57,6 +57,8 @@ MAX_SYMBOLS     = _env("MAX_SYMBOLS",     "50",      int)
 SCAN_INTERVAL   = _env("SCAN_INTERVAL",   "300",     int)    # re-scan de símbolos cada 5min
 ALLOW_SHORT     = _env("ALLOW_SHORT",     "true").lower() == "true"
 COOLDOWN_MIN    = _env("COOLDOWN_MIN",    "15",      int)    # minutos entre trades mismo par
+TP_PCT          = _env("TP_PCT",          "2.5",     float)  # % take profit desde entrada
+SL_PCT          = _env("SL_PCT",          "1.2",     float)  # % stop loss desde entrada
 
 # Símbolos excluidos (derivados, índices, materias primas)
 EXCLUDED = {
@@ -285,20 +287,32 @@ def handle_entry(symbol: str, signals: dict, direction: str, balance: float):
         client.set_leverage(symbol, LEVERAGE)
         client.place_market_order(symbol, side, qty, position_side=pos_side)
 
+        tp_price = price * (1 + TP_PCT / 100) if direction == "long" else price * (1 - TP_PCT / 100)
+        sl_price = price * (1 - SL_PCT / 100) if direction == "long" else price * (1 + SL_PCT / 100)
+
         open_trades[symbol] = {
             "position":      direction,
             "entry_price":   price,
             "entry_qty":     qty,
             "position_side": pos_side,
+            "tp_price":      tp_price,
+            "sl_price":      sl_price,
             "opened_at":     datetime.now(timezone.utc),
         }
 
+        # Colocar TP y SL en BingX
+        tp_sl = client.place_tp_sl(symbol, direction, qty, tp_price, sl_price, position_side=pos_side)
+
         emoji = "🟢" if direction == "long" else "🔴"
         trend_str = "ALCISTA" if signals["trend"] == 1 else "BAJISTA"
+        tp_icon = "✅" if tp_sl["tp"] else "❌"
+        sl_icon = "✅" if tp_sl["sl"] else "❌"
         client.send_telegram(
             f"<b>{emoji} ABIERTO {direction.upper()} [Multi-Symbol]</b>\n"
             f"Par: {symbol} | TF: {TIMEFRAME} | {LEVERAGE}x\n"
             f"Precio: ${price:.4f} | Qty: {qty}\n"
+            f"TP {tp_icon}: ${tp_price:.4f} (+{TP_PCT}%)\n"
+            f"SL {sl_icon}: ${sl_price:.4f} (-{SL_PCT}%)\n"
             f"Tendencia: {trend_str} | Prob rev: {signals['probability']:.1%}\n"
             f"Balance: ${balance:.2f} USDT\n"
             f"Posiciones: {len(open_trades)}/{MAX_OPEN_TRADES}"
