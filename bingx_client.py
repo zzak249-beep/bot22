@@ -1,12 +1,13 @@
 """
-Cliente BingX — v2.2
-FIXES:
+Cliente BingX — v2.3
+FIXES vs v2.2:
   FIX-A  close_all_positions: cierra posición a posición con positionSide correcto
-  FIX-B  set_leverage: llama para LONG, SHORT y BOTH por separado (hedge mode)
+  FIX-B  set_leverage: llama para LONG y SHORT por separado (hedge mode)
   FIX-C  place_market_order: positionSide siempre incluido en hedge mode
   FIX-D  _request (CRÍTICO — error 100001): construye URL manualmente igual
-         que wyckoff_bot.py que SÍ funciona. Antes params=params hacía que
-         requests recodificara floats/bools diferente → signature mismatch.
+         que wyckoff_bot.py que SÍ funciona.
+  FIX-E  set_leverage: eliminado "BOTH" — BingX hedge mode solo acepta LONG/SHORT
+         ("BOTH" causaba error 109400 en ambos bots)
 """
 
 import hashlib
@@ -173,9 +174,14 @@ class BingXClient:
     # ─────────────────── leverage ─────────────────────────────────────────────
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """FIX-B: hedge mode requiere LONG y SHORT por separado."""
+        """
+        FIX-B + FIX-E: hedge mode requiere LONG y SHORT por separado.
+        "BOTH" eliminado — BingX lo rechaza con error 109400 en hedge mode.
+        Si la cuenta está en one-way mode, LONG fallará silenciosamente
+        y SHORT también, pero el success=True de uno de ellos es suficiente.
+        """
         success = False
-        for side in ("LONG", "SHORT", "BOTH"):
+        for side in ("LONG", "SHORT"):
             try:
                 self._request(
                     "POST",
@@ -290,7 +296,6 @@ class BingXClient:
             logger.error(f"{symbol}: close_all_positions error: {e}")
             return False
 
-
     # ─────────────────── TP / SL ─────────────────────────────────────────────
 
     def place_tp_sl(self, symbol, direction, quantity, tp_price, sl_price, position_side=None):
@@ -303,6 +308,7 @@ class BingXClient:
         ps = (position_side or ("LONG" if direction == "long" else "SHORT")).upper()
         qty_str = f"{quantity:.6g}"
         result = {"tp": False, "sl": False}
+
         # TP
         tp_p = {"symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
                 "quantity": qty_str, "stopPrice": f"{tp_price:.8g}"}
@@ -314,7 +320,9 @@ class BingXClient:
             result["tp"] = True
         except BingXError as e:
             logger.error(f"{symbol}: TP falló: {e}")
+
         import time as _t; _t.sleep(0.3)
+
         # SL
         sl_p = {"symbol": symbol, "side": close_side, "type": "STOP_MARKET",
                 "quantity": qty_str, "stopPrice": f"{sl_price:.8g}"}
