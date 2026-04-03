@@ -290,6 +290,56 @@ class BingXClient:
             logger.error(f"{symbol}: close_all_positions error: {e}")
             return False
 
+
+    # ─────────────────── TP / SL ─────────────────────────────────────────────
+
+    def place_tp_sl(self, symbol, direction, quantity, tp_price, sl_price, position_side=None):
+        """
+        Coloca TP y SL tras abrir posición.
+        direction: "long" o "short"
+        Retorna {"tp": bool, "sl": bool}
+        """
+        close_side = "SELL" if direction == "long" else "BUY"
+        ps = (position_side or ("LONG" if direction == "long" else "SHORT")).upper()
+        qty_str = f"{quantity:.6g}"
+        result = {"tp": False, "sl": False}
+        # TP
+        tp_p = {"symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+                "quantity": qty_str, "stopPrice": f"{tp_price:.8g}"}
+        if ps != "BOTH":
+            tp_p["positionSide"] = ps
+        try:
+            self._request("POST", "/openApi/swap/v2/trade/order", tp_p)
+            logger.info(f"{symbol}: TP OK @ ${tp_price:.6g}")
+            result["tp"] = True
+        except BingXError as e:
+            logger.error(f"{symbol}: TP falló: {e}")
+        import time as _t; _t.sleep(0.3)
+        # SL
+        sl_p = {"symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+                "quantity": qty_str, "stopPrice": f"{sl_price:.8g}"}
+        if ps != "BOTH":
+            sl_p["positionSide"] = ps
+        try:
+            self._request("POST", "/openApi/swap/v2/trade/order", sl_p)
+            logger.info(f"{symbol}: SL OK @ ${sl_price:.6g}")
+            result["sl"] = True
+        except BingXError as e:
+            logger.warning(f"{symbol}: SL STOP_MARKET falló, reintentando STOP: {e}")
+            offset = 0.999 if direction == "long" else 1.001
+            sl_p2 = {"symbol": symbol, "side": close_side, "type": "STOP",
+                     "quantity": qty_str, "stopPrice": f"{sl_price:.8g}",
+                     "price": f"{sl_price*offset:.8g}", "timeInForce": "GTC"}
+            if ps != "BOTH":
+                sl_p2["positionSide"] = ps
+            try:
+                self._request("POST", "/openApi/swap/v2/trade/order", sl_p2)
+                logger.info(f"{symbol}: SL(STOP) OK @ ${sl_price:.6g}")
+                result["sl"] = True
+            except BingXError as e2:
+                logger.error(f"{symbol}: SL también falló: {e2}")
+        return result
+
     # ─────────────────── telegram ─────────────────────────────────────────────
 
     def send_telegram(self, message: str):
