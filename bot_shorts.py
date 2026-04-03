@@ -1,8 +1,8 @@
 """
 Bot SHORT-Only Multi-Symbol — Zero Lag + Trend Reversal Probability
-v2.0 — Short Specialist mejorado
+v2.1 — Short Specialist
 
-FIXES vs v1.0:
+FIXES vs v2.0:
   FIX-1  LIMIT orders en entradas: fee 0.02% vs 0.05% (ahorra 60%)
   FIX-2  MIN_HOLD_MIN: evita cierres en segundos que solo pagan fees
   FIX-3  Filtro ATR: solo entra si hay volatilidad suficiente
@@ -13,6 +13,8 @@ FIXES vs v1.0:
   FIX-8  Confirmación de momentum bajista reforzada
   FIX-9  PnL neto con deducción de fees en reporte
   FIX-10 Anti-overtrading: max 1 entrada por ciclo
+  FIX-11 TP/SL solo se colocan cuando la posición existe (fix error 109420)
+         Si la orden es LIMIT y aún no se ejecutó, se reintenta en el próximo ciclo
 """
 
 import os
@@ -60,11 +62,11 @@ TELEGRAM_CHAT  = _senv("TELEGRAM_CHAT_ID",   "")
 # ── Estrategia ─────────────────────────────────────────────────
 TIMEFRAME      = _senv("TIMEFRAME",      "1h")
 LEVERAGE       = _senv("LEVERAGE",       "3",    int)
-RISK_PCT       = _senv("RISK_PCT",       "0.02", float)  # más conservador en shorts
+RISK_PCT       = _senv("RISK_PCT",       "0.02", float)
 ZLEMA_LENGTH   = _senv("ZLEMA_LENGTH",   "50",   int)
 BAND_MULT      = _senv("BAND_MULT",      "1.2",  float)
 OSC_PERIOD     = _senv("OSC_PERIOD",     "20",   int)
-ENTRY_MAX_PROB = _senv("ENTRY_MAX_PROB", "0.50", float)  # más estricto para shorts
+ENTRY_MAX_PROB = _senv("ENTRY_MAX_PROB", "0.50", float)
 EXIT_PROB      = _senv("EXIT_PROB",      "0.78", float)
 TP_PCT         = _senv("TP_PCT",         "4.0",  float)
 SL_PCT         = _senv("SL_PCT",         "2.0",  float)
@@ -82,15 +84,15 @@ MAX_OPEN_TRADES = _senv("MAX_OPEN_TRADES", "2",       int)
 MIN_VOLUME_24H  = _senv("MIN_VOLUME_24H",  "5000000", float)
 MAX_SYMBOLS     = _senv("MAX_SYMBOLS",     "20",      int)
 SCAN_INTERVAL   = _senv("SCAN_INTERVAL",   "600",     int)
-COOLDOWN_MIN    = _senv("COOLDOWN_MIN",    "90",      int)   # shorts necesitan más cooldown
+COOLDOWN_MIN    = _senv("COOLDOWN_MIN",    "90",      int)
 USE_LIMIT       = _senv("USE_LIMIT_ORDERS","true").lower() == "true"
 MIN_HOLD_MIN    = _senv("MIN_HOLD_MIN",    "20",      int)
-MIN_ATR_PCT     = _senv("MIN_ATR_PCT",     "0.6",     float)  # shorts necesitan más volatilidad
+MIN_ATR_PCT     = _senv("MIN_ATR_PCT",     "0.6",     float)
 USE_BTC_FILTER  = _senv("USE_BTC_FILTER",  "true").lower() == "true"
-MAX_LOSS_STREAK = _senv("MAX_LOSS_STREAK", "2",       int)    # blacklist más agresivo en shorts
-MAX_PUMP_PCT    = _senv("SH_MAX_PUMP_PCT", "4.0",     float)  # excluir si subió > 4% en 24h
-MIN_DROP_PCT    = _senv("SH_MIN_DROP_PCT", "0.4",     float)  # caída mínima confirmada
-MIN_RED_CANDLES = _senv("SH_MIN_RED_CANDLES","2",     int)    # velas rojas mínimas
+MAX_LOSS_STREAK = _senv("MAX_LOSS_STREAK", "2",       int)
+MAX_PUMP_PCT    = _senv("SH_MAX_PUMP_PCT", "4.0",     float)
+MIN_DROP_PCT    = _senv("SH_MIN_DROP_PCT", "0.4",     float)
+MIN_RED_CANDLES = _senv("SH_MIN_RED_CANDLES","2",     int)
 FEE_RATE        = 0.0002 if USE_LIMIT else 0.0005
 
 EXCLUDED = {
@@ -178,14 +180,12 @@ def get_symbols() -> list:
                 change = float(t.get("priceChangePercent", 0))
                 if vol < MIN_VOLUME_24H or price < 0.000001:
                     continue
-                # Excluir pumps — muy arriesgado shortear
                 if change > MAX_PUMP_PCT:
                     continue
                 items.append({"symbol": sym, "vol": vol, "change": change})
             except Exception:
                 continue
 
-        # Primero los que más bajaron (mejores candidatos short)
         items.sort(key=lambda x: x["change"])
         symbols = [x["symbol"] for x in items[:MAX_SYMBOLS]]
         last_scan_ts = now
@@ -279,18 +279,15 @@ def has_bearish_momentum(df: pd.DataFrame) -> bool:
     closes = df["close"].values
     opens  = df["open"].values
 
-    # Caída porcentual en las últimas velas
     drop = (closes[-5] - closes[-1]) / closes[-5] * 100
     if drop < MIN_DROP_PCT:
         return False
 
-    # Contar velas rojas recientes
     red = sum(1 for i in range(-MIN_RED_CANDLES - 1, 0)
               if closes[i] < opens[i])
     if red < MIN_RED_CANDLES:
         return False
 
-    # El precio actual debe estar por debajo de la media reciente
     avg_close = sum(closes[-6:-1]) / 5
     if closes[-1] >= avg_close:
         return False
@@ -325,18 +322,45 @@ def sync_all_positions():
                     "sl_price":      open_trades.get(sym, {}).get("sl_price", 0),
                     "opened_at":     open_trades.get(sym, {}).get("opened_at",
                                      datetime.now(timezone.utc)),
+                    "tp_sl_placed":  open_trades.get(sym, {}).get("tp_sl_placed", False),
                 }
         for sym in list(open_trades.keys()):
             if sym not in real:
                 logger.info(f"  [SYNC] {sym} cerrado externamente")
                 del open_trades[sym]
-        # Solo recuperar shorts
         for sym, info in real.items():
             if sym not in open_trades and info["position"] == "short":
                 logger.info(f"  [SYNC] Recuperando SHORT {sym}")
                 open_trades[sym] = info
     except Exception as e:
         logger.warning(f"sync error: {e}")
+
+
+def _try_place_tp_sl(symbol: str):
+    """
+    FIX-11: Intenta colocar TP/SL solo si la posición ya existe en BingX.
+    Se llama tanto al abrir como en cada ciclo de monitoreo hasta que se confirme.
+    """
+    t = open_trades.get(symbol)
+    if not t or t.get("tp_sl_placed", False):
+        return
+
+    positions = client.get_positions(symbol)
+    pos_exists = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
+
+    if not pos_exists:
+        logger.info(f"  {symbol}: posición aún no confirmada — TP/SL pendientes")
+        return
+
+    tp_sl = client.place_tp_sl(
+        symbol, "short",
+        t["entry_qty"], t["tp_price"], t["sl_price"],
+        position_side=t["position_side"],
+    )
+    open_trades[symbol]["tp_sl_placed"] = True
+    tp_icon = "✅" if tp_sl["tp"] else "❌"
+    sl_icon = "✅" if tp_sl["sl"] else "❌"
+    logger.info(f"  {symbol}: TP {tp_icon} SL {sl_icon} colocados (posición confirmada)")
 
 
 # ─────────────────────── CORE LOGIC ──────────────────────────
@@ -351,7 +375,6 @@ def handle_exit(symbol: str, signals: dict, reason: str):
     qty       = t["entry_qty"]
     opened_at = t["opened_at"]
 
-    # FIX-2: respetar tiempo mínimo para salidas por señal
     hold_mins    = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60
     is_signal    = "prob" in reason.lower() or "tendencia" in reason.lower()
     is_emergency = "sl" in reason.lower() or "tp" in reason.lower()
@@ -360,7 +383,6 @@ def handle_exit(symbol: str, signals: dict, reason: str):
         logger.info(f"  {symbol}: holding mínimo {hold_mins:.1f}/{MIN_HOLD_MIN}min — ignorando señal")
         return
 
-    # SHORT: ganamos cuando el precio baja
     pnl_usd     = qty * (entry - current)
     notional    = qty * entry * LEVERAGE
     fee_total   = notional * FEE_RATE * 2
@@ -405,7 +427,6 @@ def handle_short_entry(symbol: str, signals: dict, balance: float, df: pd.DataFr
     if qty <= 0:
         return
 
-    # FIX-5: TP/SL dinámicos basados en ATR
     atr_val = calc_atr(df, 14)
     if USE_ATR_TPSL and atr_val > 0:
         tp_dist = atr_val * ATR_TP_MULT
@@ -416,12 +437,10 @@ def handle_short_entry(symbol: str, signals: dict, balance: float, df: pd.DataFr
         tp_pct = TP_PCT
         sl_pct = SL_PCT
 
-    # TP mínimo para cubrir fees
     min_tp = (FEE_RATE * 2 * LEVERAGE * 100) + 1.5
     tp_pct = max(tp_pct, min_tp, TP_PCT)
     sl_pct = max(sl_pct, SL_PCT)
 
-    # Para shorts: TP abajo, SL arriba
     tp_price = price * (1 - tp_pct / 100)
     sl_price = price * (1 + sl_pct / 100)
 
@@ -437,9 +456,8 @@ def handle_short_entry(symbol: str, signals: dict, balance: float, df: pd.DataFr
     try:
         client.set_leverage(symbol, LEVERAGE)
 
-        # FIX-1: LIMIT order para reducir fee
         if USE_LIMIT:
-            offset = 1 + 0.0003  # un poco por encima para vender short
+            offset = 1 + 0.0003
             limit_price = round(price * offset, 8)
             params = {
                 "symbol":       symbol,
@@ -460,8 +478,7 @@ def handle_short_entry(symbol: str, signals: dict, balance: float, df: pd.DataFr
         else:
             client.place_market_order(symbol, "SELL", qty, position_side=pos_side)
 
-        time.sleep(2)
-
+        # Registrar trade ANTES de intentar TP/SL
         open_trades[symbol] = {
             "position":      "short",
             "entry_price":   price,
@@ -472,19 +489,26 @@ def handle_short_entry(symbol: str, signals: dict, balance: float, df: pd.DataFr
             "tp_pct":        round(tp_pct, 2),
             "sl_pct":        round(sl_pct, 2),
             "opened_at":     datetime.now(timezone.utc),
+            "tp_sl_placed":  False,   # FIX-11: flag para saber si TP/SL ya se puso
         }
 
-        tp_sl   = client.place_tp_sl(symbol, "short", qty, tp_price, sl_price, position_side=pos_side)
-        tp_icon = "✅" if tp_sl["tp"] else "❌"
-        sl_icon = "✅" if tp_sl["sl"] else "❌"
+        # FIX-11: esperar y verificar que la posición existe antes de poner TP/SL
+        time.sleep(2)
+        _try_place_tp_sl(symbol)
+
+        t = open_trades.get(symbol, {})
+        tp_sl_ok = t.get("tp_sl_placed", False)
+        tp_icon  = "✅" if tp_sl_ok else "⏳"
+        sl_icon  = "✅" if tp_sl_ok else "⏳"
         ord_type = "LIMIT" if USE_LIMIT else "MARKET"
 
         client.send_telegram(
-            f"<b>🔴 SHORT ABIERTO [Short Specialist v2]</b>\n"
+            f"<b>🔴 SHORT ABIERTO [Short Specialist v2.1]</b>\n"
             f"Par: {symbol} | TF: {TIMEFRAME} | {LEVERAGE}x | {ord_type}\n"
             f"Precio: ${price:.4f} | Qty: {qty}\n"
             f"TP {tp_icon}: ${tp_price:.4f} (-{tp_pct:.2f}%)\n"
             f"SL {sl_icon}: ${sl_price:.4f} (+{sl_pct:.2f}%)\n"
+            f"{'TP/SL pendientes confirmación posición' if not tp_sl_ok else ''}\n"
             f"Prob: {signals['probability']:.1%} | BTC 1h: {btc_trend_1h:+.2f}%\n"
             f"Balance: ${balance:.2f} USDT\n"
             f"Posiciones: {len(open_trades)}/{MAX_OPEN_TRADES}"
@@ -510,12 +534,16 @@ def analyze_symbol(symbol: str, balance: float):
             logger.debug(f"  {symbol} error: {e}")
             return
 
+        # FIX-11: si el TP/SL no se pudo colocar antes, reintentar ahora
+        if not t.get("tp_sl_placed", False):
+            _try_place_tp_sl(symbol)
+
         cur  = signals["close"]
         prob = signals["probability"]
         tp   = t.get("tp_price", 0)
         sl   = t.get("sl_price", 0)
 
-        # Verificar TP/SL manualmente
+        # Verificar TP/SL manualmente (por si las órdenes no se ejecutaron en BingX)
         if tp and sl:
             if cur <= tp:
                 handle_exit(symbol, signals, f"TP alcanzado ${cur:.4f}")
@@ -524,7 +552,6 @@ def analyze_symbol(symbol: str, balance: float):
                 handle_exit(symbol, signals, f"SL alcanzado ${cur:.4f}")
                 return
 
-        # Salida por señal
         if prob >= EXIT_PROB:
             handle_exit(symbol, signals, f"Prob reversión {prob:.1%}")
             return
@@ -539,7 +566,6 @@ def analyze_symbol(symbol: str, balance: float):
     if is_on_cooldown(symbol):
         return
 
-    # FIX-7: no shortear si BTC sube
     if USE_BTC_FILTER and btc_trend_1h > 1.5:
         return
 
@@ -557,19 +583,16 @@ def analyze_symbol(symbol: str, balance: float):
     if not signals["bearish_entry"]:
         return
 
-    # FIX-3: ATR mínimo
     atr_val = calc_atr(df, 14)
     atr_pct = atr_val / signals["close"] * 100
     if atr_pct < MIN_ATR_PCT:
         logger.debug(f"  {symbol}: ATR {atr_pct:.3f}% insuficiente")
         return
 
-    # FIX-8: momentum bajista confirmado
     if not has_bearish_momentum(df):
         logger.debug(f"  {symbol}: sin momentum bajista suficiente")
         return
 
-    # FIX-9: volumen ok
     if not vol_spike_ok(df):
         logger.debug(f"  {symbol}: volumen insuficiente")
         return
@@ -591,11 +614,12 @@ def send_report(balance: float):
         except Exception:
             cur = t["entry_price"]
         pct = (t["entry_price"] - cur) / t["entry_price"] * 100
-        pos_lines += f"  SHORT {sym}: {pct:+.2f}%\n"
+        tpsl_status = "✅" if t.get("tp_sl_placed") else "⏳"
+        pos_lines += f"  SHORT {sym}: {pct:+.2f}% TP/SL:{tpsl_status}\n"
 
     no_pos = "  sin posiciones\n"
     client.send_telegram(
-        f"<b>📊 Reporte Short Bot v2 #{stats['cycle']}</b>\n"
+        f"<b>📊 Reporte Short Bot v2.1 #{stats['cycle']}</b>\n"
         f"Balance: ${balance:.2f} USDT | BTC 1h: {btc_trend_1h:+.2f}%\n"
         f"Posiciones: {len(open_trades)}/{MAX_OPEN_TRADES}\n"
         f"{pos_lines if pos_lines else no_pos}"
@@ -611,7 +635,7 @@ def main():
     stats["account_mode"] = detect_account_mode()
 
     logger.info("=" * 70)
-    logger.info("  SHORT-Only Bot v2.0  |  Solo Shorts")
+    logger.info("  SHORT-Only Bot v2.1  |  Solo Shorts")
     logger.info(f"  TF:{TIMEFRAME} | LEV:{LEVERAGE}x | MaxTrades:{MAX_OPEN_TRADES}")
     logger.info(f"  Riesgo:{RISK_PCT:.0%}/op | MaxSymbols:{MAX_SYMBOLS}")
     logger.info(f"  TP:{TP_PCT}% SL:{SL_PCT}% | ATR TP/SL:{'ON' if USE_ATR_TPSL else 'OFF'}")
@@ -619,6 +643,7 @@ def main():
     logger.info(f"  MinHold:{MIN_HOLD_MIN}min | Cooldown:{COOLDOWN_MIN}min")
     logger.info(f"  Momentum: caída>{MIN_DROP_PCT}% + {MIN_RED_CANDLES} velas rojas")
     logger.info(f"  BTC filter:{'ON' if USE_BTC_FILTER else 'OFF'}")
+    logger.info(f"  FIX-11: TP/SL diferido hasta confirmar posición ✅")
     logger.info("=" * 70)
 
     if DEMO_MODE:
@@ -636,7 +661,7 @@ def main():
     update_btc_trend()
 
     client.send_telegram(
-        f"<b>🔴 Short-Only Bot v2.0 iniciado</b>\n"
+        f"<b>🔴 Short-Only Bot v2.1 iniciado</b>\n"
         f"TF:{TIMEFRAME} | LEV:{LEVERAGE}x | Max:{MAX_OPEN_TRADES} shorts\n"
         f"Símbolos: {len(symbols)} (vol>{MIN_VOLUME_24H/1e6:.0f}M, no pumps>{MAX_PUMP_PCT}%)\n"
         f"LIMIT: {'ON ✅ (fee 0.02%)' if USE_LIMIT else 'OFF ⚠️'}\n"
@@ -711,7 +736,7 @@ def main():
                 total = stats["wins"] + stats["losses"]
                 wr    = stats["wins"] / total * 100 if total > 0 else 0
                 client.send_telegram(
-                    f"<b>🔴 Short Bot v2 detenido</b>\n"
+                    f"<b>🔴 Short Bot v2.1 detenido</b>\n"
                     f"Trades: {total} | WR: {wr:.1f}%\n"
                     f"PnL neto: ${stats['total_pnl']:+.4f} USDT\n"
                     f"Fees pagadas: ${stats['total_fees']:.4f} USDT\n"
