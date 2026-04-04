@@ -1,8 +1,12 @@
 # ════════════════════════════════════════════════════════════════════
-# RAILWAY — VARIABLES DE ENTORNO v4.0
+# RAILWAY — VARIABLES v4.2 / v2.2
+# ════════════════════════════════════════════════════════════════════
+# ⚠️  IMPORTANTE: Borra todas las variables antiguas y pon solo estas.
+#    Las variables MAX_OPEN_TRADES=6 y MAX_TRADES_DAY=14 que tenías
+#    en Railway eran demasiado altas — ahora los defaults son 2 y 6.
 # ════════════════════════════════════════════════════════════════════
 
-# ── OBLIGATORIAS ─────────────────────────────────────────────────────
+# ── OBLIGATORIAS ──────────────────────────────────────────────────
 BINGX_API_KEY=TU_API_KEY_AQUI
 BINGX_SECRET_KEY=TU_SECRET_KEY_AQUI
 TELEGRAM_BOT_TOKEN=TU_TOKEN_AQUI
@@ -11,100 +15,87 @@ DEMO_MODE=false
 POSITION_MODE=auto
 
 # ════════════════════════════════════════════════════════════════════
-# BOT LONG+SHORT  (bot.py)
-# Procfile → worker: python bot.py
+# BOT LONG+SHORT — bot.py v4.2
+# Procfile: worker: python bot.py
 # ════════════════════════════════════════════════════════════════════
-
-# [CRÍTICO] Usa LIMIT orders → fee 0.02% vs 0.05% taker (ahorra 60%)
 USE_LIMIT_ORDERS=true
-
 TIMEFRAME=1h
 LEVERAGE=3
 RISK_PCT=0.03
-MAX_OPEN_TRADES=2
-
-# Escaneo de mercado
-MAX_SYMBOLS=15
-MIN_VOLUME_24H=5000000
+MAX_OPEN_TRADES=2        # ⚠️ NO subir — estaba en 6, causaba sobrexposición
+MAX_TRADES_DAY=6         # ⚠️ NO subir — estaba en 14, demasiados trades
+MAX_SYMBOLS=12
+MIN_VOLUME_24H=8000000
 SCAN_INTERVAL=600
 CHECK_INTERVAL=300
-
-# Señales
-ENTRY_MAX_PROB=0.55
+MIN_QUALITY=55           # NUEVO: score mínimo de señal (0-100)
+ENTRY_MAX_PROB=0.50
 EXIT_PROB=0.80
 ZLEMA_LENGTH=50
 BAND_MULT=1.2
 OSC_PERIOD=20
-
-# TP/SL (ATR dinámico)
 TP_PCT=4.5
 SL_PCT=2.0
 USE_ATR_TPSL=true
 ATR_TP_MULT=2.5
 ATR_SL_MULT=1.2
-
-# Anti-pérdidas
-COOLDOWN_MIN=60
-MIN_HOLD_MIN=15
-MIN_ATR_PCT=0.5
-MAX_LOSS_STREAK=3
-
-# Filtros
+COOLDOWN_MIN=90
+MIN_HOLD_MIN=20
+MIN_ATR_PCT=0.6
 USE_BTC_FILTER=true
+MAX_LOSS_STREAK=2
+MIN_BALANCE=15
+MIN_PROFIT_USDT=0.50     # NUEVO: no abrir si ganancia esperada < $0.50
 ALLOW_SHORT=true
-MIN_BALANCE=10
 REPORT_EVERY=12
 
-
 # ════════════════════════════════════════════════════════════════════
-# BOT SHORT-ONLY  (bot_shorts.py)
-# Procfile → worker: python bot_shorts.py
-# Variables con prefijo SH_ tienen prioridad sobre las sin prefijo
+# BOT SHORTS — bot_shorts.py v2.2
+# Procfile: worker: python bot_shorts.py
 # ════════════════════════════════════════════════════════════════════
-
 SH_USE_LIMIT_ORDERS=true
-
 SH_TIMEFRAME=1h
 SH_LEVERAGE=3
 SH_RISK_PCT=0.02
 SH_MAX_OPEN_TRADES=2
-
-SH_MAX_SYMBOLS=20
-SH_MIN_VOLUME_24H=5000000
+SH_MAX_TRADES_DAY=4
+SH_MAX_SYMBOLS=15
+SH_MIN_VOLUME_24H=8000000
 SH_CHECK_INTERVAL=300
-
-SH_ENTRY_MAX_PROB=0.50
+SH_MIN_QUALITY=60
+SH_ENTRY_MAX_PROB=0.45
 SH_EXIT_PROB=0.78
 SH_ZLEMA_LENGTH=50
-
 SH_TP_PCT=4.0
 SH_SL_PCT=2.0
 SH_USE_ATR_TPSL=true
 SH_ATR_TP_MULT=2.2
 SH_ATR_SL_MULT=1.1
-
-SH_COOLDOWN_MIN=90
-SH_MIN_HOLD_MIN=20
-SH_MIN_ATR_PCT=0.6
-SH_MAX_LOSS_STREAK=2
-
+SH_COOLDOWN_MIN=120
+SH_MIN_HOLD_MIN=25
+SH_MIN_ATR_PCT=0.7
 SH_USE_BTC_FILTER=true
+SH_MAX_LOSS_STREAK=2
+SH_MIN_BALANCE=15
+SH_MIN_PROFIT_USDT=0.40
 SH_MAX_PUMP_PCT=4.0
-SH_MIN_DROP_PCT=0.4
-SH_MIN_RED_CANDLES=2
+SH_MIN_DROP_PCT=0.5
+SH_MIN_RED_CANDLES=3
 SH_REPORT_EVERY=12
 
 # ════════════════════════════════════════════════════════════════════
-# RESUMEN DE MEJORAS v4.0
+# RESUMEN DE FIXES v4.2 / v2.2 / strategy v2.0
 # ════════════════════════════════════════════════════════════════════
-# ✅ LIMIT orders: fee 0.02% vs 0.05% — ahorra ~60% en comisiones
-# ✅ Menos trades: 300s ciclo vs 60s — de ~574 a ~60 trades/semana
-# ✅ TP mayor: 4.5% vs 2.5% — cada winner cubre más pérdidas
-# ✅ Cooldown 60min: evita re-entrar al mismo par en pérdida
-# ✅ MinHold 15min: elimina trades de 9 segundos
-# ✅ Blacklist: excluye pares con 3+ pérdidas consecutivas
-# ✅ Filtro BTC: no longs si BTC cae >1.5%, no shorts si sube >1.5%
-# ✅ Filtro ATR: solo entra si hay volatilidad suficiente para cubrir fees
-# ✅ TP/SL dinámicos con ATR: se adapta a la volatilidad del par
-# ✅ Max 2 trades abiertos: menos exposición, más selectivo
+# ✅ TP/SL workingType=MARK_PRICE — elimina el ⚠️ en posiciones
+# ✅ 3 intentos TP/SL (MARK_PRICE → CONTRACT_PRICE → STOP limit)
+# ✅ Reintento automático TP/SL si quedan en ⚠️ al ciclo siguiente
+# ✅ cancel_symbol_orders antes de cerrar posición (limpia órdenes huérfanas)
+# ✅ MIN_PROFIT_USDT: no abrir si ganancia esperada < $0.50
+# ✅ Quality score 0-100 en strategy.py (RSI + fuerza + oscilador)
+# ✅ Filtro consolidación (ranging): no entrar si rango < 1.5%
+# ✅ RSI filter: no longs si RSI>70, no shorts si RSI<30
+# ✅ _opening set: anti-doble apertura + _closing: anti-doble cierre
+# ✅ PnL diario separado del acumulado en reportes
+# ✅ MAX_OPEN=2 MAX_DAY=6 como defaults correctos
+# ✅ Blacklist tras 2 pérdidas (era 3), cooldown ×6 con pérdida grande
 # ════════════════════════════════════════════════════════════════════
