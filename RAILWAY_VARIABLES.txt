@@ -1,6 +1,6 @@
 # ════════════════════════════════════════════════════════════════════
-# RAILWAY — VARIABLES v5.0 / v3.0
-# ⚠️  BORRA TODAS LAS VARIABLES ANTERIORES — pon solo estas
+# RAILWAY — VARIABLES v5.1 Adaptive Learning
+# ⚠️  BORRA TODAS LAS VARIABLES ANTERIORES
 # ════════════════════════════════════════════════════════════════════
 
 BINGX_API_KEY=TU_API_KEY
@@ -11,17 +11,17 @@ DEMO_MODE=false
 POSITION_MODE=auto
 
 # ════════════════════════════════════════════════════════════════════
-# BOT LONG+SHORT — bot.py v5.0
+# BOT LONG+SHORT — bot.py v5.1
 # Procfile: worker: python bot.py
 # ════════════════════════════════════════════════════════════════════
 TIMEFRAME=1h
 LEVERAGE=3
 RISK_PCT=0.03
-MAX_OPEN_TRADES=2       # ⚠️ hard cap 2 en código, no se puede subir
-MAX_TRADES_DAY=4        # ⚠️ hard cap 4 en código, no se puede subir
-DAILY_LOSS_LIMIT=5.0    # pausa 2h si pierde $5 en el día
-MAX_SYMBOLS=10          # solo top 10 por volumen (sin memes)
-MIN_VOLUME_24H=10000000 # 10M USDT mínimo
+MAX_OPEN_TRADES=2        # hard cap 2
+MAX_TRADES_DAY=4         # hard cap 4
+DAILY_LOSS_LIMIT=5.0
+MAX_SYMBOLS=12
+MIN_VOLUME_24H=10000000
 SCAN_INTERVAL=900
 CHECK_INTERVAL=300
 MIN_QUALITY=60
@@ -45,15 +45,19 @@ MIN_PROFIT_USDT=0.80
 ALLOW_SHORT=true
 REPORT_EVERY=12
 
+# ── Memoria Adaptativa (NUEVO) ────────────────────────────────────
+MEMORY_MIN_WR=30         # Skip símbolo si WR histórica < 30%
+MEMORY_MAX_LOSS=3        # Skip símbolo si 3 pérdidas consecutivas
+
 # ════════════════════════════════════════════════════════════════════
-# BOT SHORTS — bot_shorts.py v3.0
+# BOT SHORTS — bot_shorts.py v3.0 (sin cambios)
 # Procfile: worker: python bot_shorts.py
 # ════════════════════════════════════════════════════════════════════
 SH_TIMEFRAME=1h
 SH_LEVERAGE=3
 SH_RISK_PCT=0.02
-SH_MAX_OPEN_TRADES=2    # hard cap 2
-SH_MAX_TRADES_DAY=3     # hard cap 3
+SH_MAX_OPEN_TRADES=2
+SH_MAX_TRADES_DAY=3
 SH_DAILY_LOSS_LIMIT=4.0
 SH_MAX_SYMBOLS=12
 SH_MIN_VOLUME_24H=10000000
@@ -76,22 +80,23 @@ SH_MIN_RED_CANDLES=3
 SH_REPORT_EVERY=12
 
 # ════════════════════════════════════════════════════════════════════
-# POR QUÉ SE PERDIÓ DINERO — CAUSA RAÍZ
+# CÓMO FUNCIONA EL APRENDIZAJE ADAPTATIVO
 # ════════════════════════════════════════════════════════════════════
-# BOMEUSDT tenía 12 órdenes LIMIT acumuladas sin ejecutar.
-# El bot usaba LIMIT orders para entrar (ahorro 0.03% de fee).
-# Cada ciclo el precio no llegaba al límite → orden pendiente.
-# Al ciclo siguiente, el bot no veía posición → nueva orden LIMIT.
-# Tras 12 ciclos → 12 órdenes. Cuando el precio bajó fuerte,
-# las 12 ejecutaron a la vez → posición 12x más grande de lo previsto
-# → SL activado × 12 = pérdida masiva.
+# Cada vez que se cierra un trade, se guarda en /tmp/symbol_memory.json:
+#   - PnL, dirección, tiempo de holding, TP/SL usados
+#   - Win rate acumulado por símbolo
+#   - Pérdidas consecutivas recientes
 #
-# SOLUCIÓN v5.0:
-# ✅ SOLO MARKET orders: ejecución garantizada, nunca se acumulan
-# ✅ cleanup_all_orders() al arrancar: elimina órdenes huérfanas
-# ✅ Verificación de posición real (15s) antes de registrarla
-# ✅ Hard cap MAX_OPEN=2 MAX_DAY=4 en código (no configurable)
-# ✅ Circuit breaker: pausa 2h si pérdida > $5/día
-# ✅ Memes excluidos (BOME, PEPE, SHIB) — demasiado volátiles
-# ✅ PnL solo del día actual (no acumula sesiones anteriores)
+# Al buscar nuevas entradas, el bot:
+#   1. Excluye símbolos con 3+ pérdidas consecutivas (STOUSDT ← esto lo habría evitado)
+#   2. Excluye símbolos con WR < 30% (con ≥5 trades)
+#   3. Ordena la lista por score histórico (PIPPIN, SIREN primero)
+#   4. Ajusta TP/SL si el símbolo tiene historial de tocar SL frecuente
+#
+# En Telegram verás en cada trade:
+#   "Memoria: WR_hist:67%(6t) | Score_hist:82"
+#   "STOUSDT: WR:0% PnL:-$4.69 (3t)" → no se abre
+#
+# El archivo persiste entre reinicios de Railway.
+# Se resetea solo si lo eliminas manualmente.
 # ════════════════════════════════════════════════════════════════════
