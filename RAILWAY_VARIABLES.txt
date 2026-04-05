@@ -1,101 +1,97 @@
 # ════════════════════════════════════════════════════════════════════
-# RAILWAY — VARIABLES v4.2 / v2.2
-# ════════════════════════════════════════════════════════════════════
-# ⚠️  IMPORTANTE: Borra todas las variables antiguas y pon solo estas.
-#    Las variables MAX_OPEN_TRADES=6 y MAX_TRADES_DAY=14 que tenías
-#    en Railway eran demasiado altas — ahora los defaults son 2 y 6.
+# RAILWAY — VARIABLES v5.0 / v3.0
+# ⚠️  BORRA TODAS LAS VARIABLES ANTERIORES — pon solo estas
 # ════════════════════════════════════════════════════════════════════
 
-# ── OBLIGATORIAS ──────────────────────────────────────────────────
-BINGX_API_KEY=TU_API_KEY_AQUI
-BINGX_SECRET_KEY=TU_SECRET_KEY_AQUI
-TELEGRAM_BOT_TOKEN=TU_TOKEN_AQUI
-TELEGRAM_CHAT_ID=TU_CHAT_ID_AQUI
+BINGX_API_KEY=TU_API_KEY
+BINGX_SECRET_KEY=TU_SECRET_KEY
+TELEGRAM_BOT_TOKEN=TU_TOKEN
+TELEGRAM_CHAT_ID=TU_CHAT_ID
 DEMO_MODE=false
 POSITION_MODE=auto
 
 # ════════════════════════════════════════════════════════════════════
-# BOT LONG+SHORT — bot.py v4.2
+# BOT LONG+SHORT — bot.py v5.0
 # Procfile: worker: python bot.py
 # ════════════════════════════════════════════════════════════════════
-USE_LIMIT_ORDERS=true
 TIMEFRAME=1h
 LEVERAGE=3
 RISK_PCT=0.03
-MAX_OPEN_TRADES=2        # ⚠️ NO subir — estaba en 6, causaba sobrexposición
-MAX_TRADES_DAY=6         # ⚠️ NO subir — estaba en 14, demasiados trades
-MAX_SYMBOLS=12
-MIN_VOLUME_24H=8000000
-SCAN_INTERVAL=600
+MAX_OPEN_TRADES=2       # ⚠️ hard cap 2 en código, no se puede subir
+MAX_TRADES_DAY=4        # ⚠️ hard cap 4 en código, no se puede subir
+DAILY_LOSS_LIMIT=5.0    # pausa 2h si pierde $5 en el día
+MAX_SYMBOLS=10          # solo top 10 por volumen (sin memes)
+MIN_VOLUME_24H=10000000 # 10M USDT mínimo
+SCAN_INTERVAL=900
 CHECK_INTERVAL=300
-MIN_QUALITY=55           # NUEVO: score mínimo de señal (0-100)
-ENTRY_MAX_PROB=0.50
+MIN_QUALITY=60
+ENTRY_MAX_PROB=0.45
 EXIT_PROB=0.80
 ZLEMA_LENGTH=50
 BAND_MULT=1.2
 OSC_PERIOD=20
-TP_PCT=4.5
-SL_PCT=2.0
+TP_PCT=5.0
+SL_PCT=2.5
 USE_ATR_TPSL=true
-ATR_TP_MULT=2.5
-ATR_SL_MULT=1.2
-COOLDOWN_MIN=90
-MIN_HOLD_MIN=20
-MIN_ATR_PCT=0.6
+ATR_TP_MULT=3.0
+ATR_SL_MULT=1.5
+COOLDOWN_MIN=120
+MIN_HOLD_MIN=30
+MIN_ATR_PCT=0.8
 USE_BTC_FILTER=true
 MAX_LOSS_STREAK=2
-MIN_BALANCE=15
-MIN_PROFIT_USDT=0.50     # NUEVO: no abrir si ganancia esperada < $0.50
+MIN_BALANCE=20
+MIN_PROFIT_USDT=0.80
 ALLOW_SHORT=true
 REPORT_EVERY=12
 
 # ════════════════════════════════════════════════════════════════════
-# BOT SHORTS — bot_shorts.py v2.2
+# BOT SHORTS — bot_shorts.py v3.0
 # Procfile: worker: python bot_shorts.py
 # ════════════════════════════════════════════════════════════════════
-SH_USE_LIMIT_ORDERS=true
 SH_TIMEFRAME=1h
 SH_LEVERAGE=3
 SH_RISK_PCT=0.02
-SH_MAX_OPEN_TRADES=2
-SH_MAX_TRADES_DAY=4
-SH_MAX_SYMBOLS=15
-SH_MIN_VOLUME_24H=8000000
+SH_MAX_OPEN_TRADES=2    # hard cap 2
+SH_MAX_TRADES_DAY=3     # hard cap 3
+SH_DAILY_LOSS_LIMIT=4.0
+SH_MAX_SYMBOLS=12
+SH_MIN_VOLUME_24H=10000000
 SH_CHECK_INTERVAL=300
-SH_MIN_QUALITY=60
-SH_ENTRY_MAX_PROB=0.45
+SH_MIN_QUALITY=65
+SH_ENTRY_MAX_PROB=0.40
 SH_EXIT_PROB=0.78
-SH_ZLEMA_LENGTH=50
-SH_TP_PCT=4.0
-SH_SL_PCT=2.0
-SH_USE_ATR_TPSL=true
-SH_ATR_TP_MULT=2.2
-SH_ATR_SL_MULT=1.1
-SH_COOLDOWN_MIN=120
-SH_MIN_HOLD_MIN=25
-SH_MIN_ATR_PCT=0.7
+SH_TP_PCT=5.0
+SH_SL_PCT=2.5
+SH_COOLDOWN_MIN=180
+SH_MIN_HOLD_MIN=30
+SH_MIN_ATR_PCT=1.0
 SH_USE_BTC_FILTER=true
 SH_MAX_LOSS_STREAK=2
-SH_MIN_BALANCE=15
-SH_MIN_PROFIT_USDT=0.40
-SH_MAX_PUMP_PCT=4.0
-SH_MIN_DROP_PCT=0.5
+SH_MIN_BALANCE=20
+SH_MIN_PROFIT_USDT=0.60
+SH_MAX_PUMP_PCT=5.0
+SH_MIN_DROP_PCT=0.8
 SH_MIN_RED_CANDLES=3
 SH_REPORT_EVERY=12
 
 # ════════════════════════════════════════════════════════════════════
-# RESUMEN DE FIXES v4.2 / v2.2 / strategy v2.0
+# POR QUÉ SE PERDIÓ DINERO — CAUSA RAÍZ
 # ════════════════════════════════════════════════════════════════════
-# ✅ TP/SL workingType=MARK_PRICE — elimina el ⚠️ en posiciones
-# ✅ 3 intentos TP/SL (MARK_PRICE → CONTRACT_PRICE → STOP limit)
-# ✅ Reintento automático TP/SL si quedan en ⚠️ al ciclo siguiente
-# ✅ cancel_symbol_orders antes de cerrar posición (limpia órdenes huérfanas)
-# ✅ MIN_PROFIT_USDT: no abrir si ganancia esperada < $0.50
-# ✅ Quality score 0-100 en strategy.py (RSI + fuerza + oscilador)
-# ✅ Filtro consolidación (ranging): no entrar si rango < 1.5%
-# ✅ RSI filter: no longs si RSI>70, no shorts si RSI<30
-# ✅ _opening set: anti-doble apertura + _closing: anti-doble cierre
-# ✅ PnL diario separado del acumulado en reportes
-# ✅ MAX_OPEN=2 MAX_DAY=6 como defaults correctos
-# ✅ Blacklist tras 2 pérdidas (era 3), cooldown ×6 con pérdida grande
+# BOMEUSDT tenía 12 órdenes LIMIT acumuladas sin ejecutar.
+# El bot usaba LIMIT orders para entrar (ahorro 0.03% de fee).
+# Cada ciclo el precio no llegaba al límite → orden pendiente.
+# Al ciclo siguiente, el bot no veía posición → nueva orden LIMIT.
+# Tras 12 ciclos → 12 órdenes. Cuando el precio bajó fuerte,
+# las 12 ejecutaron a la vez → posición 12x más grande de lo previsto
+# → SL activado × 12 = pérdida masiva.
+#
+# SOLUCIÓN v5.0:
+# ✅ SOLO MARKET orders: ejecución garantizada, nunca se acumulan
+# ✅ cleanup_all_orders() al arrancar: elimina órdenes huérfanas
+# ✅ Verificación de posición real (15s) antes de registrarla
+# ✅ Hard cap MAX_OPEN=2 MAX_DAY=4 en código (no configurable)
+# ✅ Circuit breaker: pausa 2h si pérdida > $5/día
+# ✅ Memes excluidos (BOME, PEPE, SHIB) — demasiado volátiles
+# ✅ PnL solo del día actual (no acumula sesiones anteriores)
 # ════════════════════════════════════════════════════════════════════
