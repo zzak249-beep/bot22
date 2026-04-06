@@ -1,7 +1,23 @@
 """
-Bot SHORT-Only Multi-Symbol — v3.0
-Mismos fixes CRÍTICOS que bot.py v5.0.
-MARKET ONLY, cleanup al arrancar, circuit breaker, sin memes.
+Bot Conservador v6.0 — Menos es más
+
+FILOSOFÍA: Después de análisis de 89 páginas de trades perdedores, la
+conclusión es clara: el problema no es el código, es la frecuencia.
+Demasiados trades × pequeñas pérdidas = pérdida total grande.
+
+Este bot opera con estas reglas absolutas:
+  • Solo 3 pares: BTC-USDT, ETH-USDT, SOL-USDT
+  • Timeframe 4h (menos ruido, señales más fiables)
+  • Máximo 1 posición a la vez
+  • Máximo 2 trades por día
+  • SL monitoreado en código cada ciclo (no solo como orden)
+  • TP mínimo 3× el SL (ratio riesgo/beneficio real)
+  • Stop si pierde $3 en el día
+
+Basado en lo que funcionó en el historial:
+  • Holdings > 45 min → más rentables
+  • BTC/ETH/SOL → más predecibles
+  • Timeframe largo → menos señales falsas
 """
 
 import os, sys, time, json, logging
@@ -10,7 +26,6 @@ import pandas as pd
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from bingx_client import BingXClient, BingXError
-from strategy import calculate_signals
 
 load_dotenv()
 
@@ -22,653 +37,566 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ──────────────────────── CONFIG ─────────────────────────────
 
-def _senv(key, default=None, cast=str):
-    val = os.getenv(f"SH_{key}") or os.getenv(key, default)
-    if val is None:
-        raise EnvironmentError(f"Variable requerida: {key}")
-    return cast(val)
+def _e(k, d=None, t=str):
+    v = os.getenv(k, d)
+    return t(v) if v is not None else None
 
-API_KEY        = _senv("BINGX_API_KEY")
-SECRET_KEY     = _senv("BINGX_SECRET_KEY")
-TELEGRAM_TOKEN = _senv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = _senv("TELEGRAM_CHAT_ID",   "")
+API_KEY        = _e("BINGX_API_KEY")
+SECRET_KEY     = _e("BINGX_SECRET_KEY")
+TELEGRAM_TOKEN = _e("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT  = _e("TELEGRAM_CHAT_ID",   "")
+DEMO_MODE      = _e("DEMO_MODE", "false") == "true"
+POSITION_MODE  = _e("POSITION_MODE", "auto")
 
-TIMEFRAME       = _senv("TIMEFRAME",        "1h")
-LEVERAGE        = _senv("LEVERAGE",         "3",       int)
-RISK_PCT        = _senv("RISK_PCT",         "0.02",    float)
-ZLEMA_LENGTH    = _senv("ZLEMA_LENGTH",     "50",      int)
-BAND_MULT       = _senv("BAND_MULT",        "1.2",     float)
-OSC_PERIOD      = _senv("OSC_PERIOD",       "20",      int)
-MIN_QUALITY     = _senv("MIN_QUALITY",      "65",      int)
-ENTRY_MAX_PROB  = _senv("ENTRY_MAX_PROB",   "0.40",    float)
-EXIT_PROB       = _senv("EXIT_PROB",        "0.78",    float)
-TP_PCT          = _senv("TP_PCT",           "5.0",     float)
-SL_PCT          = _senv("SL_PCT",           "2.5",     float)
-USE_ATR_TPSL    = _senv("USE_ATR_TPSL",    "true").lower() == "true"
-ATR_TP_MULT     = _senv("ATR_TP_MULT",     "3.0",     float)
-ATR_SL_MULT     = _senv("ATR_SL_MULT",     "1.5",     float)
-CHECK_INTERVAL  = _senv("CHECK_INTERVAL",  "300",     int)
-DEMO_MODE       = _senv("DEMO_MODE",       "false").lower() == "true"
-MIN_BALANCE     = _senv("MIN_BALANCE",     "20",      float)
-POSITION_MODE   = _senv("POSITION_MODE",   "auto")
-REPORT_EVERY    = _senv("REPORT_EVERY",    "12",      int)
-MIN_VOLUME_24H  = _senv("MIN_VOLUME_24H",  "10000000",float)
-MAX_SYMBOLS     = _senv("MAX_SYMBOLS",     "12",      int)
-SCAN_INTERVAL   = _senv("SCAN_INTERVAL",  "900",     int)
-COOLDOWN_MIN    = _senv("COOLDOWN_MIN",   "180",     int)  # 3h para shorts
-MIN_HOLD_MIN    = _senv("MIN_HOLD_MIN",   "30",      int)
-MIN_ATR_PCT     = _senv("MIN_ATR_PCT",    "1.0",     float)
-USE_BTC_FILTER  = _senv("USE_BTC_FILTER","true").lower() == "true"
-MAX_LOSS_STREAK = _senv("MAX_LOSS_STREAK","2",       int)
-MIN_PROFIT_USDT = _senv("MIN_PROFIT_USDT","0.60",   float)
-DAILY_LOSS_LIM  = _senv("DAILY_LOSS_LIMIT","4.0",   float)
-MAX_PUMP_PCT    = _senv("SH_MAX_PUMP_PCT","5.0",     float)
-MIN_DROP_PCT    = _senv("SH_MIN_DROP_PCT","0.8",     float)
-MIN_RED_CANDLES = _senv("SH_MIN_RED_CANDLES","3",   int)
+# Pares — solo los más líquidos y predecibles
+SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
-MAX_OPEN_TRADES = min(_senv("MAX_OPEN_TRADES", "2", int), 2)
-MAX_TRADES_DAY  = min(_senv("MAX_TRADES_DAY",  "3", int), 3)
+TIMEFRAME   = "4h"       # 4h: menos ruido que 1h
+LEVERAGE    = 2          # bajado a 2x — más seguro
+RISK_PCT    = 0.02       # 2% del balance por trade
+TP_RATIO    = 3.0        # TP = 3 × SL (ratio mínimo)
+SL_PCT      = 2.0        # SL 2% → TP 6%
+CHECK_SEC   = 300        # ciclo cada 5 minutos
+MAX_DAY     = 2          # máximo 2 trades por día
+DAILY_STOP  = 3.0        # parar si pierde $3 en el día
+MIN_BAL     = 15.0       # balance mínimo para operar
+HOLD_MIN    = 60         # mantener posición al menos 60min
+COOLDOWN_H  = 4          # 4h de cooldown entre trades del mismo par
 
-FEE_RATE = 0.0005
-PNL_FILE = "/tmp/bot_shorts_v3_pnl.json"
+FEE = 0.0005  # MARKET taker fee BingX
 
-EXCLUDED = {
-    'DOW','SP500','GOLD','SILVER','XAU','OIL','BRENT',
-    'EUR','GBP','JPY','TSLA','AAPL','MSFT','NVDA',
-    'COIN','MSTR','WHEAT','CORN','BOME','PEPE','SHIB',
-}
+# ──────────────────────── INDICADORES ────────────────────────
 
-# ──────────────────────── STATE ──────────────────────────────
+def ema(prices, n):
+    if len(prices) < 2:
+        return prices[-1] if prices else 0
+    k, e = 2/(n+1), prices[0]
+    for p in prices[1:]:
+        e = p*k + e*(1-k)
+    return e
 
-client = BingXClient(
-    API_KEY, SECRET_KEY, demo=DEMO_MODE,
-    telegram_token=TELEGRAM_TOKEN, telegram_chat=TELEGRAM_CHAT,
-)
+def rsi(prices, n=14):
+    if len(prices) < n+1:
+        return 50.0
+    g = [max(0, prices[i]-prices[i-1]) for i in range(1, len(prices))]
+    l = [max(0, prices[i-1]-prices[i]) for i in range(1, len(prices))]
+    ag = sum(g[-n:])/n
+    al = sum(l[-n:])/n
+    return 100.0 if al == 0 else 100 - 100/(1 + ag/al)
 
-open_trades:      dict  = {}
-cooldowns:        dict  = {}
-blacklist:        dict  = {}
-_closing:         set   = set()
-_opening:         set   = set()
-_recently_closed: dict  = {}
-symbols:          list  = []
-last_scan_ts:     float = 0
-btc_trend_1h:     float = 0.0
-trades_today:     int   = 0
-pnl_today:        float = 0.0
-today_date:       str   = ""
-circuit_until:    float = 0.0
+def atr(highs, lows, closes, n=14):
+    if len(closes) < 2:
+        return 0
+    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+           for i in range(1, len(closes))]
+    return sum(trs[-n:])/n if trs else 0
 
-def _load_pnl():
-    try:
-        with open(PNL_FILE) as f:
-            d    = json.load(f)
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            if d.get("date", "") == today:
-                return (d.get("total_pnl",0.0), d.get("total_fees",0.0),
-                        d.get("wins",0), d.get("losses",0))
-    except Exception:
-        pass
-    return 0.0, 0.0, 0, 0
-
-_pnl0, _fees0, _wins0, _losses0 = _load_pnl()
-stats = {
-    "cycle":         0,
-    "wins":          _wins0,
-    "losses":        _losses0,
-    "total_pnl":     _pnl0,
-    "total_fees":    _fees0,
-    "start_balance": None,
-    "account_mode":  None,
-}
-
-def _save_pnl():
-    try:
-        with open(PNL_FILE, "w") as f:
-            json.dump({"date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                       "total_pnl": stats["total_pnl"], "total_fees": stats["total_fees"],
-                       "wins": stats["wins"], "losses": stats["losses"]}, f)
-    except Exception:
-        pass
-
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-
-def reset_daily_if_needed():
-    global trades_today, pnl_today, today_date, circuit_until
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if today != today_date:
-        trades_today  = 0
-        pnl_today     = 0.0
-        today_date    = today
-        circuit_until = 0.0
-
-def detect_account_mode():
-    if POSITION_MODE.lower() in ("hedge", "oneway"):
-        return POSITION_MODE.lower()
-    try:
-        for pos in client.get_positions("BTC-USDT"):
-            side = str(pos.get("positionSide","")).upper()
-            if side in ("LONG","SHORT"):
-                return "hedge"
-            elif side == "BOTH":
-                return "oneway"
-        return "hedge"
-    except Exception:
-        return "hedge"
-
-def check_circuit_breaker() -> bool:
-    if circuit_until and time.time() < circuit_until:
-        mins = int((circuit_until - time.time()) / 60)
-        log.warning(f"  [CIRCUIT SHORT] Pausado {mins}min")
-        return True
-    return False
-
-def maybe_trigger_circuit():
-    global circuit_until
-    if pnl_today < -abs(DAILY_LOSS_LIM):
-        circuit_until = time.time() + 2 * 3600
-        client.send_telegram(
-            f"<b>🔴 Circuit Breaker SHORT</b>\n"
-            f"Pérdida: ${pnl_today:.4f} > ${DAILY_LOSS_LIM}\nPausado 2h"
-        )
-
-def get_symbols():
-    global symbols, last_scan_ts
-    now = time.time()
-    if symbols and (now - last_scan_ts) < SCAN_INTERVAL:
-        return symbols
-    try:
-        d = req.get("https://open-api.bingx.com/openApi/swap/v2/quote/ticker", timeout=15).json()
-        if d.get("code") != 0:
-            return symbols or ["BTC-USDT","ETH-USDT"]
-        bl = {s for s, n in blacklist.items() if n >= MAX_LOSS_STREAK}
-        items = []
-        for t in d.get("data",[]):
-            sym = t.get("symbol","")
-            if not sym.endswith("-USDT"):
-                continue
-            base = sym.replace("-USDT","").upper()
-            if any(ex in base for ex in EXCLUDED) or sym in bl:
-                continue
-            try:
-                price  = float(t.get("lastPrice",0))
-                vol    = float(t.get("volume",0)) * price
-                change = float(t.get("priceChangePercent",0))
-                if vol < MIN_VOLUME_24H or price < 0.0001:
-                    continue
-                if change > MAX_PUMP_PCT:
-                    continue
-                items.append({"symbol":sym,"vol":vol,"change":change})
-            except Exception:
-                continue
-        items.sort(key=lambda x: x["change"])
-        symbols      = [x["symbol"] for x in items[:MAX_SYMBOLS]]
-        last_scan_ts = now
-        log.info(f"Símbolos SHORT: {len(symbols)}")
-        return symbols
-    except Exception as e:
-        log.warning(f"get_symbols: {e}")
-        return symbols or ["BTC-USDT","ETH-USDT"]
-
-def get_ohlcv(symbol):
-    klines = client.get_klines(symbol, TIMEFRAME, limit=200)
+def get_ohlcv(symbol, client_obj):
+    klines = client_obj.get_klines(symbol, TIMEFRAME, limit=100)
     if not klines:
         raise RuntimeError(f"Sin velas {symbol}")
     df = pd.DataFrame(klines)
     if isinstance(klines[0], dict):
         df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
     else:
-        df.columns = (["open_time","open","high","low","close","volume"]
-                      + list(range(len(df.columns)-6)))
+        df.columns = ["open_time","open","high","low","close","volume"] + list(range(len(df.columns)-6))
     for col in ("open","high","low","close","volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df.dropna(subset=["open","high","low","close"]).reset_index(drop=True)
 
-def calc_atr(df, period=14):
-    if len(df) < period + 1:
-        return 0.0
-    H, L, C = df["high"].values, df["low"].values, df["close"].values
-    trs = [max(H[i]-L[i], abs(H[i]-C[i-1]), abs(L[i]-C[i-1])) for i in range(1, len(C))]
-    return float(sum(trs[-period:]) / period)
-
-def calc_expected_profit(price, qty, tp_pct):
-    notional = qty * price * LEVERAGE
-    return notional * (tp_pct / 100) - notional * FEE_RATE * 2
-
-def calculate_qty(balance, price):
-    return max(round((balance * RISK_PCT * LEVERAGE) / price, 3), 0.001)
-
-def is_on_cooldown(symbol):
-    ts = cooldowns.get(symbol)
-    if not ts:
-        return False
-    if time.time() > ts:
-        del cooldowns[symbol]
-        return False
-    return True
-
-def set_cooldown(symbol, minutes=None):
-    cooldowns[symbol] = time.time() + (minutes or COOLDOWN_MIN) * 60
-
-def update_blacklist(symbol, win, pnl_net=0.0):
-    blacklist[symbol] = 0 if win else blacklist.get(symbol, 0) + 1
-    if not win and pnl_net < -0.80:
-        set_cooldown(symbol, 360)
-    if blacklist[symbol] >= MAX_LOSS_STREAK:
-        client.send_telegram(f"<b>⛔ Blacklist SHORT: {symbol}</b>")
-        set_cooldown(symbol, COOLDOWN_MIN * 10)
-
-def update_btc_trend():
-    global btc_trend_1h
+def analyze(symbol, client_obj):
+    """
+    Señal simple y robusta:
+    LONG:  precio > EMA50 4h + RSI entre 40-60 (tendencia alcista sin sobrecompra)
+           + precio rompió máximo de las últimas 3 velas
+    SHORT: precio < EMA50 4h + RSI entre 40-60 (tendencia bajista sin sobreventa)
+           + precio rompió mínimo de las últimas 3 velas
+    Retorna: ('long'|'short'|None, precio, sl_price, tp_price, descripción)
+    """
     try:
-        d = client.get_klines("BTC-USDT","1h",limit=3)
-        if d and len(d) >= 2:
-            closes = ([float(x["close"]) for x in d] if isinstance(d[0],dict)
-                      else [float(x[4]) for x in d])
-            btc_trend_1h = (closes[-1] - closes[-2]) / closes[-2] * 100
-    except Exception:
-        pass
-
-def has_bearish_momentum(df) -> bool:
-    if len(df) < 8:
-        return False
-    closes = df["close"].values
-    opens  = df["open"].values
-    if (closes[-5] - closes[-1]) / closes[-5] * 100 < MIN_DROP_PCT:
-        return False
-    red = sum(1 for i in range(-MIN_RED_CANDLES-1, 0) if closes[i] < opens[i])
-    if red < MIN_RED_CANDLES:
-        return False
-    if len(closes) >= 20 and closes[-1] >= sum(closes[-20:]) / 20:
-        return False
-    return closes[-1] < opens[-1]
-
-def sync_all_positions():
-    try:
-        all_pos = client.get_all_open_positions()
-        real = {}
-        for p in all_pos:
-            sym  = p.get("symbol","")
-            amt  = float(p.get("positionAmt",0))
-            ps   = str(p.get("positionSide","BOTH")).upper()
-            side = "long" if (ps == "LONG" or (ps == "BOTH" and amt > 0)) else "short"
-            real[sym] = {
-                "position":      side,
-                "entry_price":   float(p.get("avgPrice",0) or p.get("entryPrice",0)),
-                "entry_qty":     abs(amt),
-                "position_side": ps,
-                "tp_price":      open_trades.get(sym,{}).get("tp_price",0),
-                "sl_price":      open_trades.get(sym,{}).get("sl_price",0),
-                "has_tp_sl":     open_trades.get(sym,{}).get("has_tp_sl",False),
-                "opened_at":     open_trades.get(sym,{}).get("opened_at",
-                                 datetime.now(timezone.utc)),
-            }
-        for sym in list(open_trades.keys()):
-            if sym not in real:
-                del open_trades[sym]
-        now = time.time()
-        for sym, info in real.items():
-            if sym in open_trades:
-                continue
-            if now - _recently_closed.get(sym,0) < 300:
-                continue
-            if info["position"] == "short":
-                open_trades[sym] = info
+        df = get_ohlcv(symbol, client_obj)
     except Exception as e:
-        log.warning(f"sync: {e}")
+        return None, 0, 0, 0, str(e)
 
-# ─────────────────────── CORE LOGIC ──────────────────────────
+    closes = df["close"].tolist()
+    highs  = df["high"].tolist()
+    lows   = df["low"].tolist()
+    price  = closes[-1]
 
-def retry_tp_sl(symbol):
-    t = open_trades.get(symbol)
-    if not t or t.get("has_tp_sl") or not t.get("tp_price"):
-        return
-    tp_sl = client.place_tp_sl(symbol,"short",t["entry_qty"],
-                               t["tp_price"],t["sl_price"],t["position_side"])
-    if tp_sl["tp"] and tp_sl["sl"]:
-        open_trades[symbol]["has_tp_sl"] = True
-        client.send_telegram(f"<b>✅ TP/SL SHORT recolocados: {symbol}</b>")
+    e50   = ema(closes, 50)
+    e20   = ema(closes, 20)
+    r     = rsi(closes, 14)
+    a     = atr(highs, lows, closes, 14)
+    atr_pct = a / price * 100
 
+    # ATR mínimo: sin movimiento = sin trade
+    if atr_pct < 0.5:
+        return None, price, 0, 0, f"ATR bajo {atr_pct:.2f}%"
 
-def handle_exit(symbol, signals, reason):
-    if symbol not in open_trades or symbol in _closing:
-        return
-    _closing.add(symbol)
-    try:
-        if symbol not in open_trades:
-            return
-        t         = open_trades[symbol]
-        entry     = t["entry_price"]
-        current   = signals["close"]
-        qty       = t["entry_qty"]
-        opened_at = t["opened_at"]
-        hold_mins = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60
+    # ── LONG ─────────────────────────────────────────────────
+    # 1. Precio por encima de EMA50 y EMA20 (doble confirmación)
+    # 2. RSI en zona correcta (no sobrecomprado)
+    # 3. La vela actual rompe el máximo de las 3 anteriores (impulso)
+    # 4. EMA20 > EMA50 (alineación de medias)
+    recent_high = max(highs[-4:-1])
+    recent_low  = min(lows[-4:-1])
 
-        is_signal = any(w in reason.lower() for w in ("prob","tendencia"))
-        if is_signal and hold_mins < MIN_HOLD_MIN:
-            _closing.discard(symbol)
-            return
+    long_ok = (
+        price > e50 and
+        price > e20 and
+        e20 > e50 and           # tendencia alcista confirmada
+        40 <= r <= 65 and        # RSI: no sobrecomprado
+        price > recent_high and  # ruptura de máximo reciente
+        closes[-1] > closes[-2] # vela actual alcista
+    )
 
-        pnl_usd   = qty * (entry - current)
-        notional  = qty * entry * LEVERAGE
-        fee_total = notional * FEE_RATE * 2
-        pnl_net   = pnl_usd - fee_total
-        win       = pnl_net > 0
+    short_ok = (
+        price < e50 and
+        price < e20 and
+        e20 < e50 and            # tendencia bajista confirmada
+        35 <= r <= 60 and        # RSI: no sobrevendido
+        price < recent_low and   # ruptura de mínimo reciente
+        closes[-1] < closes[-2]  # vela actual bajista
+    )
 
-        stats["total_pnl"]  += pnl_net
-        stats["total_fees"] += fee_total
-        global pnl_today
-        pnl_today += pnl_net
-        if win:  stats["wins"]   += 1
-        else:    stats["losses"] += 1
+    # Calcular TP/SL basado en ATR real
+    sl_dist = max(a * 1.5, price * SL_PCT / 100)
+    tp_dist = sl_dist * TP_RATIO
 
-        _save_pnl()
-        update_blacklist(symbol, win, pnl_net)
+    if long_ok:
+        sl = price - sl_dist
+        tp = price + tp_dist
+        sl_p = sl_dist / price * 100
+        tp_p = tp_dist / price * 100
+        desc = f"LONG | EMA50:{e50:.4f} EMA20:{e20:.4f} RSI:{r:.0f} ATR:{atr_pct:.2f}%"
+        return "long", price, round(sl, 6), round(tp, 6), desc
 
-        client.cleanup_symbol_orders(symbol)
-        time.sleep(0.5)
-        client.close_all_positions(symbol)
-        _recently_closed[symbol] = time.time()
-        del open_trades[symbol]
+    if short_ok:
+        sl = price + sl_dist
+        tp = price - tp_dist
+        sl_p = sl_dist / price * 100
+        tp_p = tp_dist / price * 100
+        desc = f"SHORT | EMA50:{e50:.4f} EMA20:{e20:.4f} RSI:{r:.0f} ATR:{atr_pct:.2f}%"
+        return "short", price, round(sl, 6), round(tp, 6), desc
 
-        total = stats["wins"] + stats["losses"]
-        wr    = stats["wins"] / total * 100 if total > 0 else 0
-        emoji = "✅" if win else "❌"
-        client.send_telegram(
-            f"<b>{emoji} SHORT CERRADO — {reason}</b>\n"
-            f"{symbol} | ${entry:.4f} → ${current:.4f} | {int(hold_mins)}min\n"
-            f"PnL neto: <b>${pnl_net:+.4f}</b> (fee: ${fee_total:.4f})\n"
-            f"Hoy: ${pnl_today:+.4f} | WR: {wr:.1f}%"
+    return None, price, 0, 0, f"Sin señal | RSI:{r:.0f} EMA50:{e50:.4f} precio:{'>' if price>e50 else '<'}EMA"
+
+# ──────────────────────── BOT ────────────────────────────────
+
+class ConservativeBot:
+
+    def __init__(self):
+        self.client = BingXClient(
+            API_KEY, SECRET_KEY, demo=DEMO_MODE,
+            telegram_token=TELEGRAM_TOKEN, telegram_chat=TELEGRAM_CHAT,
         )
-        maybe_trigger_circuit()
-        set_cooldown(symbol)
-        time.sleep(1)
-    finally:
-        _closing.discard(symbol)
+        self.position   = None   # {'symbol','direction','entry','qty','sl','tp','opened_at','sl_pct','tp_pct'}
+        self.cooldowns  = {}     # {symbol: expiry_ts}
+        self.trades_today = 0
+        self.pnl_today    = 0.0
+        self.today_date   = ""
+        self.pnl_file     = "/tmp/bot_v6_pnl.json"
+        self.account_mode = "hedge"
+        self._load_state()
 
+    def _load_state(self):
+        try:
+            with open(self.pnl_file) as f:
+                d = json.load(f)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if d.get("date") == today:
+                self.trades_today = d.get("trades_today", 0)
+                self.pnl_today    = d.get("pnl_today", 0.0)
+                self.today_date   = today
+                log.info(f"  Estado cargado: {self.trades_today} trades hoy, PnL ${self.pnl_today:+.4f}")
+        except Exception:
+            pass
 
-def handle_short_entry(symbol, signals, balance, df):
-    global trades_today
-    if symbol in open_trades or symbol in _opening or symbol in _closing:
-        return
+    def _save_state(self):
+        try:
+            with open(self.pnl_file, "w") as f:
+                json.dump({
+                    "date":         datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    "trades_today": self.trades_today,
+                    "pnl_today":    self.pnl_today,
+                }, f)
+        except Exception:
+            pass
 
-    pending = client.get_open_orders(symbol)
-    if pending:
-        client.cleanup_symbol_orders(symbol)
-        time.sleep(1)
+    def _reset_daily(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self.today_date:
+            self.trades_today = 0
+            self.pnl_today    = 0.0
+            self.today_date   = today
+            log.info("  Reset diario")
 
-    _opening.add(symbol)
-    try:
-        price = signals["close"]
-        qty   = calculate_qty(balance, price)
-        if qty <= 0:
+    def _detect_mode(self):
+        if POSITION_MODE.lower() in ("hedge","oneway"):
+            self.account_mode = POSITION_MODE.lower()
             return
+        try:
+            for pos in self.client.get_positions("BTC-USDT"):
+                side = str(pos.get("positionSide","")).upper()
+                if side in ("LONG","SHORT"):
+                    self.account_mode = "hedge"
+                    return
+                elif side == "BOTH":
+                    self.account_mode = "oneway"
+                    return
+        except Exception:
+            pass
+        self.account_mode = "hedge"
 
-        atr_val = calc_atr(df, 14)
-        if USE_ATR_TPSL and atr_val > 0:
-            tp_pct = max(atr_val / price * 100 * ATR_TP_MULT, TP_PCT)
-            sl_pct = max(atr_val / price * 100 * ATR_SL_MULT, SL_PCT)
-        else:
-            tp_pct, sl_pct = TP_PCT, SL_PCT
-
-        min_tp = (FEE_RATE * 2 * LEVERAGE * 100) + 3.0
-        tp_pct = max(tp_pct, min_tp)
-
-        if calc_expected_profit(price, qty, tp_pct) < MIN_PROFIT_USDT:
+    def _sync(self):
+        """Sincroniza posición con BingX."""
+        if not self.position:
             return
+        try:
+            sym = self.position["symbol"]
+            positions = self.client.get_positions(sym)
+            alive = False
+            for p in positions:
+                amt = float(p.get("positionAmt", 0))
+                if amt != 0:
+                    alive = True
+                    break
+            if not alive:
+                log.info(f"  [SYNC] {sym} cerrado externamente")
+                self.position = None
+        except Exception:
+            pass
 
-        tp_price = price * (1 - tp_pct / 100)
-        sl_price = price * (1 + sl_pct / 100)
-        acc_mode = stats.get("account_mode","hedge")
-        pos_side = "SHORT" if acc_mode == "hedge" else "BOTH"
+    def _is_on_cooldown(self, symbol):
+        ts = self.cooldowns.get(symbol)
+        if not ts:
+            return False
+        if time.time() > ts:
+            del self.cooldowns[symbol]
+            return False
+        return True
 
-        client.set_leverage(symbol, LEVERAGE)
-        ok = client.place_entry(symbol, "short", qty, pos_side)
+    def _set_cooldown(self, symbol):
+        self.cooldowns[symbol] = time.time() + COOLDOWN_H * 3600
+
+    def _get_price(self, symbol):
+        try:
+            d = req.get("https://open-api.bingx.com/openApi/swap/v2/quote/ticker",
+                        params={"symbol": symbol}, timeout=5).json()
+            if d.get("code") == 0:
+                return float(d["data"]["lastPrice"])
+        except Exception:
+            pass
+        return 0.0
+
+    def open_position(self, symbol, direction, entry, sl, tp, desc):
+        balance = self.client.get_balance()
+        if balance < MIN_BAL:
+            log.warning(f"  Balance ${balance:.2f} < ${MIN_BAL}")
+            return False
+
+        qty = max(round((balance * RISK_PCT * LEVERAGE) / entry, 3), 0.001)
+
+        # Verificar que la ganancia esperada cubre las fees × 3
+        notional    = qty * entry * LEVERAGE
+        fee_total   = notional * FEE * 2
+        tp_pct      = abs(tp - entry) / entry * 100
+        sl_pct      = abs(sl - entry) / entry * 100
+        exp_profit  = notional * (tp_pct / 100) - fee_total
+        if exp_profit < 0.50:
+            log.info(f"  {symbol}: profit esperado ${exp_profit:.3f} insuficiente")
+            return False
+
+        pos_side = ("LONG" if direction == "long" else "SHORT") if self.account_mode == "hedge" else "BOTH"
+
+        log.info(f"  ABRIENDO {direction.upper()} {symbol} @ ${entry:.4f}")
+        log.info(f"  TP: ${tp:.4f} (+{tp_pct:.2f}%) | SL: ${sl:.4f} (-{sl_pct:.2f}%)")
+        log.info(f"  Profit esp: ${exp_profit:.3f} | {desc}")
+
+        self.client.set_leverage(symbol, LEVERAGE)
+        ok = self.client.place_entry(symbol, direction, qty, pos_side)
         if not ok:
-            return
+            return False
 
-        # Verificar posición real
+        # Esperar confirmación real (máx 20s)
         confirmed = False
-        for _ in range(15):
+        for _ in range(20):
             time.sleep(1)
-            for p in client.get_positions(symbol):
-                amt = float(p.get("positionAmt",0))
+            for p in self.client.get_positions(symbol):
+                amt = float(p.get("positionAmt", 0))
                 ps  = str(p.get("positionSide","BOTH")).upper()
-                if ps == "SHORT" or (ps == "BOTH" and amt < 0):
+                if ((direction == "long"  and (ps == "LONG"  or amt > 0)) or
+                    (direction == "short" and (ps == "SHORT" or amt < 0))):
                     confirmed = True
                     break
             if confirmed:
                 break
 
         if not confirmed:
-            client.close_all_positions(symbol)
-            return
+            log.error(f"  {symbol}: posición no confirmada")
+            self.client.close_all_positions(symbol)
+            return False
 
-        if symbol in open_trades:
-            return
-
-        open_trades[symbol] = {
-            "position":      "short",
-            "entry_price":   price,
-            "entry_qty":     qty,
-            "position_side": pos_side,
-            "tp_price":      tp_price,
-            "sl_price":      sl_price,
-            "has_tp_sl":     False,
-            "opened_at":     datetime.now(timezone.utc),
+        self.position = {
+            "symbol":    symbol,
+            "direction": direction,
+            "entry":     entry,
+            "qty":       qty,
+            "sl":        sl,
+            "tp":        tp,
+            "sl_pct":    round(sl_pct, 2),
+            "tp_pct":    round(tp_pct, 2),
+            "pos_side":  pos_side,
+            "opened_at": datetime.now(timezone.utc),
+            "notional":  notional,
         }
-        _recently_closed.pop(symbol, None)
+        self.trades_today += 1
+        self._save_state()
 
-        tp_sl = client.place_tp_sl(symbol,"short",qty,tp_price,sl_price,pos_side)
-        open_trades[symbol]["has_tp_sl"] = tp_sl["tp"] and tp_sl["sl"]
-        trades_today += 1
+        # Colocar TP/SL en BingX (intento adicional — el código también monitorea)
+        tp_sl = self.client.place_tp_sl(symbol, direction, qty, tp, sl, pos_side)
+        tp_i  = "✅" if tp_sl["tp"] else "⚠️"
+        sl_i  = "✅" if tp_sl["sl"] else "⚠️"
 
-        client.send_telegram(
-            f"<b>🔴 SHORT ABIERTO [v3.0 MARKET]</b>\n"
-            f"{symbol} | ${price:.4f} | Qty:{qty}\n"
-            f"TP {'✅' if tp_sl['tp'] else '❌'}: ${tp_price:.4f} (-{tp_pct:.2f}%)\n"
-            f"SL {'✅' if tp_sl['sl'] else '❌'}: ${sl_price:.4f} (+{sl_pct:.2f}%)\n"
-            f"Score: {signals.get('quality_bear',0)}/100 | RSI: {signals.get('rsi','?')}\n"
-            f"Hoy: {trades_today}/{MAX_TRADES_DAY}"
+        e = "🟢" if direction == "long" else "🔴"
+        self.client.send_telegram(
+            f"<b>{e} {direction.upper()} ABIERTO [v6.0]</b>\n"
+            f"Par: {symbol} | TF: {TIMEFRAME} | {LEVERAGE}x\n"
+            f"Precio: ${entry:.4f} | Qty: {qty}\n"
+            f"TP {tp_i}: ${tp:.4f} (+{tp_pct:.2f}%)\n"
+            f"SL {sl_i}: ${sl:.4f} (-{sl_pct:.2f}%)\n"
+            f"Ratio TP:SL = {TP_RATIO:.1f}:1\n"
+            f"Profit esperado: ${exp_profit:.3f}\n"
+            f"Balance: ${balance:.2f} | Hoy: {self.trades_today}/{MAX_DAY}\n"
+            f"Señal: {desc}"
         )
-    except BingXError as e:
-        log.error(f"  Error SHORT {symbol}: {e}")
-        open_trades.pop(symbol, None)
-    finally:
-        _opening.discard(symbol)
+        log.info(f"  {symbol}: posición abierta ✅")
+        return True
 
-
-def analyze_symbol(symbol, balance):
-    if symbol in open_trades:
-        if symbol in _closing:
+    def close_position(self, reason, current_price=None):
+        if not self.position:
             return
-        t = open_trades[symbol]
-        if not t.get("has_tp_sl"):
-            retry_tp_sl(symbol)
+        t = self.position
+        sym  = t["symbol"]
+        d    = t["direction"]
+        cur  = current_price or self._get_price(sym) or t["entry"]
+
+        pnl_usd   = t["qty"] * (cur - t["entry"]) * (1 if d == "long" else -1)
+        fee_total = t["notional"] * FEE * 2
+        pnl_net   = pnl_usd - fee_total
+        win       = pnl_net > 0
+
+        hold_mins = (datetime.now(timezone.utc) - t["opened_at"]).total_seconds() / 60
+        log.info(f"  CERRANDO {d.upper()} {sym} | {reason} | ${pnl_net:+.4f} | {int(hold_mins)}min")
+
+        # Cancelar órdenes TP/SL antes de cerrar
+        self.client.cleanup_symbol_orders(sym)
+        time.sleep(0.5)
+        self.client.close_all_positions(sym)
+
+        self.pnl_today += pnl_net
+        self._save_state()
+        self._set_cooldown(sym)
+
+        emoji = "✅" if win else "❌"
+        self.client.send_telegram(
+            f"<b>{emoji} CERRADO {d.upper()} — {reason}</b>\n"
+            f"Par: {sym} | {int(hold_mins)}min\n"
+            f"${t['entry']:.4f} → ${cur:.4f}\n"
+            f"PnL neto: <b>${pnl_net:+.4f}</b> (fee: ${fee_total:.4f})\n"
+            f"PnL hoy: ${self.pnl_today:+.4f} | Trades: {self.trades_today}/{MAX_DAY}"
+        )
+
+        self.position = None
+        time.sleep(2)
+
+    def monitor_position(self):
+        """
+        Monitorea la posición activa y cierra si:
+        1. Precio alcanza TP
+        2. Precio alcanza SL (monitoreado en código, no solo en BingX)
+        3. Holding mínimo alcanzado + señal de reversión
+        """
+        if not self.position:
+            return
+
+        t     = self.position
+        sym   = t["symbol"]
+        d     = t["direction"]
+        cur   = self._get_price(sym)
+        if cur <= 0:
+            return
+
+        hold_mins = (datetime.now(timezone.utc) - t["opened_at"]).total_seconds() / 60
+        pnl_pct   = (cur - t["entry"]) / t["entry"] * 100 * (1 if d == "long" else -1)
+
+        log.info(f"  Monitor {d.upper()} {sym}: ${cur:.4f} | PnL: {pnl_pct:+.2f}% | {int(hold_mins)}min")
+
+        # SL monitoreado en código (más fiable que orden BingX)
+        if d == "long"  and cur <= t["sl"]:
+            self.close_position(f"SL ${cur:.4f}", cur)
+            return
+        if d == "short" and cur >= t["sl"]:
+            self.close_position(f"SL ${cur:.4f}", cur)
+            return
+
+        # TP
+        if d == "long"  and cur >= t["tp"]:
+            self.close_position(f"TP ${cur:.4f}", cur)
+            return
+        if d == "short" and cur <= t["tp"]:
+            self.close_position(f"TP ${cur:.4f}", cur)
+            return
+
+    def run(self):
+        log.info("=" * 65)
+        log.info("  Bot Conservador v6.0 | Solo BTC/ETH/SOL | 4h | 1 trade")
+        log.info(f"  LEV:{LEVERAGE}x | RISK:{RISK_PCT:.0%} | TP:{TP_RATIO}:1 | SL:{SL_PCT}%")
+        log.info(f"  MaxDay:{MAX_DAY} | DailyStop:${DAILY_STOP} | Cooldown:{COOLDOWN_H}h")
+        log.info("=" * 65)
+
+        if DEMO_MODE:
+            log.warning("MODO DEMO")
+
         try:
-            df      = get_ohlcv(symbol)
-            signals = calculate_signals(df, ZLEMA_LENGTH, BAND_MULT, OSC_PERIOD, MIN_QUALITY)
-        except Exception as e:
-            log.debug(f"  {symbol}: {e}")
-            return
+            balance = self.client.get_balance()
+            log.info(f"Balance: ${balance:.2f} USDT")
+        except BingXError as e:
+            log.error(f"No conecta: {e}")
+            sys.exit(1)
 
-        cur = signals["close"]
-        tp  = t.get("tp_price",0)
-        sl  = t.get("sl_price",0)
+        self._detect_mode()
 
-        if tp and sl:
-            if cur <= tp:
-                handle_exit(symbol, signals, f"TP ${cur:.4f}")
-                return
-            if cur >= sl:
-                handle_exit(symbol, signals, f"SL ${cur:.4f}")
-                return
+        # Limpiar órdenes pendientes al arrancar
+        log.info("  Limpiando órdenes pendientes...")
+        self.client.cleanup_all_orders()
+        time.sleep(2)
 
-        if signals["probability"] >= EXIT_PROB:
-            handle_exit(symbol, signals, f"Prob {signals['probability']:.1%}")
-            return
-        if signals["trend"] == 1:
-            handle_exit(symbol, signals, "Tendencia viró alcista")
-            return
-        return
+        # Recuperar posición existente si la hay
+        self._sync()
 
-    if len(open_trades) >= MAX_OPEN_TRADES or trades_today >= MAX_TRADES_DAY:
-        return
-    if is_on_cooldown(symbol):
-        return
-    if time.time() - _recently_closed.get(symbol,0) < 300:
-        return
-    if USE_BTC_FILTER and btc_trend_1h > 2.0:
-        return
+        self.client.send_telegram(
+            f"<b>Bot Conservador v6.0 iniciado</b>\n"
+            f"Solo: BTC / ETH / SOL | TF: {TIMEFRAME}\n"
+            f"LEV: {LEVERAGE}x | Max: {MAX_DAY} trades/día\n"
+            f"Stop diario: -${DAILY_STOP} | SL monitoreado en código\n"
+            f"Balance: ${balance:.2f} USDT\n"
+            f"{'⚠️ DEMO MODE' if DEMO_MODE else '💰 MODO REAL'}"
+        )
 
-    try:
-        df      = get_ohlcv(symbol)
-        signals = calculate_signals(df, ZLEMA_LENGTH, BAND_MULT, OSC_PERIOD, MIN_QUALITY)
-    except Exception as e:
-        log.debug(f"  {symbol}: {e}")
-        return
+        cycle = 0
+        last_report = 0
 
-    if balance < MIN_BALANCE:
-        return
-    if signals["probability"] >= ENTRY_MAX_PROB:
-        return
-    if not signals["bearish_entry"]:
-        return
-    if signals.get("ranging") or signals.get("gap_pct",0) < 0.5:
-        return
-    if signals.get("quality_bear",0) < MIN_QUALITY:
-        return
-    if calc_atr(df,14) / signals["close"] * 100 < MIN_ATR_PCT:
-        return
-    if not has_bearish_momentum(df):
-        return
-
-    handle_short_entry(symbol, signals, balance, df)
-
-
-def send_report(balance):
-    total = stats["wins"] + stats["losses"]
-    wr    = stats["wins"] / total * 100 if total > 0 else 0
-    bl    = sum(1 for n in blacklist.values() if n >= MAX_LOSS_STREAK)
-    pos   = ""
-    for sym, t in open_trades.items():
-        try:
-            tk  = req.get("https://open-api.bingx.com/openApi/swap/v2/quote/ticker",
-                          params={"symbol":sym},timeout=5).json()
-            cur = float(tk["data"]["lastPrice"]) if tk.get("code")==0 else t["entry_price"]
-        except Exception:
-            cur = t["entry_price"]
-        pct = (t["entry_price"]-cur)/t["entry_price"]*100
-        pos += f"  SHORT {sym}: {pct:+.2f}% {'✅' if t.get('has_tp_sl') else '⚠️'}\n"
-    client.send_telegram(
-        f"<b>📊 Short Bot v3.0 #{stats['cycle']}</b>\n"
-        f"Balance: ${balance:.2f} | BTC: {btc_trend_1h:+.2f}%\n"
-        f"Posiciones: {len(open_trades)}/{MAX_OPEN_TRADES}\n"
-        f"{pos or '  sin posiciones\n'}"
-        f"Trades: {total} | WR: {wr:.1f}%\n"
-        f"Hoy: {trades_today}/{MAX_TRADES_DAY} | PnL hoy: ${pnl_today:+.4f}\n"
-        f"Acum: ${stats['total_pnl']:+.4f} | Bl: {bl}"
-    )
-
-
-def main():
-    stats["account_mode"] = detect_account_mode()
-    reset_daily_if_needed()
-
-    log.info("=" * 70)
-    log.info(f"  Short Bot v3.0 | MARKET ONLY | TF:{TIMEFRAME} LEV:{LEVERAGE}x")
-    log.info(f"  Max:{MAX_OPEN_TRADES} pos | MaxDay:{MAX_TRADES_DAY} | DailyLimit:${DAILY_LOSS_LIM}")
-    log.info("=" * 70)
-
-    if DEMO_MODE:
-        log.warning("MODO DEMO")
-    try:
-        stats["start_balance"] = client.get_balance()
-        log.info(f"Balance: ${stats['start_balance']:.2f}")
-    except BingXError as e:
-        log.error(f"No conecta: {e}")
-        sys.exit(1)
-
-    client.cleanup_all_orders()
-    time.sleep(2)
-    sync_all_positions()
-    get_symbols()
-    update_btc_trend()
-
-    client.send_telegram(
-        f"<b>🔴 Short Bot v3.0 iniciado — MARKET ONLY</b>\n"
-        f"Max:{MAX_OPEN_TRADES} | MaxDay:{MAX_TRADES_DAY} | DailyLimit:${DAILY_LOSS_LIM}\n"
-        f"Balance: ${stats['start_balance']:.2f}"
-    )
-
-    while True:
-        try:
-            stats["cycle"] += 1
-            reset_daily_if_needed()
-            if check_circuit_breaker():
-                time.sleep(CHECK_INTERVAL)
-                continue
-            syms = get_symbols()
-            sync_all_positions()
-            update_btc_trend()
-
+        while True:
             try:
-                balance = client.get_balance()
-            except BingXError:
-                time.sleep(CHECK_INTERVAL)
-                continue
+                cycle += 1
+                self._reset_daily()
+                self._sync()
 
-            total = stats["wins"] + stats["losses"]
-            wr    = stats["wins"] / total * 100 if total > 0 else 0
-            log.info(
-                f"\n{'='*70}\n"
-                f"  #{stats['cycle']} {now_utc()} | ${balance:.2f} | "
-                f"Shorts:{len(open_trades)}/{MAX_OPEN_TRADES} | WR:{wr:.1f}% | "
-                f"Hoy:${pnl_today:+.4f} ({trades_today}/{MAX_TRADES_DAY})\n{'='*70}"
-            )
+                try:
+                    balance = self.client.get_balance()
+                except BingXError:
+                    time.sleep(CHECK_SEC)
+                    continue
 
-            for sym in list(open_trades.keys()):
-                analyze_symbol(sym, balance)
-                time.sleep(0.3)
-
-            if len(open_trades) < MAX_OPEN_TRADES and trades_today < MAX_TRADES_DAY:
-                new_entries = 0
-                for sym in syms:
-                    if len(open_trades) >= MAX_OPEN_TRADES or new_entries >= 1:
-                        break
-                    if sym in open_trades:
-                        continue
-                    prev = len(open_trades)
-                    analyze_symbol(sym, balance)
-                    if len(open_trades) > prev:
-                        new_entries += 1
-                    time.sleep(0.25)
-                log.info(f"  Scan: {new_entries} shorts")
-
-            if REPORT_EVERY > 0 and stats["cycle"] % REPORT_EVERY == 0:
-                send_report(balance)
-
-            log.info(f"  Próximo ciclo en {CHECK_INTERVAL}s\n")
-            time.sleep(CHECK_INTERVAL)
-
-        except KeyboardInterrupt:
-            try:
-                final = client.get_balance()
-                client.send_telegram(
-                    f"<b>Short Bot v3.0 detenido</b>\n"
-                    f"WR: {stats['wins']/(stats['wins']+stats['losses'])*100:.1f}% "
-                    f"| PnL: ${stats['total_pnl']:+.4f}\nBalance: ${final:.2f}"
+                log.info(
+                    f"\n{'='*65}\n"
+                    f"  #{cycle} {datetime.now(timezone.utc).strftime('%H:%M:%S')} | "
+                    f"${balance:.2f} | Pos:{'Sí' if self.position else 'No'} | "
+                    f"Hoy:${self.pnl_today:+.3f} ({self.trades_today}/{MAX_DAY})\n"
+                    f"{'='*65}"
                 )
-            except Exception:
-                pass
-            sys.exit(0)
-        except Exception as e:
-            log.error(f"Error #{stats['cycle']}: {e}", exc_info=True)
-            client.send_telegram(f"<b>⚠️ Error Short Bot v3.0</b>\n{e}")
-            time.sleep(30)
+
+                # Stop diario
+                if self.pnl_today < -DAILY_STOP:
+                    if self.position:
+                        self.close_position("Stop diario activado")
+                    log.warning(f"  STOP DIARIO: ${self.pnl_today:.3f} < -${DAILY_STOP}")
+                    self.client.send_telegram(
+                        f"<b>🔴 Stop diario activado</b>\n"
+                        f"Pérdida: ${self.pnl_today:.4f} > -${DAILY_STOP}\n"
+                        f"Bot pausado hasta mañana"
+                    )
+                    # Esperar hasta el próximo día
+                    while datetime.now(timezone.utc).strftime("%Y-%m-%d") == self.today_date:
+                        time.sleep(300)
+                    continue
+
+                # Monitorear posición activa
+                if self.position:
+                    self.monitor_position()
+                    log.info(f"  Próximo ciclo en {CHECK_SEC}s\n")
+                    time.sleep(CHECK_SEC)
+                    continue
+
+                # Buscar entrada si no hay posición y quedan slots
+                if self.trades_today >= MAX_DAY:
+                    log.info(f"  Límite diario alcanzado ({self.trades_today}/{MAX_DAY})")
+                    time.sleep(CHECK_SEC)
+                    continue
+
+                if balance < MIN_BAL:
+                    log.warning(f"  Balance ${balance:.2f} < mínimo ${MIN_BAL}")
+                    time.sleep(CHECK_SEC)
+                    continue
+
+                # Analizar los 3 pares
+                best = None
+                for sym in SYMBOLS:
+                    if self._is_on_cooldown(sym):
+                        cd_left = int((self.cooldowns[sym] - time.time()) / 60)
+                        log.info(f"  {sym}: cooldown {cd_left}min restantes")
+                        continue
+
+                    direction, price, sl, tp, desc = analyze(sym, self.client)
+                    log.info(f"  {sym}: {desc[:60]}")
+
+                    if direction and sl > 0 and tp > 0:
+                        # Tomar el primer par con señal válida
+                        best = (sym, direction, price, sl, tp, desc)
+                        break
+
+                if best:
+                    sym, direction, price, sl, tp, desc = best
+                    log.info(f"  ★ SEÑAL: {direction.upper()} {sym}")
+                    self.open_position(sym, direction, price, sl, tp, desc)
+
+                # Reporte cada hora
+                if time.time() - last_report > 3600:
+                    last_report = time.time()
+                    pos_str = "Sin posición"
+                    if self.position:
+                        t   = self.position
+                        cur = self._get_price(t["symbol"]) or t["entry"]
+                        pct = (cur - t["entry"]) / t["entry"] * 100
+                        pct *= 1 if t["direction"] == "long" else -1
+                        pos_str = f"{t['direction'].upper()} {t['symbol']}: {pct:+.2f}%"
+                    self.client.send_telegram(
+                        f"<b>Bot v6.0 — Reporte horario</b>\n"
+                        f"Balance: ${balance:.2f} | {pos_str}\n"
+                        f"Trades hoy: {self.trades_today}/{MAX_DAY}\n"
+                        f"PnL hoy: ${self.pnl_today:+.4f}"
+                    )
+
+                log.info(f"  Próximo ciclo en {CHECK_SEC}s\n")
+                time.sleep(CHECK_SEC)
+
+            except KeyboardInterrupt:
+                if self.position:
+                    self.close_position("Bot detenido manualmente")
+                self.client.send_telegram(
+                    f"<b>Bot v6.0 detenido</b>\n"
+                    f"PnL hoy: ${self.pnl_today:+.4f}\n"
+                    f"Trades: {self.trades_today}/{MAX_DAY}"
+                )
+                sys.exit(0)
+            except Exception as e:
+                log.error(f"Error ciclo #{cycle}: {e}", exc_info=True)
+                self.client.send_telegram(f"<b>⚠️ Error Bot v6.0</b>\n{e}")
+                time.sleep(30)
 
 
 if __name__ == "__main__":
-    main()
+    ConservativeBot().run()
