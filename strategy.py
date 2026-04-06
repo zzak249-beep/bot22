@@ -1,189 +1,159 @@
 """
-Estrategia Zero Lag EMA + Trend Reversal Probability — v2.1
-Más conservador: reduce entradas falsas en mercados laterales
+Sniper Entry/Exit Strategy - KhanSaab V.02
+Translated from Pine Script to Python
 """
-
 import pandas as pd
-from typing import Dict
+import numpy as np
 
 
-def zlema(series: pd.Series, length: int) -> pd.Series:
-    lag      = (length - 1) // 2
-    ema_data = series + series.diff(lag)
-    return ema_data.ewm(span=length, adjust=False).mean()
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> float:
-    if len(series) < period + 1:
-        return 50.0
-    delta  = series.diff()
-    gains  = delta.clip(lower=0).rolling(window=period).mean()
-    losses = (-delta).clip(lower=0).rolling(window=period).mean()
-    ag, al = gains.iloc[-1], losses.iloc[-1]
-    if al == 0:
-        return 100.0
-    return float(100 - (100 / (1 + ag / al)))
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
-def calculate_bands(z, mult, period):
-    std   = z.rolling(window=period).std()
-    return z + std * mult, z - std * mult
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
 
 
-def stochastic_oscillator(high, low, close, period):
-    lo = low.rolling(window=period).min()
-    hi = high.rolling(window=period).max()
-    k  = 100 * (close - lo) / (hi - lo)
-    return k.fillna(50)
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 
-def calculate_reversal_probability(close, z, upper, lower, osc) -> float:
-    price, zv = close.iloc[-1], z.iloc[-1]
-    up, lo    = upper.iloc[-1], lower.iloc[-1]
-    osc_v     = osc.iloc[-1]
-    rng       = up - lo
-
-    band_factor = 0.0
-    if rng > 0:
-        dist = ((up - price) / rng if price > zv else (price - lo) / rng)
-        band_factor = max(0.0, min(0.4, 0.4 * (1 - dist)))
-
-    osc_factor = (0.35 if osc_v > 80 else
-                  0.25 if osc_v > 70 else
-                  0.35 if osc_v < 20 else
-                  0.25 if osc_v < 30 else 0.0)
-
-    mom = 0.0
-    if len(close) >= 5:
-        mom = min(0.25, abs((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100)
-
-    return min(1.0, max(0.0, band_factor + osc_factor + mom))
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    tr = atr(high, low, close, period)
+    plus_dm_s = pd.Series(plus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean()
+    minus_dm_s = pd.Series(minus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * plus_dm_s / tr
+    minus_di = 100 * minus_dm_s / tr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean()
 
 
-def is_ranging(close: pd.Series, period=12, threshold=1.8) -> bool:
-    """Detecta consolidación: rango < threshold%."""
-    if len(close) < period:
-        return False
-    r = close.iloc[-period:]
-    return (r.max() - r.min()) / r.min() * 100 < threshold
+def vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series) -> pd.Series:
+    hlc3 = (high + low + close) / 3
+    cumulative_vol = volume.cumsum()
+    cumulative_tp_vol = (hlc3 * volume).cumsum()
+    return cumulative_tp_vol / cumulative_vol
 
 
-def trend_gap_pct(close: pd.Series, z: pd.Series) -> float:
-    """% de distancia precio-ZLEMA. > 0.5% = tendencia real."""
-    zv = z.iloc[-1]
-    return abs(close.iloc[-1] - zv) / zv * 100 if zv != 0 else 0.0
+def compute_scores(df: pd.DataFrame, rsi_5m: pd.Series = None) -> dict:
+    """
+    Compute bull/bear scores exactly as in Pine Script.
+    df must have: open, high, low, close, volume
+    """
+    close = df['close']
+    high = df['high']
+    low = df['low']
+    volume = df['volume']
 
+    ema9 = ema(close, 9)
+    ema21 = ema(close, 21)
+    vwap_val = vwap(high, low, close, volume)
+    atr_val = atr(high, low, close, 14)
+    rsi_val = rsi(close, 14)
+    macd_m, macd_s, _ = macd(close)
+    adx_val = adx(high, low, close, 14)
+    vol_avg = volume.rolling(20).mean()
 
-def quality_score(close, z, upper, lower, osc, rsi_val, direction) -> int:
-    score = 0
-    gap = trend_gap_pct(close, z)
+    rsi5m = rsi_5m if rsi_5m is not None else rsi_val  # fallback
 
-    # Fuerza de tendencia
-    if gap > 1.5:   score += 35
-    elif gap > 0.8: score += 25
-    elif gap > 0.5: score += 15
-    else:           score += 0
+    # Last bar values
+    i = -1
+    c = close.iloc[i]
+    o = df['open'].iloc[i]
+    v = volume.iloc[i]
 
-    # RSI en zona correcta
-    if direction == "bull":
-        if 35 <= rsi_val <= 58:  score += 30
-        elif 25 <= rsi_val < 35: score += 20  # rebote sobreventa
-        elif 58 < rsi_val <= 68: score += 10
-        elif rsi_val > 68:       score -= 20  # sobrecomprado: peligro
+    bull = 0
+    bull += 1 if c > vwap_val.iloc[i] else 0
+    bull += 1 if rsi_val.iloc[i] > 50 else 0
+    bull += 1 if macd_m.iloc[i] > macd_s.iloc[i] else 0
+    bull += 1 if ema9.iloc[i] > ema21.iloc[i] else 0
+    bull += 1 if adx_val.iloc[i] > 25 and c > ema9.iloc[i] else 0
+    bull += 1 if v > vol_avg.iloc[i] and c > o else 0
+    bull += 1 if rsi5m.iloc[i] > 50 else 0
+
+    bear = 0
+    bear += 1 if c < vwap_val.iloc[i] else 0
+    bear += 1 if rsi_val.iloc[i] < 50 else 0
+    bear += 1 if macd_m.iloc[i] < macd_s.iloc[i] else 0
+    bear += 1 if ema9.iloc[i] < ema21.iloc[i] else 0
+    bear += 1 if adx_val.iloc[i] > 25 and c < ema9.iloc[i] else 0
+    bear += 1 if v > vol_avg.iloc[i] and c < o else 0
+    bear += 1 if rsi5m.iloc[i] < 50 else 0
+
+    bull_pct = (bull / 7) * 100
+    bear_pct = (bear / 7) * 100
+
+    diff = bull_pct - bear_pct
+    if diff >= 40:
+        bias = "STRONG BULL"
+    elif -diff >= 40:
+        bias = "STRONG BEAR"
+    elif bull_pct > bear_pct:
+        bias = "MILD BULL"
     else:
-        if 42 <= rsi_val <= 65:  score += 30
-        elif 65 < rsi_val <= 75: score += 20  # rebote sobrecompra
-        elif 35 <= rsi_val < 42: score += 10
-        elif rsi_val < 35:       score -= 20  # sobrevendido: peligro
+        bias = "MILD BEAR"
 
-    # Oscilador estocástico
-    osc_v = osc.iloc[-1]
-    if direction == "bull":
-        if osc_v < 35:  score += 25
-        elif osc_v > 75: score -= 20
-    else:
-        if osc_v > 65:  score += 25
-        elif osc_v < 25: score -= 20
+    # EMA cross signal
+    ema9_prev = ema9.iloc[-2]
+    ema21_prev = ema21.iloc[-2]
+    ema9_curr = ema9.iloc[-1]
+    ema21_curr = ema21.iloc[-1]
 
-    # Sin consolidación
-    if not is_ranging(close, 10, 1.8):
-        score += 10
+    buy_signal = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr)
+    sell_signal = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr)
 
-    return max(0, min(100, score))
-
-
-def detect_entry_signals(close, z, upper, lower, osc, trend) -> Dict:
-    p     = close.iloc[-1]
-    pp    = close.iloc[-2] if len(close) >= 2 else p
-    zv    = z.iloc[-1]
-    zprev = z.iloc[-2] if len(z) >= 2 else zv
-    osc_v = osc.iloc[-1]
-
-    # LONG: cruce alcista reciente (precio cruzó ZLEMA hacia arriba)
-    bull_cross  = (p > zv and pp <= zprev)
-    bull_bounce = (p <= lower.iloc[-1] and osc_v < 25 and p > close.iloc[-2])
-    bull_entry  = trend == 1 and p > zv and osc_v < 75 and (bull_cross or bull_bounce)
-
-    # SHORT: cruce bajista reciente
-    bear_cross  = (p < zv and pp >= zprev)
-    bear_reject = (p >= upper.iloc[-1] and osc_v > 75 and p < close.iloc[-2])
-    bear_entry  = trend == -1 and p < zv and osc_v > 25 and (bear_cross or bear_reject)
-
-    return {"bullish_entry": bull_entry, "bearish_entry": bear_entry}
-
-
-def calculate_signals(df: pd.DataFrame,
-                      zlema_length=50, band_mult=1.2, osc_period=20,
-                      min_quality=60) -> Dict:
-    if df is None or len(df) < max(zlema_length, osc_period) + 10:
-        raise ValueError("Datos insuficientes")
-
-    z     = zlema(df["close"], zlema_length)
-    up, lo = calculate_bands(z, band_mult, zlema_length)
-    osc   = stochastic_oscillator(df["high"], df["low"], df["close"], osc_period)
-    trend = 1 if df["close"].iloc[-1] > z.iloc[-1] else -1
-    prob  = calculate_reversal_probability(df["close"], z, up, lo, osc)
-    rsi_v = calculate_rsi(df["close"], 14)
-    rang  = is_ranging(df["close"], 12, 1.8)
-    gap   = trend_gap_pct(df["close"], z)
-
-    sigs  = detect_entry_signals(df["close"], z, up, lo, osc, trend)
-
-    # Filtros duros — apagan señal independientemente del score
-    if rang:
-        sigs["bullish_entry"] = False
-        sigs["bearish_entry"] = False
-
-    if rsi_v > 72:  # sobrecomprado → no long
-        sigs["bullish_entry"] = False
-    if rsi_v < 28:  # sobrevendido → no short
-        sigs["bearish_entry"] = False
-
-    if gap < 0.5:  # tendencia demasiado débil
-        sigs["bullish_entry"] = False
-        sigs["bearish_entry"] = False
-
-    q_bull = quality_score(df["close"], z, up, lo, osc, rsi_v, "bull") if sigs["bullish_entry"] else 0
-    q_bear = quality_score(df["close"], z, up, lo, osc, rsi_v, "bear") if sigs["bearish_entry"] else 0
-
-    if sigs["bullish_entry"] and q_bull < min_quality:
-        sigs["bullish_entry"] = False
-    if sigs["bearish_entry"] and q_bear < min_quality:
-        sigs["bearish_entry"] = False
+    atr_now = atr_val.iloc[-1]
 
     return {
-        "close":          float(df["close"].iloc[-1]),
-        "zlema":          float(z.iloc[-1]),
-        "upper_band":     float(up.iloc[-1]),
-        "lower_band":     float(lo.iloc[-1]),
-        "oscillator":     float(osc.iloc[-1]),
-        "trend":          trend,
-        "probability":    prob,
-        "rsi":            round(rsi_v, 1),
-        "gap_pct":        round(gap, 3),
-        "bullish_entry":  sigs["bullish_entry"],
-        "bearish_entry":  sigs["bearish_entry"],
-        "quality_bull":   q_bull,
-        "quality_bear":   q_bear,
-        "ranging":        rang,
+        "close": c,
+        "ema9": ema9_curr,
+        "ema21": ema21_curr,
+        "vwap": vwap_val.iloc[i],
+        "rsi": rsi_val.iloc[i],
+        "macd_main": macd_m.iloc[i],
+        "macd_signal": macd_s.iloc[i],
+        "adx": adx_val.iloc[i],
+        "atr": atr_now,
+        "volume": v,
+        "vol_avg": vol_avg.iloc[i],
+        "bull_pct": bull_pct,
+        "bear_pct": bear_pct,
+        "bias": bias,
+        "buy_signal": buy_signal,
+        "sell_signal": sell_signal,
+        "rsi_5m": rsi5m.iloc[i],
     }
+
+
+def compute_trade_levels(entry: float, atr_val: float, direction: str, multiplier: float = 1.5) -> dict:
+    risk = atr_val * multiplier
+    is_long = direction == "BUY"
+    sl = entry - risk if is_long else entry + risk
+    targets = {}
+    for i in range(1, 6):
+        targets[f"tp{i}"] = entry + (risk * i) if is_long else entry - (risk * i)
+    return {"entry": entry, "sl": sl, "atr": atr_val, "risk": risk, **targets}

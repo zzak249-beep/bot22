@@ -1,411 +1,184 @@
 """
-Cliente BingX — v3.0
-CAMBIOS CRÍTICOS:
-  CRIT-1  place_entry: SOLO MARKET — las órdenes LIMIT acumulaban 12+ pendientes
-           sin ejecutar y al ejecutarse todas a la vez arruinaban la cuenta
-  CRIT-2  cleanup_all_orders: cancela TODAS las órdenes pendientes al arrancar
-           y antes de cada cierre — elimina el estado sucio entre sesiones
-  CRIT-3  place_tp_sl: 4 métodos de intento para máxima compatibilidad
-           workingType MARK_PRICE → CONTRACT_PRICE → sin workingType → STOP limit
-  CRIT-4  get_pending_orders_count: para que el bot sepa cuántas órdenes tiene
+BingX Perpetual Futures API Client
+Docs: https://bingx-api.github.io/docs/
 """
-
-import hashlib, hmac, time, requests, logging
-from typing import Optional, Dict, List, Any
-from urllib.parse import urlencode
+import hashlib
+import hmac
+import time
+import urllib.parse
+import aiohttp
+import logging
 
 logger = logging.getLogger(__name__)
 
-
-class BingXError(Exception):
-    pass
+BASE_URL = "https://open-api.bingx.com"
 
 
 class BingXClient:
+    def __init__(self, api_key: str, secret_key: str):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.session: aiohttp.ClientSession | None = None
 
-    def __init__(self, api_key, secret_key, demo=False,
-                 telegram_token="", telegram_chat=""):
-        self.api_key        = api_key
-        self.secret_key     = secret_key
-        self.demo           = demo
-        self.telegram_token = telegram_token
-        self.telegram_chat  = telegram_chat
-        self.base_url       = ("https://open-api-vst.bingx.com" if demo
-                               else "https://open-api.bingx.com")
-        self.headers        = {
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, *args):
+        if self.session:
+            await self.session.close()
+
+    def _sign(self, params: dict) -> str:
+        query = urllib.parse.urlencode(sorted(params.items()))
+        return hmac.new(
+            self.secret_key.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _headers(self) -> dict:
+        return {
             "X-BX-APIKEY": self.api_key,
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Type": "application/json",
         }
 
-    # ─────────────────── firma / request ─────────────────────────────────
+    def _build_params(self, extra: dict) -> dict:
+        params = {**extra, "timestamp": int(time.time() * 1000)}
+        params["signature"] = self._sign(params)
+        return params
 
-    def _sign(self, qs: str) -> str:
-        return hmac.new(self.secret_key.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    # ── Market Data ────────────────────────────────────────────────────────────
 
-    def _request(self, method, endpoint, params=None, signed=True):
-        if params is None:
-            params = {}
-        sp: Dict[str, str] = {}
-        for k, v in params.items():
-            if isinstance(v, float):
-                sp[k] = f"{v:.6g}"
-            elif isinstance(v, bool):
-                sp[k] = "true" if v else "false"
-            else:
-                sp[k] = str(v)
-        if signed:
-            sp["timestamp"] = str(int(time.time() * 1000))
-            qs  = urlencode(sorted(sp.items()))
-            sig = self._sign(qs)
-            url = f"{self.base_url}{endpoint}?{qs}&signature={sig}"
-        else:
-            qs  = urlencode(sorted(sp.items()))
-            url = f"{self.base_url}{endpoint}?{qs}" if qs else f"{self.base_url}{endpoint}"
-        try:
-            if method == "GET":
-                r = requests.get(url,    headers=self.headers, timeout=12)
-            elif method == "POST":
-                r = requests.post(url,   headers=self.headers, timeout=12)
-            elif method == "DELETE":
-                r = requests.delete(url, headers=self.headers, timeout=12)
-            else:
-                raise ValueError(f"Método no soportado: {method}")
-            data = r.json()
+    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list:
+        """
+        interval: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w, 1M
+        """
+        url = f"{BASE_URL}/openApi/swap/v3/quote/klines"
+        params = self._build_params({"symbol": symbol, "interval": interval, "limit": limit})
+        async with self.session.get(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
             if data.get("code") != 0:
-                msg = f"API error {data.get('code')}: {data.get('msg','Unknown')}"
-                logger.error(f"{msg} | {endpoint}")
-                raise BingXError(msg)
-            return data.get("data", data)
-        except requests.exceptions.RequestException as e:
-            raise BingXError(f"Network error: {e}")
+                raise Exception(f"BingX klines error: {data}")
+            return data["data"]
 
-    # ─────────────────── balance / velas ─────────────────────────────────
+    async def get_ticker(self, symbol: str) -> dict:
+        url = f"{BASE_URL}/openApi/swap/v2/quote/ticker"
+        params = self._build_params({"symbol": symbol})
+        async with self.session.get(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
+            if data.get("code") != 0:
+                raise Exception(f"BingX ticker error: {data}")
+            return data["data"]
 
-    def get_balance(self) -> float:
-        data = self._request("GET", "/openApi/swap/v2/user/balance")
-        if isinstance(data, dict):
-            bal = data.get("balance", {})
-            if isinstance(bal, dict):
-                return float(bal.get("balance", 0))
-        if isinstance(data, list):
-            for item in data:
-                if item.get("asset") == "USDT":
-                    return float(item.get("balance", 0))
-        return 0.0
+    # ── Account ────────────────────────────────────────────────────────────────
 
-    def get_klines(self, symbol, interval, limit=200):
-        params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
-        try:
-            data = self._request("GET", "/openApi/swap/v3/quote/klines", params, signed=False)
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.error(f"klines {symbol}: {e}")
-            return []
+    async def get_balance(self) -> dict:
+        url = f"{BASE_URL}/openApi/swap/v2/user/balance"
+        params = self._build_params({})
+        async with self.session.get(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
+            if data.get("code") != 0:
+                raise Exception(f"BingX balance error: {data}")
+            return data["data"]["balance"]
 
-    # ─────────────────── posiciones ──────────────────────────────────────
+    async def get_positions(self, symbol: str = "") -> list:
+        url = f"{BASE_URL}/openApi/swap/v2/user/positions"
+        p = {} if not symbol else {"symbol": symbol}
+        params = self._build_params(p)
+        async with self.session.get(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
+            if data.get("code") != 0:
+                raise Exception(f"BingX positions error: {data}")
+            return data["data"]
 
-    def get_positions(self, symbol="") -> List[Dict]:
-        try:
-            params = {"symbol": symbol} if symbol else {}
-            data   = self._request("GET", "/openApi/swap/v2/user/positions", params)
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.error(f"posiciones {symbol}: {e}")
-            return []
+    # ── Orders ─────────────────────────────────────────────────────────────────
 
-    def get_all_open_positions(self) -> List[Dict]:
-        """Obtiene TODAS las posiciones abiertas (sin filtro de símbolo)."""
-        return [p for p in self.get_positions()
-                if float(p.get("positionAmt", 0)) != 0]
-
-    # ─────────────────── órdenes pendientes ──────────────────────────────
-
-    def get_open_orders(self, symbol="") -> List[Dict]:
-        try:
-            params = {"symbol": symbol} if symbol else {}
-            data   = self._request("GET", "/openApi/swap/v2/trade/openOrders", params)
-            if isinstance(data, dict):
-                return data.get("orders", []) or []
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.debug(f"open_orders {symbol}: {e}")
-            return []
-
-    def cleanup_symbol_orders(self, symbol: str):
-        """
-        CRIT-2: Cancela TODAS las órdenes pendientes de un símbolo.
-        Llamar antes de abrir y antes de cerrar posición.
-        """
-        try:
-            orders = self.get_open_orders(symbol)
-            cancelled = 0
-            for o in orders:
-                oid = o.get("orderId", "")
-                if oid:
-                    try:
-                        self._request("DELETE", "/openApi/swap/v2/trade/order",
-                                      {"symbol": symbol, "orderId": str(oid)})
-                        cancelled += 1
-                    except Exception:
-                        pass
-            if cancelled:
-                logger.info(f"{symbol}: {cancelled} órdenes canceladas")
-        except Exception as e:
-            logger.debug(f"cleanup {symbol}: {e}")
-
-    def cleanup_all_orders(self):
-        """
-        CRIT-2: Cancela TODAS las órdenes pendientes de la cuenta.
-        Llamar al arrancar el bot para limpiar estado sucio.
-        """
-        try:
-            all_orders = self.get_open_orders()
-            symbols    = set(o.get("symbol", "") for o in all_orders if o.get("symbol"))
-            total = 0
-            for sym in symbols:
-                orders = [o for o in all_orders if o.get("symbol") == sym]
-                # Solo cancelar LIMIT de entrada (no TP/SL)
-                entry_types = {"LIMIT", "MARKET"}
-                for o in orders:
-                    if o.get("type") in entry_types or str(o.get("type", "")).upper() == "LIMIT":
-                        oid = o.get("orderId", "")
-                        if oid:
-                            try:
-                                self._request("DELETE", "/openApi/swap/v2/trade/order",
-                                              {"symbol": sym, "orderId": str(oid)})
-                                total += 1
-                            except Exception:
-                                pass
-            if total:
-                logger.warning(f"  [CLEANUP] {total} órdenes LIMIT pendientes canceladas al arrancar")
-                self.send_telegram(f"<b>🧹 Limpieza al arrancar</b>\n{total} órdenes LIMIT pendientes canceladas")
-        except Exception as e:
-            logger.debug(f"cleanup_all: {e}")
-
-    def has_tp_sl(self, symbol: str) -> dict:
-        orders = self.get_open_orders(symbol)
-        has_tp = any(o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") for o in orders)
-        has_sl = any(o.get("type") in ("STOP_MARKET", "STOP") for o in orders)
-        return {"tp": has_tp, "sl": has_sl}
-
-    # ─────────────────── leverage ─────────────────────────────────────────
-
-    def set_leverage(self, symbol, leverage) -> bool:
-        success = False
-        for side in ("LONG", "SHORT", "BOTH"):
-            try:
-                self._request("POST", "/openApi/swap/v2/trade/leverage",
-                              {"symbol": symbol, "leverage": leverage, "side": side})
-                logger.info(f"{symbol}: leverage {leverage}x ({side})")
-                success = True
-            except BingXError as e:
-                if "110025" in str(e) or "leverage" in str(e).lower():
-                    success = True
-                else:
-                    logger.debug(f"leverage {side}: {e}")
-        return success
-
-    # ─────────────────── ENTRADA — SOLO MARKET ────────────────────────────
-
-    def place_entry(self, symbol, direction, quantity,
-                    position_side=None) -> bool:
-        """
-        CRIT-1: SOLO órdenes MARKET para entradas.
-        Las LIMIT acumulaban docenas de órdenes sin ejecutar.
-        MARKET = ejecución inmediata garantizada.
-        """
-        side     = "BUY" if direction == "long" else "SELL"
-        qty_str  = f"{quantity:.6g}"
-        ps       = (position_side or ("LONG" if direction == "long" else "SHORT")).upper()
-
-        params: Dict[str, Any] = {
-            "symbol":   symbol,
-            "side":     side,
-            "type":     "MARKET",
-            "quantity": qty_str,
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,           # BUY / SELL
+        position_side: str,  # LONG / SHORT
+        order_type: str,     # MARKET / LIMIT
+        quantity: float,
+        price: float = None,
+        stop_price: float = None,
+        reduce_only: bool = False,
+    ) -> dict:
+        url = f"{BASE_URL}/openApi/swap/v2/trade/order"
+        body = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": order_type,
+            "quantity": str(quantity),
         }
-        if ps != "BOTH":
-            params["positionSide"] = ps
+        if price:
+            body["price"] = str(price)
+        if stop_price:
+            body["stopPrice"] = str(stop_price)
+        if reduce_only:
+            body["reduceOnly"] = "true"
+        params = self._build_params(body)
+        async with self.session.post(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
+            if data.get("code") != 0:
+                raise Exception(f"BingX order error: {data}")
+            logger.info(f"Order placed: {data}")
+            return data["data"]
 
-        logger.info(f"{symbol}: MARKET {direction.upper()} qty={qty_str} ps={ps}")
-        try:
-            self._request("POST", "/openApi/swap/v2/trade/order", params)
-            logger.info(f"{symbol}: entrada MARKET OK ✅")
-            return True
-        except BingXError as e:
-            # Fallback sin positionSide (one-way mode)
-            if "positionSide" in params:
-                logger.warning(f"{symbol}: reintentando sin positionSide")
-                params.pop("positionSide")
-                try:
-                    self._request("POST", "/openApi/swap/v2/trade/order", params)
-                    logger.info(f"{symbol}: entrada MARKET (sin ps) OK ✅")
-                    return True
-                except BingXError as e2:
-                    logger.error(f"{symbol}: entrada falló: {e2}")
-                    return False
-            logger.error(f"{symbol}: entrada falló: {e}")
-            return False
+    async def place_market_order(self, symbol: str, side: str, quantity: float) -> dict:
+        position_side = "LONG" if side == "BUY" else "SHORT"
+        return await self.place_order(symbol, side, position_side, "MARKET", quantity)
 
-    # Alias para compatibilidad
-    def place_market_order(self, symbol, side, quantity, position_side=None):
-        direction = "long" if side.upper() == "BUY" else "short"
-        self.place_entry(symbol, direction, quantity, position_side)
+    async def place_tp_sl(
+        self,
+        symbol: str,
+        direction: str,  # BUY or SELL (the original trade direction)
+        quantity: float,
+        sl_price: float,
+        tp_prices: list[float],
+    ) -> list:
+        """Place SL + multiple partial TP orders."""
+        results = []
+        position_side = "LONG" if direction == "BUY" else "SHORT"
+        close_side = "SELL" if direction == "BUY" else "BUY"
 
-    # ─────────────────── TP / SL ─────────────────────────────────────────
+        # Stop-Loss
+        sl = await self.place_order(
+            symbol, close_side, position_side, "STOP_MARKET",
+            quantity, stop_price=sl_price, reduce_only=True
+        )
+        results.append({"type": "SL", "order": sl})
 
-    def place_tp_sl(self, symbol, direction, quantity, tp_price, sl_price,
-                    position_side=None) -> dict:
-        """
-        CRIT-3: 4 métodos de intento para máxima compatibilidad con BingX.
-        """
-        close_side = "SELL" if direction == "long" else "BUY"
-        ps         = (position_side or ("LONG" if direction == "long" else "SHORT")).upper()
-        qty_str    = f"{quantity:.6g}"
-        result     = {"tp": False, "sl": False}
-
-        def _try_order(params_dict) -> bool:
+        # TPs — split quantity equally (or weight toward early TPs)
+        qty_per_tp = round(quantity / len(tp_prices), 4)
+        for idx, tp in enumerate(tp_prices, 1):
             try:
-                self._request("POST", "/openApi/swap/v2/trade/order", params_dict)
-                return True
-            except BingXError as e:
-                logger.debug(f"  order attempt falló: {e}")
-                return False
+                tp_order = await self.place_order(
+                    symbol, close_side, position_side, "TAKE_PROFIT_MARKET",
+                    qty_per_tp, stop_price=tp, reduce_only=True
+                )
+                results.append({"type": f"TP{idx}", "order": tp_order})
+            except Exception as e:
+                logger.warning(f"TP{idx} placement failed: {e}")
 
-        def _base(order_type, stop_p, extra=None):
-            p = {
-                "symbol":    symbol,
-                "side":      close_side,
-                "type":      order_type,
-                "stopPrice": f"{stop_p:.8g}",
-                "quantity":  qty_str,
-            }
-            if ps != "BOTH":
-                p["positionSide"] = ps
-            if extra:
-                p.update(extra)
-            return p
+        return results
 
-        # ── Take Profit ───────────────────────────────────────────────────
-        tp_attempts = [
-            _base("TAKE_PROFIT_MARKET", tp_price, {"workingType": "MARK_PRICE"}),
-            _base("TAKE_PROFIT_MARKET", tp_price, {"workingType": "CONTRACT_PRICE"}),
-            _base("TAKE_PROFIT_MARKET", tp_price),
-        ]
-        # Fallback: TAKE_PROFIT con precio límite
-        offset = 1.001 if direction == "long" else 0.999
-        tp_attempts.append({
-            "symbol": symbol, "side": close_side,
-            "type": "TAKE_PROFIT",
-            "stopPrice": f"{tp_price:.8g}",
-            "price":     f"{tp_price * offset:.8g}",
-            "quantity":  qty_str,
-            "timeInForce": "GTC",
-            **({} if ps == "BOTH" else {"positionSide": ps}),
-        })
+    async def close_position(self, symbol: str, direction: str, quantity: float) -> dict:
+        close_side = "SELL" if direction == "BUY" else "BUY"
+        position_side = "LONG" if direction == "BUY" else "SHORT"
+        return await self.place_order(symbol, close_side, position_side, "MARKET", quantity, reduce_only=True)
 
-        for attempt in tp_attempts:
-            if _try_order(attempt):
-                logger.info(f"{symbol}: TP ✅ @ ${tp_price:.6g} ({attempt.get('type')} {attempt.get('workingType','')})")
-                result["tp"] = True
-                break
+    async def cancel_all_orders(self, symbol: str) -> dict:
+        url = f"{BASE_URL}/openApi/swap/v2/trade/allOpenOrders"
+        params = self._build_params({"symbol": symbol})
+        async with self.session.delete(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
+            return data
 
-        if not result["tp"]:
-            logger.error(f"{symbol}: TP TODOS LOS INTENTOS FALLARON")
-
-        time.sleep(0.5)
-
-        # ── Stop Loss ─────────────────────────────────────────────────────
-        sl_attempts = [
-            _base("STOP_MARKET", sl_price, {"workingType": "MARK_PRICE"}),
-            _base("STOP_MARKET", sl_price, {"workingType": "CONTRACT_PRICE"}),
-            _base("STOP_MARKET", sl_price),
-        ]
-        offset_sl = 0.999 if direction == "long" else 1.001
-        sl_attempts.append({
-            "symbol": symbol, "side": close_side,
-            "type": "STOP",
-            "stopPrice": f"{sl_price:.8g}",
-            "price":     f"{sl_price * offset_sl:.8g}",
-            "quantity":  qty_str,
-            "timeInForce": "GTC",
-            **({} if ps == "BOTH" else {"positionSide": ps}),
-        })
-
-        for attempt in sl_attempts:
-            if _try_order(attempt):
-                logger.info(f"{symbol}: SL ✅ @ ${sl_price:.6g} ({attempt.get('type')} {attempt.get('workingType','')})")
-                result["sl"] = True
-                break
-
-        if not result["sl"]:
-            logger.error(f"{symbol}: SL TODOS LOS INTENTOS FALLARON")
-
-        return result
-
-    # ─────────────────── cierre ───────────────────────────────────────────
-
-    def close_position(self, symbol, direction, quantity, position_side=None) -> bool:
-        """Cierra posición con orden MARKET reduceOnly."""
-        close_side = "SELL" if direction == "long" else "BUY"
-        ps         = (position_side or ("LONG" if direction == "long" else "SHORT")).upper()
-        qty_str    = f"{quantity:.6g}"
-
-        params: Dict[str, Any] = {
-            "symbol":     symbol,
-            "side":       close_side,
-            "type":       "MARKET",
-            "quantity":   qty_str,
-        }
-        if ps != "BOTH":
-            params["positionSide"] = ps
-        else:
-            params["reduceOnly"] = "true"
-
-        try:
-            self._request("POST", "/openApi/swap/v2/trade/order", params)
-            logger.info(f"{symbol}: cierre MARKET {direction.upper()} ✅")
-            return True
-        except BingXError as e:
-            # Fallback reduceOnly
-            try:
-                fb = {"symbol": symbol, "side": close_side, "type": "MARKET",
-                      "quantity": qty_str, "reduceOnly": "true"}
-                self._request("POST", "/openApi/swap/v2/trade/order", fb)
-                logger.info(f"{symbol}: cierre fallback ✅")
-                return True
-            except BingXError as e2:
-                logger.error(f"{symbol}: cierre falló: {e2}")
-                return False
-
-    def close_all_positions(self, symbol: str) -> bool:
-        """Cierra todas las posiciones del símbolo."""
-        try:
-            positions = self.get_positions(symbol)
-            closed = 0
-            for pos in positions:
-                amt = float(pos.get("positionAmt", 0))
-                if amt == 0:
-                    continue
-                ps  = str(pos.get("positionSide", "BOTH")).upper()
-                direction = "long" if (ps == "LONG" or (ps == "BOTH" and amt > 0)) else "short"
-                if self.close_position(symbol, direction, abs(amt), ps):
-                    closed += 1
-            return closed > 0
-        except Exception as e:
-            logger.error(f"close_all {symbol}: {e}")
-            return False
-
-    # ─────────────────── telegram ─────────────────────────────────────────
-
-    def send_telegram(self, message: str):
-        if not self.telegram_token or not self.telegram_chat:
-            return
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
-                json={"chat_id": self.telegram_chat, "text": message, "parse_mode": "HTML"},
-                timeout=5,
-            )
-        except Exception as e:
-            logger.debug(f"Telegram: {e}")
+    async def set_leverage(self, symbol: str, leverage: int, margin_type: str = "ISOLATED") -> dict:
+        url = f"{BASE_URL}/openApi/swap/v2/trade/leverage"
+        params = self._build_params({"symbol": symbol, "leverage": leverage, "marginType": margin_type})
+        async with self.session.post(url, params=params, headers=self._headers()) as r:
+            data = await r.json()
+            return data
