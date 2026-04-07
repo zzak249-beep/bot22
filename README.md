@@ -1,175 +1,382 @@
-# 🎯 Sniper Entry/Exit Bot — KhanSaab V.02
+# 🚀 Advanced Trading Bot V2 - BingX Edition
 
-Automated trading bot based on the **Sniper Entry/Exit with SL&TP** Pine Script strategy, running on **BingX Perpetual Futures** with **Telegram signals**.
+Bot de trading automatizado con **estrategias duales**, gestión inteligente de comisiones y sistema de aprendizaje.
 
----
+## ✨ Características Principales
 
-## 📁 File Structure
+### 🎯 Estrategias Duales
+- **Sniper Strategy**: Cruces de EMA 9/21 con scoring multi-indicador
+- **VWAP Volatility Bands**: Sistema T3-smoothed con bandas de volatilidad ATR
+- **Modo Híbrido**: Confluencia de ambas estrategias para mayor precisión
 
-```
-sniper_bot/
-├── bot.py            # Main loop & orchestrator
-├── strategy.py       # Pine Script → Python (EMA cross, scores, levels)
-├── bingx_client.py   # BingX API (orders, positions, klines)
-├── telegram_bot.py   # Telegram alerts
-├── risk_manager.py   # Position sizing & guards
-├── requirements.txt
-├── Dockerfile
-├── railway.json
-├── .env.example
-└── README.md
-```
+### 💰 Optimización de Comisiones
+- ✅ Cálculo automático de breakeven incluyendo fees
+- ✅ Ajuste dinámico de TPs para garantizar profit después de comisiones
+- ✅ Tracking detallado de costos por trade
 
----
+### 📊 Sistema de Aprendizaje
+- ✅ Análisis automático de trades pasados
+- ✅ Detección de patrones de pérdida
+- ✅ Recomendaciones de optimización
+- ✅ Métricas de rendimiento por estrategia
 
-## ⚙️ Strategy Logic
-
-| Component | Detail |
-|-----------|--------|
-| **Signal** | EMA 9 / EMA 21 crossover (buy) / crossunder (sell) |
-| **Bull/Bear Score** | 7-factor scoring (VWAP, RSI, MACD, EMA, ADX, Volume, 5m RSI) |
-| **SL** | Entry ± (ATR × multiplier) |
-| **TP1–TP5** | Entry ± (ATR × 1R … 5R) |
-| **Bias** | STRONG BULL / MILD BULL / MILD BEAR / STRONG BEAR |
+### 🛡️ Gestión de Riesgo
+- ✅ Position sizing basado en % de balance
+- ✅ 5 niveles de Take Profit (TP1-TP5)
+- ✅ Stop Loss dinámico basado en ATR
+- ✅ Máximo de posiciones simultáneas
 
 ---
 
-## 🚀 Quick Start (Local)
+## 📋 Requisitos
 
-### 1. Clone & Install
+### Sistema
+- Python 3.9 o superior
+- Cuenta en BingX con API habilitada
+- Bot de Telegram (opcional, pero recomendado)
+
+### API Keys Requeridas
+1. **BingX API**: https://bingx.com/en-us/account/api/
+2. **Telegram Bot**: @BotFather en Telegram
+
+---
+
+## 🔧 Instalación
+
+### 1. Clonar o descargar archivos
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/sniper-bot.git
-cd sniper-bot
+# Estructura de archivos necesaria:
+bot_v2.py
+strategy_vwap.py
+strategy_sniper.py
+trade_analyzer.py
+bingx_client.py        # (tu implementación existente)
+telegram_bot.py        # (tu implementación existente)
+risk_manager.py        # (tu implementación existente)
+```
+
+### 2. Instalar dependencias
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure
+### 3. Configurar variables de entorno
 
 ```bash
+# Copiar archivo de ejemplo
 cp .env.example .env
-# Edit .env with your keys
+
+# Editar con tus credenciales
+nano .env  # o tu editor favorito
 ```
 
-### 3. Get your Telegram Bot
-
-1. Message [@BotFather](https://t.me/BotFather) → `/newbot` → copy **token**
-2. Message [@userinfobot](https://t.me/userinfobot) → copy your **chat_id**
-3. Start your bot (send it `/start`)
-
-### 4. Get BingX API Keys
-
-1. Login to [BingX](https://bingx.com)
-2. Account → API Management → Create API
-3. Enable: **Read**, **Trade** (do NOT enable withdrawal)
-4. Whitelist your IP if possible
-5. Copy **API Key** and **Secret Key**
-
-### 5. Run (signals only first!)
+**Configuración mínima requerida:**
 
 ```bash
-# Test with SIGNALS_ONLY=true first
-SIGNALS_ONLY=true python bot.py
+# API Keys
+BINGX_API_KEY=tu_api_key_aqui
+BINGX_SECRET=tu_secret_key_aqui
+TG_TOKEN=tu_telegram_bot_token
+TG_CHAT_ID=tu_chat_id
+
+# Trading
+SYMBOL=BTC-USDT
+TIMEFRAME=15m
+LEVERAGE=10
+RISK_PCT=1.0
+
+# IMPORTANTE: Empieza en modo prueba
+SIGNALS_ONLY=true
 ```
 
 ---
 
-## 🚂 Deploy on Railway
+## 🚀 Uso
 
-### Method A — GitHub (recommended)
-
-1. Push repo to GitHub:
-```bash
-git init
-git add .
-git commit -m "Initial sniper bot"
-git remote add origin https://github.com/YOUR_USERNAME/sniper-bot.git
-git push -u origin main
-```
-
-2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
-
-3. Select your repo → Railway auto-detects Dockerfile ✅
-
-4. Click **Variables** → Add each variable from `.env.example`:
-
-| Variable | Value |
-|----------|-------|
-| `BINGX_API_KEY` | your key |
-| `BINGX_SECRET` | your secret |
-| `TG_TOKEN` | your bot token |
-| `TG_CHAT_ID` | your chat id |
-| `SYMBOL` | `BTC-USDT` |
-| `TIMEFRAME` | `15m` |
-| `RISK_PCT` | `1.0` |
-| `LEVERAGE` | `5` |
-| `SIGNALS_ONLY` | `false` |
-| `ATR_MULTIPLIER` | `1.5` |
-| `POLL_SECONDS` | `60` |
-
-5. Click **Deploy** — done! 🎉
-
-### Method B — Railway CLI
+### Modo Señales (Recomendado para empezar)
 
 ```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway up
-railway variables set BINGX_API_KEY=xxx BINGX_SECRET=xxx TG_TOKEN=xxx TG_CHAT_ID=xxx
+# Solo envía señales por Telegram, NO ejecuta trades
+export SIGNALS_ONLY=true
+python bot_v2.py
+```
+
+### Modo Trading en Vivo
+
+```bash
+# ⚠️ CUIDADO: Ejecuta trades reales con dinero real
+export SIGNALS_ONLY=false
+python bot_v2.py
 ```
 
 ---
 
-## 📊 Environment Variables Reference
+## ⚙️ Configuración de Estrategias
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SYMBOL` | `BTC-USDT` | Trading pair (BingX format) |
-| `TIMEFRAME` | `15m` | Candle interval for signals |
-| `RISK_PCT` | `1.0` | % of balance to risk per trade |
-| `LEVERAGE` | `10` | Futures leverage (⚠️ start with 5) |
-| `ATR_MULTIPLIER` | `1.5` | SL distance multiplier |
-| `POLL_SECONDS` | `60` | Loop interval in seconds |
-| `SIGNALS_ONLY` | `false` | If `true`, only send Telegram, no orders |
-| `HEARTBEAT_HOURS` | `4` | Alive ping interval |
+### Estrategia Sniper (EMA)
+Basada en cruces de EMA 9/21 con sistema de scoring:
 
----
-
-## 📲 Telegram Messages
-
-| Event | Message |
-|-------|---------|
-| Bot starts | 🚀 Bot started with config |
-| New signal | 🟢/🔴 Full signal with all TP/SL levels |
-| TP hit | 🔥 Target hit with PnL |
-| SL hit | 🛑 Stop loss with PnL |
-| Order filled | ✅ Entry confirmed |
-| Error | ⚠️ Error details |
-| Heartbeat | 💓 Balance + PnL status every N hours |
-
----
-
-## ⚠️ Risk Warnings
-
-- **Start with `SIGNALS_ONLY=true`** until you trust the signals
-- **Use low leverage** (3-5x) when starting with real money
-- **Never risk more than 1-2%** per trade
-- This bot trades **perpetual futures** — losses can exceed initial investment
-- Past performance does not guarantee future results
-- **You are responsible** for all trades
-
----
-
-## 🛠 Supported Symbols (BingX format)
-
-```
-BTC-USDT   ETH-USDT   SOL-USDT   BNB-USDT
-XRP-USDT   DOGE-USDT  ADA-USDT   AVAX-USDT
+```bash
+STRATEGY=sniper
+MIN_SCORE_DIFF=40.0  # Diferencia mínima para señal STRONG
 ```
 
+**Componentes del Score:**
+- Posición vs VWAP
+- RSI > 50 (bull) o < 50 (bear)
+- MACD vs Signal
+- EMA 9 vs EMA 21
+- ADX > 25 con dirección
+- Volumen > promedio
+- RSI 5m confirmación
+
+### Estrategia VWAP Volatility Bands
+Sistema T3-smoothed con bandas de volatilidad:
+
+```bash
+STRATEGY=vwap
+```
+
+**Características:**
+- VWAP anclado por sesión
+- Smoothing T3 (6-stage EMA cascade)
+- 4 bandas de volatilidad (0.5x, 1.0x, 1.5x, 2.2x ATR)
+- Señales en cruces de pendiente T3
+
+### Modo Híbrido (Recomendado)
+Requiere confluencia de ambas estrategias:
+
+```bash
+STRATEGY=hybrid
+```
+
+**Señal BUY:** Sniper BUY + VWAP BUY  
+**Señal SELL:** Sniper SELL + VWAP SELL
+
 ---
 
-## 📝 License
+## 📊 Análisis de Rendimiento
 
-Private use only. Strategy © KhanSaab 2026.
+### Métricas en Tiempo Real
+
+El bot genera automáticamente:
+
+```bash
+/tmp/bot_state.json           # Estado actual del trade
+/tmp/trades_history.json      # Historial de trades
+/tmp/performance_metrics.json # Métricas calculadas
+```
+
+### Ver Métricas
+
+```python
+from trade_analyzer import TradeAnalyzer
+
+analyzer = TradeAnalyzer(
+    "/tmp/trades_history.json",
+    "/tmp/performance_metrics.json"
+)
+
+# Reporte completo
+print(analyzer.get_performance_report())
+
+# Análisis de errores
+errors = analyzer.analyze_errors()
+print(errors)
+```
+
+### Métricas Incluidas
+
+- **Win Rate**: % de trades ganadores
+- **Total PnL**: Ganancia/pérdida total
+- **Comisiones**: Fees pagados totales
+- **Profit Factor**: Ratio ganancia/pérdida
+- **Max Drawdown**: Máxima pérdida consecutiva
+- **Performance por Estrategia**: Comparativa VWAP vs Sniper
+- **Distribución de TPs**: ¿Qué TPs se alcanzan más?
+
+---
+
+## 🔍 Solución de Problemas
+
+### Error: `KeyError: 'BINGX_SECRET'`
+
+**Causa:** Variables de entorno no configuradas  
+**Solución:**
+
+```bash
+# Verifica que el archivo .env existe
+cat .env
+
+# Carga las variables manualmente
+export $(cat .env | xargs)
+
+# O usa python-dotenv
+pip install python-dotenv
+```
+
+### El bot no ejecuta trades
+
+**Posibles causas:**
+
+1. **SIGNALS_ONLY=true**
+   ```bash
+   # Cambiar a false para trading real
+   export SIGNALS_ONLY=false
+   ```
+
+2. **Balance insuficiente**
+   - Verifica tu balance en BingX
+   - El bot necesita margen disponible
+
+3. **Posición máxima alcanzada**
+   - El risk manager bloquea nuevas posiciones
+   - Cierra posiciones existentes primero
+
+### Señales pero sin confluencia (Hybrid)
+
+**Causa:** Las estrategias no están alineadas  
+**Solución:**
+
+```bash
+# Cambiar a una sola estrategia
+STRATEGY=sniper  # o STRATEGY=vwap
+```
+
+### Comisiones muy altas
+
+**Optimizaciones:**
+
+1. **Reducir frecuencia de trades**
+   ```bash
+   POLL_SECONDS=300  # 5 minutos en vez de 60
+   ```
+
+2. **Aumentar distancia de TPs**
+   ```bash
+   ATR_MULTIPLIER=2.0  # En vez de 1.5
+   ```
+
+3. **Usar órdenes limit** (modificación en código)
+
+---
+
+## 🎯 Mejores Prácticas
+
+### 1. Empezar con Precaución
+
+```bash
+# Primero en modo señales
+SIGNALS_ONLY=true
+LEVERAGE=5
+RISK_PCT=0.5
+```
+
+### 2. Monitorear Regularmente
+
+```bash
+# Heartbeat cada 4 horas
+HEARTBEAT_HOURS=4
+
+# Revisar métricas diariamente
+python -c "from trade_analyzer import TradeAnalyzer; \
+  a = TradeAnalyzer('/tmp/trades_history.json', '/tmp/performance_metrics.json'); \
+  print(a.get_performance_report())"
+```
+
+### 3. Ajustar Según Resultados
+
+- **Win Rate < 40%**: Cambiar estrategia o parámetros
+- **Comisiones > 30% de PnL**: Reducir frecuencia
+- **TP1 raramente alcanzado**: Reducir ATR_MULTIPLIER
+
+### 4. Diversificar
+
+```bash
+# No todo el capital en un símbolo
+RISK_PCT=0.5  # 0.5% por trade
+LEVERAGE=5    # Apalancamiento moderado
+```
+
+---
+
+## 🚨 Advertencias Importantes
+
+### ⚠️ Riesgo de Pérdida
+
+- Trading con apalancamiento conlleva **alto riesgo**
+- Solo opera con capital que puedas **permitirte perder**
+- Las estrategias pasadas **no garantizan resultados futuros**
+
+### 🔒 Seguridad
+
+- **NUNCA** compartas tus API keys
+- Activa **2FA** en BingX
+- Usa **IP Whitelisting** si es posible
+- Limita **permisos de API** (solo trading, no withdrawals)
+
+### 📉 Backtest Primero
+
+- Prueba en **paper trading** extensivamente
+- Analiza **al menos 100 trades** antes de ir en vivo
+- Verifica **win rate > 50%** y **profit factor > 1.5**
+
+---
+
+## 📚 Recursos Adicionales
+
+### Documentación BingX
+- API Docs: https://bingx-api.github.io/docs/
+- Fees: https://bingx.com/en-us/support/articles/360016768834
+
+### Aprender Trading
+- ATR: https://www.investopedia.com/terms/a/atr.asp
+- VWAP: https://www.investopedia.com/terms/v/vwap.asp
+- Risk Management: https://www.investopedia.com/articles/trading/09/risk-management.asp
+
+---
+
+## 🛠️ Soporte y Desarrollo
+
+### Reportar Bugs
+
+Si encuentras un error:
+
+1. **Revisa los logs**: `tail -f /tmp/bot.log`
+2. **Verifica configuración**: `cat .env`
+3. **Incluye detalles**: Versión Python, mensaje de error, configuración
+
+### Contribuir
+
+Mejoras bienvenidas:
+
+- Nuevas estrategias
+- Optimizaciones de comisiones
+- Mejores métricas de análisis
+- Tests automatizados
+
+---
+
+## 📜 Licencia
+
+Este software se proporciona "tal cual", sin garantías de ningún tipo.
+El uso es bajo tu propia responsabilidad y riesgo.
+
+---
+
+## 🏆 Roadmap Futuro
+
+- [ ] Backtesting engine completo
+- [ ] Optimización automática de parámetros
+- [ ] Soporte multi-símbolo
+- [ ] Dashboard web en tiempo real
+- [ ] Machine learning para predicción
+- [ ] Grid trading automático
+
+---
+
+**¡Buena suerte en tu trading! 🚀📈**
+
+*Recuerda: La clave del éxito es la disciplina, el análisis constante y la gestión de riesgo.*
