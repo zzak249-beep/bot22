@@ -4,7 +4,7 @@ Estrategia basada en cruces de EMA con scoring multi-indicador
 """
 import pandas as pd
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple
 
 
 class SniperStrategy:
@@ -186,7 +186,6 @@ class SniperStrategy:
         rsi_5m = None
         if df_5m is not None and len(df_5m) >= 14:
             rsi_5m_series = self.calculate_rsi(df_5m['close'], 14)
-            # Usar último valor para todo el df principal
             rsi_5m = pd.Series(rsi_5m_series.iloc[-1], index=df.index)
         
         # Scoring system
@@ -235,7 +234,6 @@ class SniperStrategy:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Test
     np.random.seed(42)
     dates = pd.date_range('2024-01-01', periods=500, freq='15min')
     
