@@ -4,25 +4,24 @@ Risk Manager
 - Max open positions cap
 - Daily loss limit (kill switch)
 - Leverage control
-- Trailing stop logic
 - Commission-aware P&L tracking
+- Compatible with bot_v2.py interface
 """
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
 
 # ── Config (override via env vars in bot.py) ─────────────────────────
-RISK_PER_TRADE   = 0.01    # 1% balance per trade
-MAX_POSITIONS    = 5       # concurrent open trades
-LEVERAGE         = 5       # 5x isolated (conservative)
-DAILY_LOSS_LIMIT = 0.05    # 5% daily drawdown → pause
-WEEKLY_LOSS_LIMIT = 0.10   # 10% weekly → halt harder
-MIN_NOTIONAL     = 6.0     # BingX min order ~$5 USDT, use $6 buffer
-PARTIAL_TP_PCT   = 0.50    # close 50% at TP1
-MAKER_FEE        = 0.0002  # 0.02% maker fee
-TAKER_FEE        = 0.0005  # 0.05% taker fee
+RISK_PER_TRADE    = 0.01   # 1% balance per trade
+MAX_POSITIONS     = 5      # concurrent open trades
+LEVERAGE          = 5      # 5x isolated (conservative)
+DAILY_LOSS_LIMIT  = 0.05   # 5% daily drawdown → pause
+MIN_NOTIONAL      = 6.0    # BingX min order ~$5 USDT, use $6 buffer
+PARTIAL_TP_PCT    = 0.50   # close 50% at TP1
+MAKER_FEE         = 0.0002 # 0.02% maker fee
+TAKER_FEE         = 0.0005 # 0.05% taker fee
 
 
 @dataclass
@@ -38,24 +37,31 @@ class TradeParams:
     leverage:       int
     notional:       float
     risk_usdt:      float
-    est_fee:        float   # estimated round-trip fee
+    est_fee:        float
 
 
 class RiskManager:
-    def __init__(self, risk_pct: float = RISK_PER_TRADE,
-                 max_pos: int = MAX_POSITIONS,
-                 leverage: int = LEVERAGE,
-                 daily_loss_limit: float = DAILY_LOSS_LIMIT):
-        self.risk_pct          = risk_pct
-        self.max_pos           = max_pos
-        self.leverage          = leverage
-        self.daily_loss_limit  = daily_loss_limit
+    def __init__(
+        self,
+        risk_pct: float = RISK_PER_TRADE,
+        max_pos: int = MAX_POSITIONS,
+        leverage: int = LEVERAGE,
+        max_leverage: int = None,        # alias para compatibilidad con bot_v2.py
+        daily_loss_limit: float = DAILY_LOSS_LIMIT,
+    ):
+        self.risk_pct         = risk_pct
+        self.max_pos          = max_pos
+        # Acepta tanto 'leverage' como 'max_leverage'
+        self.leverage         = max_leverage if max_leverage is not None else leverage
+        self.daily_loss_limit = daily_loss_limit
 
         self._daily_start_balance: Optional[float] = None
-        self._daily_pnl: float     = 0.0
-        self._daily_trades: int    = 0
-        self._weekly_pnl: float    = 0.0
-        self._total_fees: float    = 0.0
+        self._daily_pnl: float    = 0.0
+        self._daily_trades: int   = 0
+        self._weekly_pnl: float   = 0.0
+        self._total_fees: float   = 0.0
+
+    # ── Daily Management ──────────────────────────────────────────────
 
     def reset_daily(self, balance: float):
         self._daily_start_balance = balance
@@ -64,9 +70,9 @@ class RiskManager:
         log.info(f"📅 Daily reset | Balance: {balance:.2f} USDT | Leverage: {self.leverage}x")
 
     def record_pnl(self, pnl_usdt: float, fee: float = 0.0):
-        self._daily_pnl    += pnl_usdt
-        self._weekly_pnl   += pnl_usdt
-        self._total_fees   += fee
+        self._daily_pnl  += pnl_usdt
+        self._weekly_pnl += pnl_usdt
+        self._total_fees += fee
         self._daily_trades += 1
         log.info(
             f"📊 P&L record: {pnl_usdt:+.2f} USDT | "
@@ -81,12 +87,15 @@ class RiskManager:
         if daily_loss_pct >= self.daily_loss_limit:
             log.warning(
                 f"⛔ KILL SWITCH: Daily loss {daily_loss_pct*100:.1f}% "
-                f"≥ {self.daily_loss_limit*100:.0f}%"
+                f">= {self.daily_loss_limit*100:.0f}%"
             )
             return True
         return False
 
+    # ── Trade Checks ──────────────────────────────────────────────────
+
     def can_open_trade(self, open_positions: int, balance: float) -> bool:
+        """Versión original"""
         if open_positions >= self.max_pos:
             log.info(f"Max positions ({self.max_pos}) reached.")
             return False
@@ -96,6 +105,64 @@ class RiskManager:
             log.warning(f"Balance too low: {balance:.2f} USDT")
             return False
         return True
+
+    def check_trade_allowed(
+        self, open_positions: int, balance: float
+    ) -> Tuple[bool, str]:
+        """
+        Versión usada por bot_v2.py.
+        Retorna (allowed: bool, reason: str)
+        """
+        if open_positions >= self.max_pos:
+            return False, f"Máximo de posiciones alcanzado ({self.max_pos})"
+        if self.is_kill_switch(balance):
+            return False, f"Kill switch activado (pérdida diaria >= {self.daily_loss_limit*100:.0f}%)"
+        if balance < MIN_NOTIONAL * 2:
+            return False, f"Balance insuficiente: ${balance:.2f} USDT"
+        return True, "OK"
+
+    # ── Position Sizing ───────────────────────────────────────────────
+
+    def position_size(
+        self,
+        balance: float,
+        entry: float,
+        sl: float,
+        leverage: int = None,
+        qty_precision: int = 3,
+    ) -> float:
+        """
+        Versión simplificada usada por bot_v2.py.
+        Retorna qty (float) directamente.
+        """
+        lev = leverage if leverage is not None else self.leverage
+        risk_usdt = balance * self.risk_pct
+        sl_dist   = abs(entry - sl)
+
+        if sl_dist < 1e-10:
+            log.warning("SL demasiado cercano a entry, qty = 0")
+            return 0.0
+
+        qty = round(risk_usdt / sl_dist, qty_precision)
+
+        # Mínimo notional
+        if qty * entry < MIN_NOTIONAL:
+            qty = round(MIN_NOTIONAL / entry * 1.05, qty_precision)
+
+        # Verificar margen
+        notional = qty * entry
+        margin_required = notional / lev
+        if margin_required > balance * 0.30:
+            log.warning(
+                f"Margen requerido ${margin_required:.2f} > 30% balance, reduciendo"
+            )
+            qty = round((balance * 0.30 * lev) / entry, qty_precision)
+
+        log.info(
+            f"📐 position_size: qty={qty} entry={entry:.4f} "
+            f"SL={sl:.4f} risk=${risk_usdt:.2f} notional=${qty*entry:.2f}"
+        )
+        return max(qty, 0.0)
 
     def size_position(
         self,
@@ -110,14 +177,7 @@ class RiskManager:
         qty_precision: int = 3,
         price_precision: int = 4,
     ) -> Optional[TradeParams]:
-        """
-        Fixed-risk position sizing:
-          risk_usdt = balance * risk_pct
-          qty = risk_usdt / |entry - sl|
-        Note: leverage does NOT multiply qty here.
-        We're sizing based on actual $ at risk if SL hits.
-        Margin used = qty * entry / leverage.
-        """
+        """Versión completa con TradeParams (compatible con bot.py original)"""
         risk_usdt = balance * self.risk_pct
         sl_dist   = abs(entry - sl)
 
@@ -125,7 +185,6 @@ class RiskManager:
             log.warning(f"SL too close to entry for {symbol}, skipping")
             return None
 
-        # Qty in base currency (coins)
         qty_raw = risk_usdt / sl_dist
         qty     = round(qty_raw, qty_precision)
 
@@ -135,44 +194,32 @@ class RiskManager:
 
         notional = qty * entry
 
-        # Enforce minimum notional
         if notional < MIN_NOTIONAL:
             qty      = round(MIN_NOTIONAL / entry * 1.05, qty_precision)
             notional = qty * entry
 
-        # Check margin requirement
         margin_required = notional / self.leverage
         if margin_required > balance * 0.30:
             log.warning(
-                f"Trade {symbol} margin {margin_required:.2f} USDT > 30% balance "
-                f"({balance*0.30:.2f}), skipping"
+                f"Trade {symbol} margin {margin_required:.2f} USDT > 30% balance, skipping"
             )
             return None
 
-        # Estimated fee (entry LIMIT + exit LIMIT = 2x maker)
         est_fee = notional * MAKER_FEE * 2
-
-        ep  = round(entry, price_precision)
-        slp = round(sl,   price_precision)
-        t1  = round(tp1,  price_precision)
-        t2  = round(tp2,  price_precision)
-        t3  = round(tp3,  price_precision)
-
-        log.info(
-            f"📐 Size [{symbol}] {direction} qty={qty} "
-            f"entry={ep} SL={slp} TP1={t1} TP2={t2} "
-            f"notional=${notional:.1f} risk=${risk_usdt:.2f} "
-            f"margin=${margin_required:.2f} fee≈${est_fee:.3f}"
-        )
 
         return TradeParams(
             symbol=symbol, direction=direction,
-            entry_price=ep, sl_price=slp,
-            tp1_price=t1, tp2_price=t2, tp3_price=t3,
+            entry_price=round(entry, price_precision),
+            sl_price=round(sl, price_precision),
+            tp1_price=round(tp1, price_precision),
+            tp2_price=round(tp2, price_precision),
+            tp3_price=round(tp3, price_precision),
             quantity=qty, leverage=self.leverage,
             notional=notional, risk_usdt=risk_usdt,
             est_fee=est_fee,
         )
+
+    # ── Utilities ─────────────────────────────────────────────────────
 
     def partial_close_qty(self, qty: float, qty_precision: int = 3) -> float:
         return round(qty * PARTIAL_TP_PCT, qty_precision)
