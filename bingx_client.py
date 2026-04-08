@@ -1,7 +1,7 @@
 """
 BingX API Client - Perpetual Futures (Swap)
 Optimized for low fees using maker orders.
-Fixed: retry logic, rate limiting, proper error handling.
+Fixed: retry logic, rate limiting, proper error handling, balance parsing.
 """
 import hmac, hashlib, time, requests, json, logging
 from urllib.parse import urlencode
@@ -71,6 +71,41 @@ class BingXClient:
     def _post(self, path: str, params: dict = None) -> dict:
         return self._request("POST", path, params)
 
+    # ── Helpers ───────────────────────────────────────────────────────────
+    def _parse_balance_data(self, data: dict) -> Optional[dict]:
+        """
+        Handles multiple BingX API response formats for balance:
+        - Format A: data.balance = [ {"asset": "USDT", ...}, ... ]
+        - Format B: data.balance = { "asset": "USDT", ... }
+        - Format C: data = { "asset": "USDT", ... }
+        Returns the USDT balance dict or None.
+        """
+        raw = data.get("data", {})
+        log.debug(f"Raw balance response: {raw}")
+
+        balance = raw.get("balance", raw)  # fallback to raw if no "balance" key
+
+        if isinstance(balance, dict):
+            # Format B or C — single dict
+            if balance.get("asset") == "USDT":
+                return balance
+            # Maybe it's nested differently, search values
+            for v in balance.values():
+                if isinstance(v, dict) and v.get("asset") == "USDT":
+                    return v
+            # If no asset key, assume it's the USDT balance directly
+            if "availableMargin" in balance or "equity" in balance:
+                return balance
+
+        elif isinstance(balance, list):
+            # Format A — list of dicts or strings
+            for a in balance:
+                if isinstance(a, dict) and a.get("asset") == "USDT":
+                    return a
+
+        log.warning(f"Could not parse balance from response: {data}")
+        return None
+
     # ── Market Data ───────────────────────────────────────────────────────
     def get_all_symbols(self) -> list:
         data = self._get("/openApi/swap/v2/quote/contracts")
@@ -116,16 +151,16 @@ class BingXClient:
     # ── Account ───────────────────────────────────────────────────────────
     def get_balance(self) -> float:
         data = self._get("/openApi/swap/v2/user/balance")
-        for a in data.get("data", {}).get("balance", []):
-            if a.get("asset") == "USDT":
-                return float(a.get("availableMargin", 0))
+        usdt = self._parse_balance_data(data)
+        if usdt:
+            return float(usdt.get("availableMargin", 0))
         return 0.0
 
     def get_total_equity(self) -> float:
         data = self._get("/openApi/swap/v2/user/balance")
-        for a in data.get("data", {}).get("balance", []):
-            if a.get("asset") == "USDT":
-                return float(a.get("equity", 0))
+        usdt = self._parse_balance_data(data)
+        if usdt:
+            return float(usdt.get("equity", 0))
         return 0.0
 
     def get_positions(self) -> list:
