@@ -1,7 +1,7 @@
 """
 BingX API Client - Perpetual Futures (Swap)
 Async version compatible with bot_v2.py (aiohttp).
-Fixed: retry logic, rate limiting, proper error handling, balance parsing.
+Fixed: retry logic, rate limiting, proper error handling, balance parsing, klines format.
 """
 import hmac, hashlib, time, json, logging
 import asyncio
@@ -36,7 +36,6 @@ class BingXClient:
             self._session = None
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """Obtener sesión activa o crear una nueva si no existe"""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(headers={
                 "X-BX-APIKEY": self.api_key,
@@ -125,6 +124,36 @@ class BingXClient:
         log.warning(f"Could not parse balance from response: {data}")
         return None
 
+    def _parse_kline(self, k) -> Optional[dict]:
+        """
+        Parsear una vela — soporta formato lista [ts, o, h, l, c, v]
+        y formato dict {"time": ..., "open": ..., etc.}
+        """
+        try:
+            if isinstance(k, (list, tuple)):
+                return {
+                    "ts":     int(k[0]),
+                    "open":   float(k[1]),
+                    "high":   float(k[2]),
+                    "low":    float(k[3]),
+                    "close":  float(k[4]),
+                    "volume": float(k[5]),
+                }
+            elif isinstance(k, dict):
+                # Formato dict — BingX usa "time"/"open"/"high"/"low"/"close"/"volume"
+                ts = k.get("time") or k.get("t") or k.get("openTime") or k.get("open_time") or 0
+                return {
+                    "ts":     int(ts),
+                    "open":   float(k.get("open",   k.get("o", 0))),
+                    "high":   float(k.get("high",   k.get("h", 0))),
+                    "low":    float(k.get("low",    k.get("l", 0))),
+                    "close":  float(k.get("close",  k.get("c", 0))),
+                    "volume": float(k.get("volume", k.get("v", 0))),
+                }
+        except (IndexError, ValueError, TypeError, KeyError) as e:
+            log.warning(f"Error parsing kline {k}: {e}")
+        return None
+
     # ── Market Data ───────────────────────────────────────────────────────
     async def get_all_symbols(self) -> list:
         data = await self._get("/openApi/swap/v2/quote/contracts")
@@ -138,19 +167,17 @@ class BingXClient:
             "symbol": symbol, "interval": interval, "limit": limit
         })
         raw = data.get("data", [])
+
+        # Log del primer elemento para debug si hay problemas
+        if raw:
+            log.debug(f"Kline sample for {symbol}: {raw[0]}")
+
         candles = []
         for k in raw:
-            try:
-                candles.append({
-                    "ts":     int(k[0]),
-                    "open":   float(k[1]),
-                    "high":   float(k[2]),
-                    "low":    float(k[3]),
-                    "close":  float(k[4]),
-                    "volume": float(k[5]),
-                })
-            except (IndexError, ValueError, TypeError):
-                continue
+            parsed = self._parse_kline(k)
+            if parsed:
+                candles.append(parsed)
+
         return sorted(candles, key=lambda x: x["ts"])
 
     async def get_ticker(self, symbol: str) -> dict:
