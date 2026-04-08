@@ -1,255 +1,249 @@
 """
-Sniper Bot — Main orchestrator
-Runs on asyncio loop, polls BingX, evaluates strategy, manages trades.
+SuperBot Main Orchestrator
+Loop: scan → filter → open trades → manage positions → repeat
+Commission saving strategy:
+  - LIMIT entry orders (maker fee 0.02% vs taker 0.05%)
+  - Partial close at TP1 to lock profit
+  - Trailing via band4 crossover
 """
-import asyncio
-import logging
-import os
-import json
-from datetime import datetime
+import logging, os, time, json
+from datetime import datetime, timezone
+from typing import Optional
 
-import pandas as pd
-
-from strategy import compute_scores, compute_trade_levels
 from bingx_client import BingXClient
-from telegram_bot import TelegramBot
-from risk_manager import RiskManager
+from scanner import Scanner
+from risk_manager import RiskManager, TradeParams
+from strategy import Signal
 
+# ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("SniperBot")
+log = logging.getLogger("BOT")
 
-# ── Config from environment ───────────────────────────────────────────────────
-BINGX_API_KEY   = os.environ["BINGX_API_KEY"]
-BINGX_SECRET    = os.environ["BINGX_SECRET"]
-TG_TOKEN        = os.environ["TG_TOKEN"]
-TG_CHAT_ID      = os.environ["TG_CHAT_ID"]
-SYMBOL          = os.environ.get("SYMBOL", "BTC-USDT")
-TIMEFRAME       = os.environ.get("TIMEFRAME", "15m")
-RISK_PCT        = float(os.environ.get("RISK_PCT", "1.0"))
-LEVERAGE        = int(os.environ.get("LEVERAGE", "10"))
-ATR_MULTIPLIER  = float(os.environ.get("ATR_MULTIPLIER", "1.5"))
-POLL_SECONDS    = int(os.environ.get("POLL_SECONDS", "60"))
-SIGNALS_ONLY    = os.environ.get("SIGNALS_ONLY", "false").lower() == "true"
-HEARTBEAT_HOURS = int(os.environ.get("HEARTBEAT_HOURS", "4"))
+# ── Config from ENV ───────────────────────────────────────────────────
+# Accepts both BINGX_SECRET_KEY and BINGX_SECRET (Railway compatibility)
+API_KEY    = os.environ.get("BINGX_API_KEY")    or os.environ.get("BINGX_KEY")
+SECRET_KEY = os.environ.get("BINGX_SECRET_KEY") or os.environ.get("BINGX_SECRET")
 
-# State file for persistence across restarts
+if not API_KEY or not SECRET_KEY:
+    log.critical(
+        "❌ Missing API credentials!\n"
+        "Set these in Railway → Variables:\n"
+        "  BINGX_API_KEY    = your_api_key\n"
+        "  BINGX_SECRET_KEY = your_secret_key\n"
+        "Bot stopped."
+    )
+    raise SystemExit(1)
+SCAN_PERIOD = int(os.environ.get("SCAN_PERIOD_SECONDS", "900"))   # 15 min
+DRY_RUN     = os.environ.get("DRY_RUN", "false").lower() == "true"
+LIMIT_ENTRY = os.environ.get("LIMIT_ENTRY", "true").lower() == "true"  # maker orders
+SLIPPAGE_OFFSET = 0.0003   # 0.03% offset for limit order vs market price
+
+# ── Tracked trades ────────────────────────────────────────────────────
 STATE_FILE = "/tmp/bot_state.json"
-
-
-def tf_to_minutes(tf: str) -> int:
-    map_ = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-            "1h": 60, "2h": 120, "4h": 240}
-    return map_.get(tf, 15)
-
-
-def klines_to_df(klines: list) -> pd.DataFrame:
-    df = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume", "close_time"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df.set_index("open_time", inplace=True)
-    return df
-
 
 def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"last_signal": None, "trade_direction": None, "entry": None,
-                "sl": None, "tps": [], "qty": 0.0, "tp_hits": []}
-
+        return {"open_trades": {}, "daily_date": "", "trade_log": []}
 
 def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump(state, f, indent=2)
 
 
-class SniperBot:
+class SuperBot:
     def __init__(self):
-        self.bingx = BingXClient(BINGX_API_KEY, BINGX_SECRET)
-        self.tg = TelegramBot(TG_TOKEN, TG_CHAT_ID)
-        self.risk = RiskManager(risk_pct=RISK_PCT, max_leverage=LEVERAGE)
-        self.state = load_state()
-        self._last_heartbeat = datetime.utcnow()
-        self._loop_count = 0
+        self.client  = BingXClient(API_KEY, SECRET_KEY)
+        self.scanner = Scanner(self.client)
+        self.risk    = RiskManager()
+        self.state   = load_state()
+        self._init_daily()
 
-    # ── Data ──────────────────────────────────────────────────────────────────
+    def _init_daily(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.state["daily_date"] != today:
+            balance = self.client.get_balance()
+            self.risk.reset_daily(balance)
+            self.state["daily_date"] = today
+            save_state(self.state)
+            log.info(f"📅 New trading day: {today} | Balance: {balance:.2f} USDT")
 
-    async def fetch_df(self, interval: str, limit: int = 200) -> pd.DataFrame:
-        klines = await self.bingx.get_klines(SYMBOL, interval, limit)
-        return klines_to_df(klines)
+    # ── Symbol meta (precision) ───────────────────────────────────────
+    def _get_precision(self, symbol: str) -> tuple[int, int]:
+        """Returns (qty_precision, price_precision)."""
+        info = self.client.get_symbol_info(symbol)
+        qty_p   = int(info.get("quantityPrecision", 3))
+        price_p = int(info.get("pricePrecision", 4))
+        return qty_p, price_p
 
-    # ── Core logic ────────────────────────────────────────────────────────────
+    # ── Open new trade ────────────────────────────────────────────────
+    def _open_trade(self, symbol: str, signal: Signal):
+        if symbol in self.state["open_trades"]:
+            log.info(f"Already in trade for {symbol}, skip.")
+            return
 
-    async def evaluate(self):
-        df_main = await self.fetch_df(TIMEFRAME)
-        df_5m   = await self.fetch_df("5m")
+        balance = self.client.get_balance()
+        open_count = len(self.state["open_trades"])
+        if not self.risk.can_open_trade(open_count, balance):
+            return
 
-        rsi_5m = None
-        try:
-            from strategy import rsi as compute_rsi
-            rsi_5m_series = compute_rsi(df_5m["close"], 14)
-            # Align index to main df (use last value only)
-            rsi_5m = pd.Series([rsi_5m_series.iloc[-1]] * len(df_main), index=df_main.index)
-        except Exception as e:
-            logger.warning(f"5m RSI fetch failed: {e}")
-
-        scores = compute_scores(df_main, rsi_5m)
-        logger.info(
-            f"[{SYMBOL}] Bull:{scores['bull_pct']:.0f}% Bear:{scores['bear_pct']:.0f}% "
-            f"Bias:{scores['bias']} RSI:{scores['rsi']:.1f} ADX:{scores['adx']:.1f}"
+        qty_p, price_p = self._get_precision(symbol)
+        params = self.risk.size_position(
+            symbol, signal.direction,
+            signal.entry, signal.sl, signal.tp1, signal.tp2, signal.tp3,
+            balance, qty_p, price_p,
         )
-        return scores
-
-    async def handle_new_signal(self, direction: str, scores: dict):
-        entry = scores["close"]
-        levels = compute_trade_levels(entry, scores["atr"], direction, ATR_MULTIPLIER)
-
-        logger.info(f"NEW SIGNAL: {direction} | Entry:{entry:.4f} SL:{levels['sl']:.4f}")
-
-        # Send Telegram signal regardless of mode
-        await self.tg.signal(direction, SYMBOL, levels, scores, TIMEFRAME)
-
-        if SIGNALS_ONLY:
-            logger.info("SIGNALS_ONLY mode — skipping order placement.")
+        if not params:
             return
 
-        # Get balance and compute qty
-        balance_data = await self.bingx.get_balance()
-        balance = float(balance_data.get("availableMargin", 0))
-        qty = self.risk.position_size(balance, entry, levels["sl"], LEVERAGE)
-
-        if qty <= 0:
-            await self.tg.error_alert(f"Position size 0 — balance: ${balance:.2f}")
+        if DRY_RUN:
+            log.info(f"🔵 [DRY RUN] Would open {symbol} {params.direction} x{params.quantity} @ {params.entry_price}")
+            self.state["open_trades"][symbol] = {
+                "direction": params.direction, "entry": params.entry_price,
+                "sl": params.sl_price, "tp1": params.tp1_price,
+                "tp2": params.tp2_price, "tp3": params.tp3_price,
+                "qty": params.quantity, "qty_p": qty_p, "tp1_hit": False,
+                "opened_at": datetime.utcnow().isoformat(),
+            }
+            save_state(self.state)
             return
 
-        # Check if existing position
-        positions = await self.bingx.get_positions(SYMBOL)
-        open_count = sum(1 for p in positions if float(p.get("positionAmt", 0)) != 0)
-        allowed, reason = self.risk.check_trade_allowed(open_count, balance)
-        if not allowed:
-            logger.warning(f"Trade blocked: {reason}")
-            await self.tg.error_alert(f"Trade blocked: {reason}")
-            return
+        try:
+            # Set leverage + isolated margin
+            self.client.set_margin_type(symbol, "ISOLATED")
+            self.client.set_leverage(symbol, params.leverage, params.direction)
 
-        # Set leverage
-        await self.bingx.set_leverage(SYMBOL, LEVERAGE)
+            side     = "BUY"  if params.direction == "LONG" else "SELL"
+            pos_side = params.direction
 
-        # Place market entry
-        order = await self.bingx.place_market_order(SYMBOL, direction, qty)
-        filled_price = float(order.get("price", entry))
-        await self.tg.order_filled(SYMBOL, direction, qty, filled_price)
+            # Commission saving: use LIMIT order (maker fee)
+            if LIMIT_ENTRY:
+                offset = SLIPPAGE_OFFSET * params.entry_price
+                limit_px = params.entry_price - offset if side == "BUY" else params.entry_price + offset
+                limit_px = round(limit_px, price_p)
+                order_type = "LIMIT"
+                price_arg  = limit_px
+            else:
+                order_type = "MARKET"
+                price_arg  = None
 
-        # Place TP/SL bracket
-        tp_list = [levels[f"tp{i}"] for i in range(1, 6)]
-        await self.bingx.place_tp_sl(SYMBOL, direction, qty, levels["sl"], tp_list)
+            result = self.client.place_order(
+                symbol, side, pos_side, order_type, params.quantity,
+                price=price_arg,
+                stop_loss=params.sl_price,
+            )
+            order_id = result.get("data", {}).get("orderId", "?")
+            log.info(
+                f"✅ Opened {symbol} {params.direction} qty={params.quantity} "
+                f"@ {price_arg or 'MARKET'} SL={params.sl_price} | orderId={order_id}"
+            )
 
-        # Save state
-        self.state = {
-            "last_signal": direction,
-            "trade_direction": direction,
-            "entry": filled_price,
-            "sl": levels["sl"],
-            "tps": tp_list,
-            "qty": qty,
-            "tp_hits": [],
-        }
-        save_state(self.state)
+            self.state["open_trades"][symbol] = {
+                "direction": params.direction, "entry": params.entry_price,
+                "sl": params.sl_price, "tp1": params.tp1_price,
+                "tp2": params.tp2_price, "tp3": params.tp3_price,
+                "qty": params.quantity, "qty_p": qty_p, "tp1_hit": False,
+                "order_id": order_id,
+                "opened_at": datetime.utcnow().isoformat(),
+            }
+            save_state(self.state)
 
-    async def monitor_position(self, scores: dict):
-        """Check if TPs have been hit based on current price."""
-        if not self.state.get("trade_direction"):
-            return
+        except Exception as e:
+            log.error(f"❌ Failed to open {symbol}: {e}")
 
-        direction = self.state["trade_direction"]
-        tps = self.state.get("tps", [])
-        tp_hits = self.state.get("tp_hits", [])
-        entry = self.state.get("entry", 0)
-        current = scores["close"]
+    # ── Manage existing trades ────────────────────────────────────────
+    def _manage_positions(self):
+        positions = {p["symbol"]: p for p in self.client.get_positions()}
 
-        for i, tp in enumerate(tps, 1):
-            if i in tp_hits:
+        for symbol, trade in list(self.state["open_trades"].items()):
+            direction = trade["direction"]
+            qty       = trade["qty"]
+            tp1       = trade["tp1"]
+            tp2       = trade["tp2"]
+            tp1_hit   = trade.get("tp1_hit", False)
+            qty_p     = trade.get("qty_p", 3)
+
+            # Check if position still exists
+            if not DRY_RUN and symbol not in positions:
+                pnl_usdt = 0.0  # unknown, was stopped out or TP hit
+                log.info(f"📤 Position closed externally: {symbol}")
+                self.risk.record_pnl(pnl_usdt)
+                del self.state["open_trades"][symbol]
+                save_state(self.state)
                 continue
-            hit = (current >= tp) if direction == "BUY" else (current <= tp)
-            if hit:
-                tp_hits.append(i)
-                pnl_pct = abs(tp - entry) / entry * 100 * LEVERAGE
-                await self.tg.tp_hit(SYMBOL, i, current, pnl_pct)
-                logger.info(f"TP{i} HIT at {current:.4f}")
-                self.state["tp_hits"] = tp_hits
+
+            # Get current price
+            try:
+                ticker = self.client.get_ticker(symbol)
+                price  = float(ticker.get("lastPrice", trade["entry"]))
+            except Exception:
+                continue
+
+            # TP1 partial close (50%)
+            if not tp1_hit:
+                tp1_reached = (direction == "LONG" and price >= tp1) or \
+                              (direction == "SHORT" and price <= tp1)
+                if tp1_reached:
+                    partial_qty = self.risk.partial_close_qty(qty, qty_p)
+                    log.info(f"💰 TP1 hit {symbol}! Closing {partial_qty} of {qty}")
+                    if not DRY_RUN:
+                        try:
+                            self.client.close_position(symbol, direction, partial_qty)
+                        except Exception as e:
+                            log.error(f"Partial close error {symbol}: {e}")
+                    self.state["open_trades"][symbol]["tp1_hit"] = True
+                    self.state["open_trades"][symbol]["qty"] = round(qty - partial_qty, qty_p)
+                    save_state(self.state)
+
+            # TP2 full close
+            tp2_reached = (direction == "LONG" and price >= tp2) or \
+                          (direction == "SHORT" and price <= tp2)
+            if tp2_reached and tp1_hit:
+                remaining = self.state["open_trades"][symbol]["qty"]
+                log.info(f"🎯 TP2 hit {symbol}! Closing remaining {remaining}")
+                if not DRY_RUN:
+                    try:
+                        self.client.close_position(symbol, direction, remaining)
+                        pnl = abs(price - trade["entry"]) * (qty + remaining)
+                        self.risk.record_pnl(pnl)
+                    except Exception as e:
+                        log.error(f"TP2 close error {symbol}: {e}")
+                del self.state["open_trades"][symbol]
                 save_state(self.state)
 
-    async def heartbeat(self, scores: dict):
-        now = datetime.utcnow()
-        hours_since = (now - self._last_heartbeat).total_seconds() / 3600
-        if hours_since < HEARTBEAT_HOURS:
-            return
-        self._last_heartbeat = now
-        try:
-            balance_data = await self.bingx.get_balance()
-            balance = float(balance_data.get("equity", 0))
-            pnl = float(balance_data.get("unrealizedProfit", 0))
-            trade_str = self.state.get("trade_direction") or "None"
-            await self.tg.heartbeat(SYMBOL, balance, pnl, trade_str)
-        except Exception as e:
-            logger.warning(f"Heartbeat failed: {e}")
+    # ── Main loop ─────────────────────────────────────────────────────
+    def run(self):
+        log.info(f"🤖 SuperBot starting | DRY_RUN={DRY_RUN} | SCAN_PERIOD={SCAN_PERIOD}s")
+        while True:
+            try:
+                self._init_daily()
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+                # Manage existing first
+                self._manage_positions()
 
-    async def run(self):
-        logger.info(f"🚀 Sniper Bot starting — {SYMBOL} {TIMEFRAME} leverage:{LEVERAGE}x")
-        await self.tg.send(
-            f"🚀 <b>Sniper Bot STARTED</b>\n"
-            f"Symbol: {SYMBOL}  |  TF: {TIMEFRAME}\n"
-            f"Leverage: {LEVERAGE}x  |  Risk: {RISK_PCT}%\n"
-            f"Mode: {'SIGNALS ONLY 📡' if SIGNALS_ONLY else 'LIVE TRADING 💸'}"
-        )
+                # Scan only if we have capacity
+                balance     = self.client.get_balance()
+                open_count  = len(self.state["open_trades"])
+                if self.risk.can_open_trade(open_count, balance):
+                    results = self.scanner.scan()
+                    for result in results:
+                        if len(self.state["open_trades"]) >= 5:
+                            break
+                        if result.symbol not in self.state["open_trades"]:
+                            self._open_trade(result.symbol, result.signal)
+                            time.sleep(0.5)
+                else:
+                    log.info(f"📊 Holding {open_count} positions, no new entries.")
 
-        async with self.bingx:
-            prev_signal_state = self.state.get("last_signal")
+                log.info(f"😴 Sleeping {SCAN_PERIOD}s | Open: {list(self.state['open_trades'].keys())}")
 
-            while True:
-                try:
-                    self._loop_count += 1
-                    scores = await self.evaluate()
+            except Exception as e:
+                log.error(f"Loop error: {e}", exc_info=True)
 
-                    if scores["buy_signal"] and prev_signal_state != "BUY":
-                        prev_signal_state = "BUY"
-                        # Close any existing SHORT
-                        if self.state.get("trade_direction") == "SELL" and not SIGNALS_ONLY:
-                            await self.bingx.cancel_all_orders(SYMBOL)
-                            await self.bingx.close_position(SYMBOL, "SELL", self.state["qty"])
-                            self.state = load_state()
-                            self.state["trade_direction"] = None
-                            save_state(self.state)
-                        await self.handle_new_signal("BUY", scores)
-
-                    elif scores["sell_signal"] and prev_signal_state != "SELL":
-                        prev_signal_state = "SELL"
-                        if self.state.get("trade_direction") == "BUY" and not SIGNALS_ONLY:
-                            await self.bingx.cancel_all_orders(SYMBOL)
-                            await self.bingx.close_position(SYMBOL, "BUY", self.state["qty"])
-                            self.state = load_state()
-                            self.state["trade_direction"] = None
-                            save_state(self.state)
-                        await self.handle_new_signal("SELL", scores)
-
-                    else:
-                        await self.monitor_position(scores)
-
-                    await self.heartbeat(scores)
-
-                except Exception as e:
-                    logger.error(f"Loop error: {e}", exc_info=True)
-                    await self.tg.error_alert(str(e)[:300])
-
-                await asyncio.sleep(POLL_SECONDS)
-
-
-if __name__ == "__main__":
-    bot = SniperBot()
-    asyncio.run(bot.run())
+            time.sleep(SCAN_PERIOD)
