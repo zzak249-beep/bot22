@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────
+#  SuperBot — Railway Environment Variables
+#  UPDATED: looser filters to get signals,
+#           lower leverage/risk to stop bleeding
+# ─────────────────────────────────────────────
+
+# Exchange credentials
+BINGX_API_KEY=your_api_key_here
+BINGX_API_SECRET=your_secret_here
+
+# ── Scan / signal filters ─────────────────────
+SH_USE_LIMIT_ORDERS=true
+SH_TIMEFRAME=1h
+SH_MAX_SYMBOLS=40             # was 20 — scan more symbols
+SH_ENTRY_MAX_PROB=0.62        # was 0.50 — too restrictive, no signals
+SH_EXIT_PROB=0.72             # was 0.78 — exit earlier, take profit before reversal
+SH_COOLDOWN_MIN=60            # was 90 — re-qualify symbols faster
+SH_MIN_DROP_PCT=0.20          # was 0.40 — catch smaller pullbacks
+SH_MAX_PUMP_PCT=5.0           # was 4.0 — slightly more room
+
+# ── Risk / position sizing ────────────────────
+SH_LEVERAGE=2                 # was 3 — reduce exposure while in drawdown
+SH_MAX_OPEN_TRADES=5
+SH_RISK_PCT=0.01              # was 0.02 — at $230 balance, 2% per trade was too big
+
+# ── Bot settings ──────────────────────────────
+SCAN_PERIOD_SECONDS=300
+LIMIT_ENTRY=true
+SLIPPAGE_OFFSET=0.0003
+DAILY_LOSS_LIMIT=0.04         # was 0.05 — tighter daily stop
+MIN_RR_RATIO=1.5              # NEW — skip trades with reward < 1.5x risk
+LIMIT_ORDER_TIMEOUT=120
+DRY_RUN=false
