@@ -524,7 +524,7 @@ class InstitutionalBot:
                 log.info(f"✓ BingX conectado | Equity: ${equity:.2f}")
                 return True
         
-        log.error(f"Error conectando: {data.get('msg')}")
+        log.error(f"Error conectando: {data}")
         AUTO_TRADING = False
         return False
     
