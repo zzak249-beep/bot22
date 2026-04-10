@@ -1,6 +1,5 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "pip install -r requirements_v7.txt"
 
 [deploy]
 startCommand = "python bot_v7.py"
