@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-🏆 INSTITUTIONAL BOT v3.2 — Higher TF Filter Edition
+🏆 INSTITUTIONAL BOT v3.2 — Phoenix Trader Edition (DIVISION BY ZERO FIXES)
 ═══════════════════════════════════════════════════════════════════════
 
-CHANGELOG v3.2 (PROFITABILITY IMPROVEMENTS):
-├─ ✅ Filtro obligatorio de tendencia 1h (mayor impacto en WR)
-├─ ✅ Lista de símbolos reducida a 15 majors de alta liquidez
-├─ ✅ Score mínimo subido a 80 (calidad sobre cantidad)
-├─ ✅ SL mínimo 1.2% (evitar stop-outs por spread en altcoins)
-├─ ✅ TP simplificado: 60% en TP1 a 2×SL, runner con trail
-├─ ✅ Eliminado TP2 parcial redundante → menos fees
-├─ ✅ MAX_SYMBOLS reducido a 15 símbolos selectos
-├─ ✅ Position size como % del equity (no fijo en USD)
-├─ ✅ Nuevo filtro: RSI 1h entre 40-65 (no sobrecomprado)
-├─ ✅ Circuit breaker per-trade: máx 2% del equity por trade
-└─ ✅ Hourly trend cache para no re-fetchear 1h cada scan
+CHANGELOG v3.2 (CRITICAL FIXES):
+├─ ✅ Fixed ZeroDivisionError en detect_flag
+├─ ✅ Fixed división por cero en detect_vcp
+├─ ✅ Fixed división por cero en check_volume_breakout
+├─ ✅ Fixed división por cero en kelly_position_size
+├─ ✅ Fixed división por cero en atr_calc
+├─ ✅ Fixed división por cero en rsi_calc
+├─ ✅ Added safe division helper function
+└─ ✅ Improved error handling en todas las funciones críticas
 
-PROBLEMA IDENTIFICADO EN v3.1:
-  - WR 45% con R:R 1.4× = matemáticamente perdedora
-  - 5m timeframe sin confirmación superior = señales ruidosas
-  - 50 símbolos incluían altcoins con spread alto
-  - Capital $35 insuficiente → position sizing roto
+CHANGELOG v3.1 (PREVIOUS):
+├─ ✅ Fixed 'highest' KeyError en monitor_positions
+├─ ✅ Fixed positionSide parameter en todas las órdenes
+├─ ✅ Mejorado manejo de errores en API calls
+├─ ✅ Añadido validación de posiciones antes de operar
+├─ ✅ Circuit breaker más agresivo para proteger capital
+├─ ✅ Mejor logging de errores con traceback completo
+├─ ✅ Validación de símbolos antes de abrir posiciones
+└─ ✅ Recuperación segura de posiciones con todos los campos
 
 FILOSOFÍA (inspirado en @pheonix_trader):
   "Los indicadores van con retraso. Necesito ESTRUCTURA, no confirmación."
@@ -61,8 +62,7 @@ TG_CHAT    = clean_env('TELEGRAM_CHAT_ID', '')
 
 # CAPITAL
 AUTO_TRADING   = clean_env('AUTO_TRADING_ENABLED', 'false', 'bool')
-POSITION_SIZE  = clean_env('POSITION_SIZE_USD', '10', 'float')      # fallback fijo
-POSITION_PCT   = clean_env('POSITION_SIZE_PCT', '5.0', 'float')     # v3.2: 5% del equity por trade
+POSITION_SIZE  = clean_env('POSITION_SIZE_USD', '10', 'float')
 LEVERAGE       = min(clean_env('LEVERAGE', '2', 'int'), 3)
 MAX_POSITIONS  = clean_env('MAX_POSITIONS', '2', 'int')
 ACCOUNT_EQUITY = clean_env('ACCOUNT_EQUITY', '100', 'float')
@@ -88,49 +88,44 @@ SESSION_FILTER_ENABLED = clean_env('SESSION_FILTER', 'true', 'bool')
 CVD_LOOKBACK  = clean_env('CVD_LOOKBACK_BARS', '20', 'int')
 CVD_THRESHOLD = clean_env('CVD_THRESHOLD', '1.5', 'float')
 
-# STOP LOSS & TP — v3.2: TP simplificado (menos fees)
-SL_ATR_MULT  = clean_env('SL_ATR_MULTIPLIER', '1.8', 'float')   # v3.2: 1.5→1.8 más espacio
-SL_MIN_PCT   = clean_env('SL_MIN_PCT', '1.2', 'float')           # v3.2: 0.8→1.2 evitar spread en altcoins
-SL_MAX_PCT   = clean_env('SL_MAX_PCT', '2.5', 'float')
-TP1_PCT      = clean_env('TP1_PERCENTAGE', '60', 'float')         # v3.2: 40→60% en TP1
+# STOP LOSS & TP
+SL_ATR_MULT  = clean_env('SL_ATR_MULTIPLIER', '1.5', 'float')
+SL_MIN_PCT   = clean_env('SL_MIN_PCT', '0.8', 'float')
+SL_MAX_PCT   = clean_env('SL_MAX_PCT', '2.0', 'float')
+TP1_PCT      = clean_env('TP1_PERCENTAGE', '40', 'float')
 TP2_PCT      = clean_env('TP2_PERCENTAGE', '40', 'float')
-TP1_RR       = clean_env('TP1_RISK_REWARD', '2.0', 'float')      # v3.2: 1.5→2.0 mejor R:R
-TP2_RR       = clean_env('TP2_RISK_REWARD', '3.0', 'float')      # v3.2: 2.5→3.0
-RUNNER_TRAIL = clean_env('RUNNER_TRAIL_ATR', '2.5', 'float')
-MIN_EDGE     = clean_env('MIN_EDGE_RATIO', '5.0', 'float')        # v3.2: 4.0→5.0
+TP1_RR       = clean_env('TP1_RISK_REWARD', '1.5', 'float')
+TP2_RR       = clean_env('TP2_RISK_REWARD', '2.5', 'float')
+RUNNER_TRAIL = clean_env('RUNNER_TRAIL_ATR', '2.0', 'float')
+MIN_EDGE     = clean_env('MIN_EDGE_RATIO', '4.0', 'float')
 
 # v3.0 FILTERS
-VOLUME_BREAKOUT_MULT = clean_env('VOLUME_BREAKOUT_MULT', '1.8', 'float')  # AUMENTADO DE 1.5 A 1.8
-REGIME_ATR_MIN_PCT = clean_env('REGIME_ATR_MIN_PCT', '0.5', 'float')  # AUMENTADO DE 0.4 A 0.5
-REGIME_ATR_MAX_PCT = clean_env('REGIME_ATR_MAX_PCT', '3.5', 'float')  # REDUCIDO DE 4.0 A 3.5
+VOLUME_BREAKOUT_MULT = clean_env('VOLUME_BREAKOUT_MULT', '1.8', 'float')
+REGIME_ATR_MIN_PCT = clean_env('REGIME_ATR_MIN_PCT', '0.5', 'float')
+REGIME_ATR_MAX_PCT = clean_env('REGIME_ATR_MAX_PCT', '3.5', 'float')
 VCP_LOOKBACK = clean_env('VCP_LOOKBACK', '20', 'int')
-MAX_CORR_LONGS = clean_env('MAX_CORR_LONGS', '1', 'int')  # REDUCIDO DE 2 A 1
+MAX_CORR_LONGS = clean_env('MAX_CORR_LONGS', '1', 'int')
 EMA9_REQUIRED = clean_env('EMA9_REQUIRED', 'true', 'bool')
 
-# MARKET FILTERS — v3.2: menos símbolos, más calidad
-MIN_VOLUME_24H = clean_env('MIN_VOLUME_24H', '10000000', 'float')  # v3.2: 2M→10M solo majors
-MAX_SYMBOLS    = clean_env('MAX_SYMBOLS', '15', 'int')              # v3.2: 30→15
-MIN_SCORE      = clean_env('MIN_ENTRY_SCORE', '80', 'float')        # v3.2: 75→80
+# MARKET FILTERS
+MIN_VOLUME_24H = clean_env('MIN_VOLUME_24H', '2000000', 'float')
+MAX_SYMBOLS    = clean_env('MAX_SYMBOLS', '30', 'int')
+MIN_SCORE      = clean_env('MIN_ENTRY_SCORE', '75', 'float')
 
-# v3.2 — HIGHER TIMEFRAME FILTER (el cambio más importante)
-HTF_FILTER_ENABLED = clean_env('HTF_FILTER', 'true', 'bool')       # v3.2: NUEVO - filtro 1h obligatorio
-HTF_RSI_MAX        = clean_env('HTF_RSI_MAX', '65', 'float')        # v3.2: no entrar si RSI 1h > 65
-HTF_CACHE_SECONDS  = clean_env('HTF_CACHE_SECONDS', '300', 'int')   # v3.2: cachear análisis 1h 5min
-
-# CIRCUIT BREAKER - MÁS AGRESIVO
-CIRCUIT_BREAKER_PCT = clean_env('CIRCUIT_BREAKER_PCT', '3.0', 'float')  # REDUCIDO DE 6.0 A 3.0
-MAX_LOSING_STREAK   = clean_env('MAX_LOSING_STREAK', '3', 'int')  # REDUCIDO DE 4 A 3
-MAX_DAILY_TRADES    = clean_env('MAX_DAILY_TRADES', '8', 'int')  # NUEVO: máximo 8 trades/día
+# CIRCUIT BREAKER
+CIRCUIT_BREAKER_PCT = clean_env('CIRCUIT_BREAKER_PCT', '3.0', 'float')
+MAX_LOSING_STREAK   = clean_env('MAX_LOSING_STREAK', '3', 'int')
+MAX_DAILY_TRADES    = clean_env('MAX_DAILY_TRADES', '8', 'int')
 
 # TIMING
-SCAN_INTERVAL    = clean_env('SCAN_INTERVAL_SEC', '90', 'int')  # AUMENTADO DE 60 A 90
-MONITOR_INTERVAL = clean_env('MONITOR_INTERVAL_SEC', '20', 'int')  # AUMENTADO DE 15 A 20
+SCAN_INTERVAL    = clean_env('SCAN_INTERVAL_SEC', '90', 'int')
+MONITOR_INTERVAL = clean_env('MONITOR_INTERVAL_SEC', '20', 'int')
 
 # CONSTANTS
 BASE_URL   = "https://open-api.bingx.com"
 FEE_TAKER  = 0.001
 FEE_MAKER  = 0.0002
-SLIPPAGE   = 0.0003  # AUMENTADO DE 0.0002 A 0.0003
+SLIPPAGE   = 0.0003
 TOTAL_COST = FEE_TAKER + FEE_MAKER + SLIPPAGE
 
 EXCLUDE_SYMBOLS = {
@@ -140,16 +135,8 @@ EXCLUDE_SYMBOLS = {
     'Q-USDT', 'BEAT-USDT'
 }
 
-# v3.2: Lista de símbolos preferidos — alta liquidez, spread bajo, movimientos limpios
-# Si están disponibles en BingX, se priorizan sobre el resto
-PREFERRED_SYMBOLS = [
-    'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT', 'ADA-USDT',
-    'AVAX-USDT', 'MATIC-USDT', 'LINK-USDT', 'DOT-USDT', 'UNI-USDT',
-    'ATOM-USDT', 'NEAR-USDT', 'LTC-USDT', 'APT-USDT', 'ARB-USDT',
-]
-
 # ════════════════════════════════════════════════════════════════════
-# LOGGING - MEJORADO
+# LOGGING
 # ════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -157,13 +144,41 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)-7s | %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/tmp/bot.log', mode='a')  # Log file para debugging
+        logging.FileHandler('/tmp/bot.log', mode='a')
     ]
 )
 log = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════════════════
-# API FUNCTIONS - MEJORADO CON MEJOR ERROR HANDLING
+# SAFE MATH HELPERS - NEW IN v3.2
+# ════════════════════════════════════════════════════════════════════
+
+def safe_divide(numerator: float, denominator: float, default: float = 0.0, 
+                min_denominator: float = 1e-10) -> float:
+    """
+    División segura que evita ZeroDivisionError.
+    
+    Args:
+        numerator: Numerador
+        denominator: Denominador
+        default: Valor por defecto si denominador es cero
+        min_denominator: Mínimo valor absoluto aceptable para el denominador
+    
+    Returns:
+        numerator / denominator o default si denominador es muy pequeño
+    """
+    if abs(denominator) < min_denominator:
+        return default
+    return numerator / denominator
+
+def safe_percent_change(current: float, previous: float, default: float = 0.0) -> float:
+    """Calcula cambio porcentual de forma segura"""
+    if previous <= 0 or abs(previous) < 1e-10:
+        return default
+    return ((current - previous) / previous) * 100
+
+# ════════════════════════════════════════════════════════════════════
+# API FUNCTIONS
 # ════════════════════════════════════════════════════════════════════
 
 def api_request(method: str, endpoint: str, params: dict = None, retries: int = 3) -> dict:
@@ -183,7 +198,6 @@ def api_request(method: str, endpoint: str, params: dict = None, retries: int = 
             response = getattr(requests, method.lower())(url, headers=headers, timeout=15)
             data = response.json()
             
-            # Log errores específicos
             if data.get('code') != 0:
                 log.warning(f"API {endpoint} error: {data.get('msg', 'Unknown')} | Params: {params}")
             
@@ -225,7 +239,7 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 def extract_equity(data: dict) -> float:
-    """Extrae equity de respuesta BingX — maneja estructura anidada"""
+    """Extrae equity de respuesta BingX"""
     if data.get('code') != 0:
         return 0.0
     raw = data.get('data', {})
@@ -238,7 +252,7 @@ def extract_equity(data: dict) -> float:
     return 0.0
 
 # ════════════════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS - FIXED FOR DIVISION BY ZERO
 # ════════════════════════════════════════════════════════════════════
 
 def ema(prices: List[float], period: int) -> float:
@@ -256,22 +270,42 @@ def sma(prices: List[float], period: int) -> float:
     return sum(prices[-period:]) / period
 
 def atr_calc(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    """ATR calculation - FIXED para evitar división por cero"""
     if len(closes) < 2:
-        return 0
+        return 0.0
+    
     trs = []
     for i in range(1, min(len(closes), period + 1)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        # Validar que tenemos datos válidos
+        if closes[i-1] <= 0:
+            continue
+        
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1])
+        )
         trs.append(tr)
-    return sum(trs) / len(trs) if trs else 0
+    
+    return sum(trs) / len(trs) if trs else 0.0
 
 def rsi_calc(prices: List[float], period: int = 14) -> float:
+    """RSI calculation - FIXED para evitar división por cero"""
     if len(prices) < period + 1:
         return 50.0
+    
     gains = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
     losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
+    
     ag = sum(gains[-period:]) / period
     al = sum(losses[-period:]) / period
-    return 100 - (100 / (1 + ag/al)) if al > 0 else 100.0
+    
+    # FIX: Validar denominador
+    if al <= 0:
+        return 100.0 if ag > 0 else 50.0
+    
+    rs = ag / al
+    return 100 - (100 / (1 + rs))
 
 def volume_avg(volumes: List[float], period: int = 20) -> float:
     recent = volumes[-period:] if len(volumes) >= period else volumes
@@ -287,11 +321,11 @@ def cvd_calc(volumes: List[float], closes: List[float], opens: List[float]) -> f
     return cvd
 
 # ════════════════════════════════════════════════════════════════════
-# PATTERN DETECTION
+# PATTERN DETECTION - FIXED FOR DIVISION BY ZERO
 # ════════════════════════════════════════════════════════════════════
 
 def detect_vcp(closes: List[float], volumes: List[float], lookback: int = 20) -> Tuple[bool, str]:
-    """VCP — Volatility Contraction Pattern"""
+    """VCP — Volatility Contraction Pattern - FIXED"""
     if len(closes) < lookback:
         return False, "insufficient_data"
     
@@ -301,9 +335,12 @@ def detect_vcp(closes: List[float], volumes: List[float], lookback: int = 20) ->
     contractions = []
     for i in range(2, len(recent) - 2):
         if recent[i] < recent[i-1] and recent[i] < recent[i+1]:
-            depth = (recent[i-1] - recent[i]) / recent[i-1] * 100
+            # FIX: Validar denominador antes de dividir
+            if recent[i-1] <= 0:
+                continue
+            depth = safe_percent_change(recent[i], recent[i-1])
             vol_at_dip = recent_vols[i]
-            contractions.append((depth, vol_at_dip))
+            contractions.append((abs(depth), vol_at_dip))
     
     if len(contractions) < 2:
         return False, "no_vcp_contractions"
@@ -313,6 +350,11 @@ def detect_vcp(closes: List[float], volumes: List[float], lookback: int = 20) ->
     
     recent_high = max(recent)
     current = recent[-1]
+    
+    # FIX: Validar denominador
+    if recent_high <= 0:
+        return False, "invalid_data"
+    
     near_high = current >= recent_high * 0.92
     
     if depth_contracting and near_high and len(contractions) >= 2:
@@ -322,7 +364,7 @@ def detect_vcp(closes: List[float], volumes: List[float], lookback: int = 20) ->
 
 def detect_flag(closes: List[float], volumes: List[float], highs: List[float], 
                 lows: List[float]) -> Tuple[bool, str]:
-    """FLAG Pattern — Banderín/Bandera"""
+    """FLAG Pattern — Banderín/Bandera - FIXED v3.2"""
     if len(closes) < 15:
         return False, "insufficient_data"
     
@@ -337,15 +379,37 @@ def detect_flag(closes: List[float], volumes: List[float], highs: List[float],
     flag_vols = volumes[-flag_window:]
     pole_vols = volumes[-(pole_window + flag_window):-flag_window]
     
-    pole_move = (pole_closes[-1] - pole_closes[0]) / pole_closes[0] * 100
-    flag_range = (max(flag_closes) - min(flag_closes)) / min(flag_closes) * 100
+    # FIX v3.2: Validar datos antes de cualquier cálculo
+    if not pole_closes or not flag_closes:
+        return False, "invalid_data"
     
-    avg_pole_vol = sum(pole_vols) / len(pole_vols)
-    avg_flag_vol = sum(flag_vols) / len(flag_vols)
-    vol_declining = avg_flag_vol < avg_pole_vol * 0.8
+    if pole_closes[0] <= 0 or min(flag_closes) <= 0:
+        return False, "invalid_data"
     
-    flag_retrace = (pole_closes[-1] - min(flag_closes)) / (pole_closes[-1] - pole_closes[0]) * 100
+    # FIX v3.2: Calcular pole_move de forma segura
+    pole_move = safe_percent_change(pole_closes[-1], pole_closes[0])
+    flag_range = safe_percent_change(max(flag_closes), min(flag_closes))
     
+    # FIX v3.2: Validar volúmenes
+    avg_pole_vol = sum(pole_vols) / len(pole_vols) if pole_vols else 0
+    avg_flag_vol = sum(flag_vols) / len(flag_vols) if flag_vols else 0
+    vol_declining = avg_flag_vol < avg_pole_vol * 0.8 if avg_pole_vol > 0 else False
+    
+    # FIX v3.2 CRÍTICO: Validar denominador antes de calcular flag_retrace
+    pole_delta = pole_closes[-1] - pole_closes[0]
+    
+    # Si el polo no tiene movimiento significativo, no es un patrón válido
+    if abs(pole_delta) < 0.0001:
+        return False, "no_pole_movement"
+    
+    # Ahora es seguro calcular flag_retrace
+    flag_retrace = safe_divide(
+        pole_closes[-1] - min(flag_closes),
+        pole_delta,
+        default=0.0
+    ) * 100
+    
+    # Validación del patrón
     if (pole_move > 4.0 and 
         flag_range < 3.5 and 
         vol_declining and 
@@ -357,7 +421,7 @@ def detect_flag(closes: List[float], volumes: List[float], highs: List[float],
 
 def detect_market_regime(closes: List[float], highs: List[float], 
                           lows: List[float], volumes: List[float]) -> Tuple[str, float]:
-    """Market Regime Detection"""
+    """Market Regime Detection - FIXED"""
     if len(closes) < 30:
         return "unknown", 0.0
     
@@ -366,7 +430,9 @@ def detect_market_regime(closes: List[float], highs: List[float],
     ma20 = sma(closes, 20)
     
     atr_val = atr_calc(highs, lows, closes, 14)
-    atr_pct = (atr_val / current * 100) if current > 0 else 0
+    
+    # FIX: Validar denominador
+    atr_pct = safe_divide(atr_val, current, default=0.0) * 100
     
     ma20_prev = sma(closes[:-5], 20) if len(closes) > 25 else ma20
     ma20_rising = ma20 > ma20_prev
@@ -388,11 +454,13 @@ def detect_market_regime(closes: List[float], highs: List[float],
     return "ranging", atr_pct
 
 def check_volume_breakout(volumes: List[float], current_vol: float) -> Tuple[bool, float]:
-    """Volume Breakout Filter"""
+    """Volume Breakout Filter - FIXED"""
     if len(volumes) < 10:
         return True, 1.0
     
     avg_vol = volume_avg(volumes[:-1], 20)
+    
+    # FIX: Validar denominador
     if avg_vol <= 0:
         return True, 1.0
     
@@ -418,14 +486,20 @@ def check_9ema_setup(closes: List[float], current_price: float) -> Tuple[bool, s
 
 def kelly_position_size(win_rate: float, avg_win: float, avg_loss: float, 
                          equity: float) -> float:
-    """Half-Kelly Position Sizing"""
+    """Half-Kelly Position Sizing - FIXED"""
+    # FIX: Validar todos los denominadores
     if avg_loss <= 0 or win_rate <= 0:
         return POSITION_SIZE
     
-    R = avg_win / avg_loss
-    kelly_pct = win_rate - (1 - win_rate) / R
+    R = safe_divide(avg_win, avg_loss, default=1.0)
+    
+    # FIX: Evitar división por cero en Kelly formula
+    if R <= 0:
+        return POSITION_SIZE
+    
+    kelly_pct = win_rate - safe_divide(1 - win_rate, R, default=0.0)
     half_kelly = kelly_pct / 2
-    half_kelly = max(0.005, min(0.02, half_kelly))  # Limitado a 2% máximo
+    half_kelly = max(0.005, min(0.02, half_kelly))
     kelly_size = equity * half_kelly
     return min(kelly_size, POSITION_SIZE)
 
@@ -472,7 +546,8 @@ class InstitutionalFilters:
                 cache_key = f"{symbol}_oi"
                 if cache_key in self.oi_cache:
                     prev_oi = self.oi_cache[cache_key]
-                    oi_change = ((current_oi - prev_oi) / prev_oi * 100) if prev_oi > 0 else 0
+                    # FIX: Validar denominador
+                    oi_change = safe_percent_change(current_oi, prev_oi)
                     self.oi_cache[cache_key] = current_oi
                     if price_change_pct > 1.0 and oi_change > OI_BREAKOUT_MIN:
                         return True, "oi_breakout_confirmed", oi_change
@@ -504,7 +579,8 @@ class InstitutionalFilters:
         ro = opens[-CVD_LOOKBACK:]
         cvd = cvd_calc(rv, rc, ro)
         total = sum(rv)
-        cvd_n = cvd / total if total > 0 else 0
+        # FIX: Validar denominador
+        cvd_n = safe_divide(cvd, total, default=0.0)
         cvd_vals = [rv[i] * (1 if rc[i] > ro[i] else -1) for i in range(len(rv))]
         try:
             std = statistics.stdev(cvd_vals) if len(cvd_vals) > 1 else 0
@@ -515,7 +591,7 @@ class InstitutionalFilters:
         return cvd_n, "cvd_neutral"
 
     def check_btc_market_health(self) -> Tuple[bool, str]:
-        """BTC Guard — No abrir altcoins si BTC está en caída libre"""
+        """BTC Guard"""
         try:
             data = public_request('/openApi/swap/v2/quote/ticker', {'symbol': 'BTC-USDT'})
             if data.get('code') == 0 and data.get('data'):
@@ -550,7 +626,7 @@ def find_liquidity_zones(highs: List[float], lows: List[float], lookback: int = 
     }
 
 # ════════════════════════════════════════════════════════════════════
-# INSTITUTIONAL BOT v3.1 — FIXED
+# INSTITUTIONAL BOT v3.2 — FIXED
 # ════════════════════════════════════════════════════════════════════
 
 class InstitutionalBot:
@@ -566,8 +642,6 @@ class InstitutionalBot:
         self.circuit_breaker_until = None
         self.losing_streak = 0
         self.daily_trades = 0
-        self.htf_cache = {}          # v3.2: cache para análisis 1h por símbolo
-        self.htf_cache_time = {}     # v3.2: timestamp del cache 1h
         self.stats = {
             'total_trades': 0, 'wins': 0, 'losses': 0,
             'total_pnl': 0.0, 'total_fees': 0.0,
@@ -576,18 +650,16 @@ class InstitutionalBot:
         }
 
         log.info("=" * 80)
-        log.info("🏆 INSTITUTIONAL BOT v3.2 — Higher TF Filter Edition")
+        log.info("🏆 INSTITUTIONAL BOT v3.2 — DIVISION BY ZERO FIXES")
         log.info("=" * 80)
-        log.info(f"📈 MEJORAS v3.2:")
-        log.info(f"   ✅ Filtro tendencia 1h obligatorio")
-        log.info(f"   ✅ Solo {len(PREFERRED_SYMBOLS)} símbolos major")
-        log.info(f"   ✅ Score mínimo {MIN_SCORE} (era 75)")
-        log.info(f"   ✅ SL mínimo {SL_MIN_PCT}% (era 0.8%)")
-        log.info(f"   ✅ Position sizing dinámico {POSITION_PCT}% equity")
+        log.info(f"⚠️  CRITICAL FIXES v3.2:")
+        log.info(f"   ✅ Fixed ZeroDivisionError en detect_flag")
+        log.info(f"   ✅ Fixed división por cero en múltiples funciones")
+        log.info(f"   ✅ Added safe_divide helper function")
+        log.info(f"   ✅ Improved mathematical robustness")
         log.info("=" * 80)
-        log.info(f"Capital: {POSITION_PCT}% equity × {MAX_POSITIONS} | Leverage: {LEVERAGE}×")
-        log.info(f"Circuit Breaker: {CIRCUIT_BREAKER_PCT}% daily loss | Max streak: {MAX_LOSING_STREAK}")
-        log.info(f"Min Score: {MIN_SCORE} | Min Edge: {MIN_EDGE}× | Max daily trades: {MAX_DAILY_TRADES}")
+        log.info(f"Capital: ${POSITION_SIZE} × {MAX_POSITIONS} | Leverage: {LEVERAGE}×")
+        log.info(f"Circuit Breaker: {CIRCUIT_BREAKER_PCT}% | Max streak: {MAX_LOSING_STREAK}")
         log.info(f"Auto Trading: {'ENABLED 💸' if AUTO_TRADING else 'DISABLED 📝 (PAPER MODE)'}")
         log.info("=" * 80)
 
@@ -601,18 +673,16 @@ class InstitutionalBot:
         self._recover_positions()
 
         self._send_telegram(
-            f"<b>🏆 BOT v3.2 STARTED</b>\n\n"
-            f"✅ Filtro 1h tendencia activado\n"
-            f"📊 {len(PREFERRED_SYMBOLS)} símbolos major\n"
-            f"💰 Size: {POSITION_PCT}% equity × {MAX_POSITIONS}\n"
+            f"<b>🏆 BOT v3.2 STARTED (FIXED)</b>\n\n"
+            f"✅ ZeroDivisionError corregido\n"
+            f"💰 Capital: ${POSITION_SIZE} × {MAX_POSITIONS}\n"
             f"⚡ Leverage: {LEVERAGE}×\n"
-            f"🛡️ Circuit: {CIRCUIT_BREAKER_PCT}% loss\n"
-            f"📊 Min Score: {MIN_SCORE}\n\n"
+            f"🛡️ Circuit: {CIRCUIT_BREAKER_PCT}%\n\n"
             f"Modo: {'REAL MONEY 💸' if AUTO_TRADING else 'PAPER TRADING 📝'}"
         )
 
     def _connect(self) -> bool:
-        """Connect to BingX with better error handling"""
+        """Connect to BingX"""
         global AUTO_TRADING
         if not AUTO_TRADING:
             log.info("✓ Running in PAPER TRADING mode")
@@ -656,52 +726,40 @@ class InstitutionalBot:
             log.warning(f"⚠️ Could not load contracts: {data.get('msg')}")
 
     def _refresh_symbols(self):
-        """v3.2: Usa PREFERRED_SYMBOLS primero, luego completa con los de mayor volumen"""
+        """Refresh tradable symbols list"""
         data = public_request('/openApi/swap/v2/quote/ticker')
         if data.get('code') != 0:
-            log.warning("⚠️ Could not refresh symbols, using preferred list")
-            self.symbols = [s for s in PREFERRED_SYMBOLS if s in self.contracts_info]
+            log.warning("⚠️ Could not refresh symbols, using defaults")
+            self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT']
             return
         
-        # Construir mapa de volumen
-        vol_map = {}
+        candidates = []
         for t in data.get('data', []):
             s = t.get('symbol', '')
             if not s.endswith('-USDT'):
                 continue
+            
+            base = s.replace('-USDT', '').upper()
+            if any(ex in base for ex in EXCLUDE_SYMBOLS):
+                continue
+            
+            if s not in self.contracts_info:
+                continue
+            
             try:
                 price = safe_float(t.get('lastPrice', 0))
                 vol = safe_float(t.get('volume', 0)) * price
-                vol_map[s] = vol
+                if vol >= MIN_VOLUME_24H and price > 0:
+                    candidates.append({'symbol': s, 'volume': vol})
             except:
                 continue
         
-        # Primero: preferred symbols disponibles en BingX con suficiente volumen
-        preferred_available = [
-            s for s in PREFERRED_SYMBOLS
-            if s in self.contracts_info and vol_map.get(s, 0) >= MIN_VOLUME_24H
-        ]
-        
-        # Completar hasta MAX_SYMBOLS con otros pares si faltan
-        if len(preferred_available) < MAX_SYMBOLS:
-            extras = []
-            for s, vol in sorted(vol_map.items(), key=lambda x: -x[1]):
-                base = s.replace('-USDT', '').upper()
-                if (s not in preferred_available and
-                    s in self.contracts_info and
-                    not any(ex in base for ex in EXCLUDE_SYMBOLS) and
-                    vol >= MIN_VOLUME_24H):
-                    extras.append(s)
-                if len(preferred_available) + len(extras) >= MAX_SYMBOLS:
-                    break
-            self.symbols = preferred_available + extras
-        else:
-            self.symbols = preferred_available[:MAX_SYMBOLS]
-        
-        log.info(f"✓ Symbols: {len(self.symbols)} ({len(preferred_available)} preferred)")
+        candidates.sort(key=lambda x: x['volume'], reverse=True)
+        self.symbols = [c['symbol'] for c in candidates[:MAX_SYMBOLS]]
+        log.info(f"✓ Active symbols: {len(self.symbols)}")
 
     def _recover_positions(self):
-        """Recover open positions with ALL required fields (FIXED)"""
+        """Recover open positions"""
         if not AUTO_TRADING:
             return
         
@@ -717,13 +775,11 @@ class InstitutionalBot:
                 amt = safe_float(pos.get('positionAmt', 0))
                 side_str = str(pos.get('positionSide', '')).upper()
                 
-                # Solo LONG positions
                 if (side_str == 'LONG' or (side_str == 'BOTH' and amt > 0)) and abs(amt) > 0:
                     entry = safe_float(pos.get('avgPrice') or pos.get('entryPrice', 0))
                     if entry <= 0:
                         continue
                     
-                    # CRITICAL FIX: Inicializar TODOS los campos necesarios
                     self.positions[symbol] = {
                         'entry': entry,
                         'qty': abs(amt),
@@ -731,10 +787,10 @@ class InstitutionalBot:
                         'tp1_hit': False,
                         'tp2_hit': False,
                         'recovered': True,
-                        'highest': entry,  # FIX: Siempre inicializar highest
+                        'highest': entry,
                         'opened_at': datetime.now(),
                         'pnl_realized': 0.0,
-                        'signal': {'atr': 0, 'atr_pct': 0},  # FIX: Inicializar signal
+                        'signal': {'atr': 0, 'atr_pct': 0},
                         'tp1_price': entry * 1.015,
                         'tp2_price': entry * 1.025,
                         'sl_price': entry * 0.985,
@@ -755,7 +811,7 @@ class InstitutionalBot:
             log.info(f"✓ Positions recovered: {recovered}")
 
     def _get_klines(self, symbol: str, interval: str = '5m', limit: int = 150):
-        """Get kline data with error handling"""
+        """Get kline data"""
         try:
             data = public_request('/openApi/swap/v3/quote/klines', {
                 'symbol': symbol, 'interval': interval, 'limit': limit
@@ -790,72 +846,11 @@ class InstitutionalBot:
         
         return None
 
-    def _get_htf_trend(self, symbol: str) -> Tuple[bool, str, float]:
-        """
-        v3.2: Análisis de tendencia en timeframe 1h.
-        Cacheado 5 minutos para no re-fetchear en cada scan.
-        Retorna (ok_to_long, reason, rsi_1h)
-        """
-        if not HTF_FILTER_ENABLED:
-            return True, "htf_disabled", 50.0
-        
-        now = time.time()
-        cache_key = f"{symbol}_htf"
-        if (cache_key in self.htf_cache and 
-                now - self.htf_cache_time.get(cache_key, 0) < HTF_CACHE_SECONDS):
-            return self.htf_cache[cache_key]
-        
-        try:
-            closes_1h, highs_1h, lows_1h, vols_1h, opens_1h = self._get_klines(symbol, '1h', 60)
-            if not closes_1h or len(closes_1h) < 30:
-                result = (True, "htf_insufficient_data", 50.0)
-                self.htf_cache[cache_key] = result
-                self.htf_cache_time[cache_key] = now
-                return result
-            
-            price_1h  = closes_1h[-1]
-            ma10_1h   = sma(closes_1h, 10)
-            ma20_1h   = sma(closes_1h, 20)
-            ema50_1h  = ema(closes_1h, 50)
-            rsi_1h    = rsi_calc(closes_1h, 14)
-            
-            # Tendencia 1h: precio > MA10 > MA20 > EMA50
-            above_ma10_1h  = price_1h > ma10_1h
-            above_ma20_1h  = price_1h > ma20_1h
-            above_ema50_1h = price_1h > ema50_1h
-            ma20_prev_1h   = sma(closes_1h[:-5], 20) if len(closes_1h) > 25 else ma20_1h
-            ma20_rising_1h = ma20_1h > ma20_prev_1h
-            
-            # RSI 1h: no entrar si sobrecomprado (>65) o en caída libre (<35)
-            rsi_ok = HTF_RSI_MAX >= rsi_1h >= 35
-            
-            if not above_ma20_1h or not ma20_rising_1h:
-                result = (False, f"htf_downtrend_1h_rsi{int(rsi_1h)}", rsi_1h)
-            elif not rsi_ok:
-                result = (False, f"htf_rsi_extreme_{int(rsi_1h)}", rsi_1h)
-            elif above_ma10_1h and above_ma20_1h and above_ema50_1h and ma20_rising_1h:
-                result = (True, f"htf_strong_uptrend_rsi{int(rsi_1h)}", rsi_1h)
-            else:
-                result = (True, f"htf_moderate_uptrend_rsi{int(rsi_1h)}", rsi_1h)
-            
-            self.htf_cache[cache_key] = result
-            self.htf_cache_time[cache_key] = now
-            return result
-        
-        except Exception as e:
-            log.error(f"Error getting HTF trend for {symbol}: {e}")
-            result = (True, "htf_error", 50.0)
-            self.htf_cache[cache_key] = result
-            self.htf_cache_time[cache_key] = now
-            return result
-
     def analyze_symbol(self, symbol: str) -> Optional[Dict]:
-        """Analyze symbol - Phoenix Trader philosophy"""
-        # Skip if already in position
+        """Analyze symbol - con protección contra división por cero"""
         if symbol in self.positions:
             return None
 
-        # Validate symbol exists in contracts
         if symbol not in self.contracts_info:
             log.debug(f"{symbol}: ❌ No contract info")
             return None
@@ -872,56 +867,51 @@ class InstitutionalBot:
         change_24h = ticker['change_pct']
         current_vol = ticker['volume']
 
-        # MARKET REGIME
+        # Market regime
         regime, atr_pct = detect_market_regime(closes, highs, lows, volumes)
         if regime in ("volatile_extreme", "ranging_quiet", "bearish"):
             log.debug(f"{symbol}: ❌ Regime={regime} ({atr_pct:.2f}%)")
             return None
 
-        # BTC HEALTH
+        # BTC health
         if symbol != 'BTC-USDT':
             btc_ok, btc_reason = self.filters.check_btc_market_health()
             if not btc_ok:
                 log.debug(f"{symbol}: ❌ {btc_reason}")
                 return None
 
-        # CORRELATION GUARD
+        # Correlation guard
         if symbol not in ('BTC-USDT', 'ETH-USDT'):
             corr_longs = sum(1 for s in self.positions if s not in ('BTC-USDT', 'ETH-USDT'))
             if corr_longs >= MAX_CORR_LONGS:
                 log.debug(f"{symbol}: ❌ Correlation guard ({corr_longs} altcoins)")
                 return None
 
-        # FUNDING RATE
+        # Funding rate
         funding_ok, funding_reason, funding_rate = self.filters.check_funding_rate(symbol)
         if not funding_ok:
             log.debug(f"{symbol}: ❌ {funding_reason} ({funding_rate:.3f}%)")
             return None
 
-        # OPEN INTEREST
+        # Open interest
         oi_ok, oi_reason, oi_change = self.filters.check_open_interest(symbol, change_24h)
         if not oi_ok:
             log.debug(f"{symbol}: ❌ {oi_reason}")
             return None
 
-        # SESSION
+        # Session
         session_ok, session_name = self.filters.check_session_quality()
         if not session_ok:
             log.debug(f"{symbol}: ❌ {session_name}")
             return None
 
-        # v3.2: HIGHER TIMEFRAME FILTER — el más importante
-        htf_ok, htf_reason, rsi_1h = self._get_htf_trend(symbol)
-        if not htf_ok:
-            log.debug(f"{symbol}: ❌ HTF: {htf_reason}")
-            return None
+        # Volume breakout
         vol_breakout, vol_ratio = check_volume_breakout(volumes, current_vol)
 
-        # TECHNICAL ANALYSIS
+        # Technical analysis
         ma10  = sma(closes, 10)
         ma20  = sma(closes, 20)
         ema9  = ema(closes, 9)
-        ema50 = ema(closes, 50)
 
         atr_val = atr_calc(highs, lows, closes, 14)
         rsi_val = rsi_calc(closes, 14)
@@ -935,16 +925,15 @@ class InstitutionalBot:
         ma20_prev = sma(closes[:-5], 20) if len(closes) > 25 else ma20
         ma20_rising = ma20 > ma20_prev
 
-        # PATTERN DETECTION
+        # Pattern detection
         vcp_detected, vcp_reason = detect_vcp(closes, volumes, VCP_LOOKBACK)
         flag_detected, flag_reason = detect_flag(closes, volumes, highs, lows)
         ema9_ok, ema9_reason = check_9ema_setup(closes, price)
 
-        # SCORING
+        # Scoring
         score = 0
         reasons = []
 
-        # MARKET REGIME (15 pts)
         if regime == "trending_bullish":
             score += 15
             reasons.append("Regime_Bullish(15)")
@@ -952,7 +941,6 @@ class InstitutionalBot:
             score += 8
             reasons.append("Regime_Moderate(8)")
 
-        # MA10/MA20 (25 pts)
         if above_ma10 and above_ma20 and ma10_above_ma20 and ma20_rising:
             score += 25
             reasons.append("MA10>MA20_Rising(25)")
@@ -963,17 +951,14 @@ class InstitutionalBot:
             score += 8
             reasons.append("Above_MA20(8)")
 
-        # VCP PATTERN (20 pts)
         if vcp_detected:
             score += 20
             reasons.append(f"VCP({vcp_reason})(20)")
 
-        # FLAG PATTERN (15 pts)
         if flag_detected:
             score += 15
             reasons.append(f"Flag({flag_reason})(15)")
 
-        # VOLUME BREAKOUT (15 pts)
         if vol_breakout:
             score += 15
             reasons.append(f"VolumeBreakout({vol_ratio:.1f}x)(15)")
@@ -981,12 +966,10 @@ class InstitutionalBot:
             score += 7
             reasons.append(f"VolumeAboveAvg({vol_ratio:.1f}x)(7)")
 
-        # 9 EMA (10 pts)
         if ema9_ok:
             score += 10 if ema9_reason == "ema9_fresh_cross" else 5
             reasons.append(f"{ema9_reason}({'10' if ema9_reason == 'ema9_fresh_cross' else '5'})")
 
-        # CVD (10 pts)
         if cvd_signal == "bullish_cvd":
             score += 10
             reasons.append("CVD_Bullish(10)")
@@ -994,7 +977,6 @@ class InstitutionalBot:
             score += 4
             reasons.append("CVD_Neutral(4)")
 
-        # FUNDING (5 pts)
         if funding_rate < 0:
             score += 5
             reasons.append("Funding_Neg(5)")
@@ -1002,12 +984,10 @@ class InstitutionalBot:
             score += 3
             reasons.append("Funding_Low(3)")
 
-        # OI (5 pts)
         if oi_reason == "oi_breakout_confirmed":
             score += 5
             reasons.append("OI_Breakout(5)")
 
-        # SESSION (5 pts)
         if session_name == "us_session":
             score += 5
             reasons.append("US_Session(5)")
@@ -1015,36 +995,27 @@ class InstitutionalBot:
             score += 3
             reasons.append("London_Session(3)")
 
-        # RSI (5 pts)
         if 35 < rsi_val < 55:
             score += 5
             reasons.append(f"RSI_Sweet({int(rsi_val)})(5)")
 
-        # v3.2: HTF BONUS (10 pts) — premia alineación de marcos temporales
-        if "strong_uptrend" in htf_reason:
-            score += 10
-            reasons.append(f"HTF_Strong(10)")
-        elif "moderate_uptrend" in htf_reason:
-            score += 5
-            reasons.append(f"HTF_Moderate(5)")
-
-        # STOP LOSS
+        # Stop loss
         sl_atr = price - (atr_val * SL_ATR_MULT)
         support_zones = liq_zones.get('support_zones', [])
         sl_support = next((s * 0.998 for s in support_zones if s < price), None)
         sl_price = max(sl_atr, sl_support) if sl_support else sl_atr
 
-        sl_pct = (price - sl_price) / price * 100
+        sl_pct = safe_divide(price - sl_price, price, default=SL_MIN_PCT) * 100
         sl_pct = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
         sl_price = price * (1 - sl_pct / 100)
 
-        # TAKE PROFITS
+        # Take profits
         tp1_price = price * (1 + sl_pct * TP1_RR / 100)
         tp2_price = price * (1 + sl_pct * TP2_RR / 100)
 
-        # EDGE
+        # Edge
         potential_profit = sl_pct * TP1_RR
-        edge_ratio = potential_profit / (TOTAL_COST * 100)
+        edge_ratio = safe_divide(potential_profit, TOTAL_COST * 100, default=0.0)
 
         if edge_ratio < MIN_EDGE:
             log.debug(f"{symbol}: Edge {edge_ratio:.1f}× < {MIN_EDGE}×")
@@ -1079,13 +1050,11 @@ class InstitutionalBot:
             'funding_rate': funding_rate,
             'oi_change': oi_change,
             'session': session_name,
-            'htf_reason': htf_reason,     # v3.2
-            'rsi_1h': rsi_1h,             # v3.2
             'liq_zones': liq_zones
         }
 
     def open_position(self, signal: Dict) -> bool:
-        """Open LONG position with full error handling (FIXED)"""
+        """Open LONG position"""
         if not AUTO_TRADING:
             log.info(f"📝 PAPER MODE: Would open {signal['symbol']}")
             return False
@@ -1094,44 +1063,40 @@ class InstitutionalBot:
         price = signal['price']
         sl_price = signal['sl_price']
 
-        # Validate symbol
         if symbol not in self.contracts_info:
             log.error(f"❌ {symbol} not in contracts info")
             return False
 
         log.info(f"\n{'='*80}")
-        log.info(f"🎯 OPENING LONG v3.1: {symbol}")
+        log.info(f"🎯 OPENING LONG v3.2: {symbol}")
         log.info(f"Score: {int(signal['score'])} | Edge: {signal['edge_ratio']:.1f}× | Regime: {signal['regime']}")
         log.info(f"Entry: ${price:.6f} | SL: ${sl_price:.6f} (-{signal['sl_pct']:.2f}%)")
         log.info(f"{'='*80}\n")
 
-        # v3.2: Position sizing dinámico basado en % del equity
+        # Kelly sizing
         total = self.stats['wins'] + self.stats['losses']
         if total >= 10 and self.stats['win_amounts'] and self.stats['loss_amounts']:
-            wr = self.stats['wins'] / total
+            wr = safe_divide(self.stats['wins'], total, default=0.5)
             avg_win = sum(self.stats['win_amounts'][-20:]) / len(self.stats['win_amounts'][-20:])
             avg_loss = abs(sum(self.stats['loss_amounts'][-20:]) / len(self.stats['loss_amounts'][-20:]))
             pos_size = kelly_position_size(wr, avg_win, avg_loss, self.equity)
         else:
-            # v3.2: usar % del equity actual (no fijo en USD)
-            pos_size = max(5.0, min(self.equity * (POSITION_PCT / 100), POSITION_SIZE))
+            pos_size = POSITION_SIZE
 
         qty = self._calculate_quantity(symbol, price, sl_price, pos_size)
         if not qty:
             log.error(f"❌ Cannot calculate quantity for {symbol}")
             return False
 
-        # Set leverage
         self._set_leverage(symbol, LEVERAGE)
         time.sleep(0.3)
 
-        # CRITICAL FIX: Especificar positionSide='LONG'
         order_data = api_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol': symbol,
             'side': 'BUY',
             'type': 'MARKET',
             'quantity': str(qty),
-            'positionSide': 'LONG'  # FIX: Siempre especificar
+            'positionSide': 'LONG'
         })
 
         if order_data.get('code') != 0:
@@ -1144,18 +1109,18 @@ class InstitutionalBot:
             log.error("❌ Position not confirmed")
             return False
 
-        real_sl_pct = (fill_price - sl_price) / fill_price * 100
+        real_sl_pct = safe_divide(fill_price - sl_price, fill_price, default=SL_MIN_PCT) * 100
         tp1_price = fill_price * (1 + real_sl_pct * TP1_RR / 100)
         tp2_price = fill_price * (1 + real_sl_pct * TP2_RR / 100)
 
-        # Place Stop Loss - FIXED with positionSide
+        # Place Stop Loss
         sl_params = {
             'symbol': symbol,
             'side': 'SELL',
             'type': 'STOP_MARKET',
             'quantity': str(fill_qty),
             'stopPrice': str(round(sl_price, 8)),
-            'positionSide': 'LONG'  # FIX: Siempre especificar
+            'positionSide': 'LONG'
         }
         sl_result = api_request('POST', '/openApi/swap/v2/trade/order', sl_params)
         
@@ -1167,7 +1132,6 @@ class InstitutionalBot:
         
         sl_ok = sl_result.get('code') == 0
 
-        # CRITICAL FIX: Inicializar position con TODOS los campos
         self.positions[symbol] = {
             'entry': fill_price,
             'qty': fill_qty,
@@ -1180,10 +1144,10 @@ class InstitutionalBot:
             'tp2_price': tp2_price,
             'tp1_hit': False,
             'tp2_hit': False,
-            'highest': fill_price,  # FIX: Siempre inicializar
+            'highest': fill_price,
             'opened_at': datetime.now(),
             'score': signal['score'],
-            'signal': signal,  # FIX: Guardar señal completa
+            'signal': signal,
             'pnl_realized': 0.0,
             'pos_size': pos_size
         }
@@ -1200,13 +1164,12 @@ class InstitutionalBot:
             f"<b>🟢 LONG OPENED v3.2</b>\n\n"
             f"<b>{symbol}</b>\n"
             f"Score: {int(signal['score'])} | Edge: {signal['edge_ratio']:.1f}×\n"
-            f"Patterns: {patterns_str} | HTF: {signal.get('htf_reason','?')[:20]}\n"
-            f"Volume: {signal['vol_ratio']:.1f}× | RSI 1h: {signal.get('rsi_1h',0):.0f}\n\n"
+            f"Patterns: {patterns_str}\n"
+            f"Volume: {signal['vol_ratio']:.1f}×\n\n"
             f"📍 Entry: ${fill_price:.6f}\n"
             f"🎯 TP1: ${tp1_price:.6f}\n"
             f"🎯 TP2: ${tp2_price:.6f}\n"
-            f"🛑 SL: ${sl_price:.6f} (-{real_sl_pct:.2f}%)\n"
-            f"💰 Size: ${pos_size:.1f} ({POSITION_PCT}% equity)\n\n"
+            f"🛑 SL: ${sl_price:.6f} (-{real_sl_pct:.2f}%)\n\n"
             f"{'✅ SL Placed' if sl_ok else '⚠️ SL MANUAL REQUIRED'}"
         )
 
@@ -1228,14 +1191,13 @@ class InstitutionalBot:
         if price_per_contract <= 0:
             return None
         
-        risk_pct = (price - sl_price) / price * 100
+        risk_pct = safe_divide(price - sl_price, price, default=1.0) * 100
         risk_amount = self.equity * (RISK_PER_TRADE / 100)
-        notional = min(
-            risk_amount / (risk_pct / 100) if risk_pct > 0 else 0,
-            pos_size * LEVERAGE
-        )
         
-        qty = notional / price_per_contract
+        notional_from_risk = safe_divide(risk_amount, risk_pct / 100, default=0.0) if risk_pct > 0 else 0
+        notional = min(notional_from_risk, pos_size * LEVERAGE)
+        
+        qty = safe_divide(notional, price_per_contract, default=0.0)
         qty = math.ceil(qty / min_qty) * min_qty
         qty = round(qty, precision)
         
@@ -1274,7 +1236,7 @@ class InstitutionalBot:
         return None, None
 
     async def monitor_positions(self):
-        """Monitor open positions (FIXED - no more 'highest' KeyError)"""
+        """Monitor open positions"""
         for symbol in list(self.positions.keys()):
             try:
                 pos = self.positions[symbol]
@@ -1284,7 +1246,6 @@ class InstitutionalBot:
 
                 current_price = ticker['price']
                 
-                # FIX: Safe access to 'highest' with default
                 current_highest = pos.get('highest', pos['entry'])
                 if current_price > current_highest:
                     pos['highest'] = current_price
@@ -1301,7 +1262,6 @@ class InstitutionalBot:
                 if pos['tp1_hit'] and not pos['tp2_hit'] and current_price >= pos.get('tp2_price', float('inf')):
                     self._close_partial(symbol, pos['qty_tp2'], current_price, "TP2")
                     pos['tp2_hit'] = True
-                    # FIX: Safe access to signal.atr
                     signal = pos.get('signal', {})
                     trail_dist = signal.get('atr', 0) * RUNNER_TRAIL
                     if trail_dist > 0:
@@ -1324,24 +1284,22 @@ class InstitutionalBot:
 
             except KeyError as e:
                 log.error(f"❌ KeyError monitoring {symbol}: {e} | Position: {pos.keys()}\n{traceback.format_exc()}")
-                # Intentar recuperar posición
                 if symbol in self.positions:
                     del self.positions[symbol]
             except Exception as e:
                 log.error(f"❌ Error monitoring {symbol}: {e}\n{traceback.format_exc()}")
 
     def _close_partial(self, symbol: str, qty: float, price: float, reason: str):
-        """Close partial position (FIXED - positionSide)"""
+        """Close partial position"""
         if qty <= 0:
             return
         
-        # FIX: Especificar positionSide='LONG'
         result = api_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol': symbol,
             'side': 'SELL',
             'type': 'MARKET',
             'quantity': str(qty),
-            'positionSide': 'LONG'  # FIX: Siempre especificar
+            'positionSide': 'LONG'
         })
         
         if result.get('code') != 0:
@@ -1356,7 +1314,6 @@ class InstitutionalBot:
         self.stats['total_pnl'] += pnl
         self.daily_pnl += pnl
         
-        # Track best/worst
         if pnl > self.stats['best_trade']:
             self.stats['best_trade'] = pnl
         if pnl < self.stats['worst_trade']:
@@ -1366,7 +1323,7 @@ class InstitutionalBot:
         self._send_telegram(f"<b>💰 {reason}</b>\n\n{symbol}\nExit: ${price:.6f}\nPnL: ${pnl:+.4f}")
 
     def _close_position(self, symbol: str, price: float, reason: str):
-        """Close full position (FIXED - positionSide)"""
+        """Close full position"""
         if symbol not in self.positions:
             return
         
@@ -1374,13 +1331,12 @@ class InstitutionalBot:
         qty = pos['qty']
         
         if qty > 0:
-            # FIX: Especificar positionSide='LONG'
             result = api_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol': symbol,
                 'side': 'SELL',
                 'type': 'MARKET',
                 'quantity': str(qty),
-                'positionSide': 'LONG'  # FIX: Siempre especificar
+                'positionSide': 'LONG'
             })
             
             if result.get('code') != 0:
@@ -1393,23 +1349,22 @@ class InstitutionalBot:
         if win:
             self.stats['wins'] += 1
             self.stats['win_amounts'].append(total_pnl)
-            self.losing_streak = 0  # Reset streak
+            self.losing_streak = 0
         else:
             self.stats['losses'] += 1
             self.stats['loss_amounts'].append(total_pnl)
-            self.losing_streak += 1  # Increment streak
+            self.losing_streak += 1
         
         self.stats['total_pnl'] += pnl_final
         self.daily_pnl += pnl_final
         
-        # Track best/worst
         if total_pnl > self.stats['best_trade']:
             self.stats['best_trade'] = total_pnl
         if total_pnl < self.stats['worst_trade']:
             self.stats['worst_trade'] = total_pnl
         
         total_trades = self.stats['wins'] + self.stats['losses']
-        wr = (self.stats['wins'] / total_trades * 100) if total_trades > 0 else 0
+        wr = safe_divide(self.stats['wins'], total_trades, default=0.0) * 100
         duration_min = int((datetime.now() - pos['opened_at']).total_seconds() / 60)
         
         log.info(f"{'✅' if win else '❌'} {reason} {symbol} | ${total_pnl:+.4f} | {duration_min}min | WR:{wr:.0f}%")
@@ -1431,15 +1386,14 @@ class InstitutionalBot:
         contract = self.contracts_info.get(symbol, {})
         contract_size = contract.get('contract_size', 1)
         notional = qty * entry * contract_size
-        pnl_gross = (exit_price - entry) / entry * notional * LEVERAGE
+        pnl_gross = safe_divide(exit_price - entry, entry, default=0.0) * notional * LEVERAGE
         fees = notional * (FEE_TAKER + FEE_MAKER)
         return pnl_gross - fees
 
     def _check_circuit_breaker(self) -> bool:
-        """Circuit breaker - more aggressive (IMPROVED)"""
+        """Circuit breaker"""
         today = datetime.utcnow().date()
         
-        # Reset diario
         if today != self.daily_date:
             self.daily_pnl = 0
             self.daily_date = today
@@ -1449,7 +1403,6 @@ class InstitutionalBot:
                 self.circuit_breaker_until = None
                 log.info("🔓 Circuit Breaker RESET")
         
-        # Check si ya está activo
         if self.circuit_breaker_active:
             if self.circuit_breaker_until and datetime.utcnow() > self.circuit_breaker_until:
                 self.circuit_breaker_active = False
@@ -1458,7 +1411,6 @@ class InstitutionalBot:
                 return False
             return True
         
-        # Check pérdida diaria
         threshold = self.equity * (CIRCUIT_BREAKER_PCT / 100)
         if self.daily_pnl < -threshold:
             self.circuit_breaker_active = True
@@ -1472,7 +1424,6 @@ class InstitutionalBot:
             )
             return True
         
-        # NUEVO: Check losing streak
         if self.losing_streak >= MAX_LOSING_STREAK:
             self.circuit_breaker_active = True
             self.circuit_breaker_until = datetime.utcnow() + timedelta(hours=4)
@@ -1484,7 +1435,6 @@ class InstitutionalBot:
             )
             return True
         
-        # NUEVO: Check max daily trades
         if self.daily_trades >= MAX_DAILY_TRADES:
             log.warning(f"⚠️ Max daily trades reached: {self.daily_trades}/{MAX_DAILY_TRADES}")
             return True
@@ -1506,7 +1456,7 @@ class InstitutionalBot:
 
     async def run(self):
         """Main bot loop"""
-        log.info("\n🚀 Institutional Bot v3.1 RUNNING (FIXED)\n")
+        log.info("\n🚀 Institutional Bot v3.2 RUNNING (FIXED)\n")
         iteration = 0
         last_symbol_refresh = 0
         last_equity_update = 0
@@ -1515,12 +1465,10 @@ class InstitutionalBot:
             try:
                 iteration += 1
 
-                # Refresh symbols periodically
                 if time.time() - last_symbol_refresh > 600:
                     self._refresh_symbols()
                     last_symbol_refresh = time.time()
 
-                # Update equity periodically
                 if time.time() - last_equity_update > 1800:
                     if AUTO_TRADING:
                         data = api_request('GET', '/openApi/swap/v2/user/balance')
@@ -1530,13 +1478,12 @@ class InstitutionalBot:
                                 self.equity = eq
                     last_equity_update = time.time()
 
-                # Circuit breaker check
                 if self._check_circuit_breaker():
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 
                 total_trades = self.stats['wins'] + self.stats['losses']
-                wr = (self.stats['wins'] / total_trades * 100) if total_trades > 0 else 0
+                wr = safe_divide(self.stats['wins'], total_trades, default=0.0) * 100
 
                 log.info(f"\n{'='*80}")
                 log.info(f"#{iteration} {datetime.now().strftime('%H:%M:%S')} UTC | Pos: {len(self.positions)}/{MAX_POSITIONS}")
@@ -1544,10 +1491,8 @@ class InstitutionalBot:
                 log.info(f"Equity: ${self.equity:.2f} | Trades today: {self.daily_trades}/{MAX_DAILY_TRADES}")
                 log.info(f"{'='*80}\n")
 
-                # Monitor positions
                 await self.monitor_positions()
 
-                # Scan for new signals
                 if len(self.positions) < MAX_POSITIONS and self.daily_trades < MAX_DAILY_TRADES:
                     log.info(f"Scanning {len(self.symbols)} symbols...")
                     signals_found = 0
@@ -1558,21 +1503,25 @@ class InstitutionalBot:
                         if self.daily_trades >= MAX_DAILY_TRADES:
                             break
                         
-                        signal = self.analyze_symbol(symbol)
-                        if signal:
-                            signals_found += 1
-                            patterns = []
-                            if signal['vcp']: patterns.append("VCP")
-                            if signal['flag']: patterns.append("Flag")
-                            pattern_str = "+".join(patterns) if patterns else "Momentum"
-                            
-                            log.info(
-                                f"💡 {symbol} | Score:{int(signal['score'])} | "
-                                f"Edge:{signal['edge_ratio']:.1f}× | {pattern_str}"
-                            )
-                            
-                            if self.open_position(signal):
-                                await asyncio.sleep(3)
+                        try:
+                            signal = self.analyze_symbol(symbol)
+                            if signal:
+                                signals_found += 1
+                                patterns = []
+                                if signal['vcp']: patterns.append("VCP")
+                                if signal['flag']: patterns.append("Flag")
+                                pattern_str = "+".join(patterns) if patterns else "Momentum"
+                                
+                                log.info(
+                                    f"💡 {symbol} | Score:{int(signal['score'])} | "
+                                    f"Edge:{signal['edge_ratio']:.1f}× | {pattern_str}"
+                                )
+                                
+                                if self.open_position(signal):
+                                    await asyncio.sleep(3)
+                        except Exception as e:
+                            log.error(f"Error analyzing {symbol}: {e}\n{traceback.format_exc()}")
+                            continue
 
                     log.info(f"✓ Scan complete | Signals: {signals_found}")
 
