@@ -6,3 +6,8 @@ numpy==1.26.4
 ccxt
 pandas
 numpy
+ccxt
+pandas
+numpy
+scikit-learn
+python-dotenv
