@@ -2,75 +2,121 @@ import os
 import asyncio
 import ccxt.pro as ccxt
 import pandas as pd
+import numpy as np
 import logging
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Cargar variables de entorno si existen (local)
+load_dotenv()
 
 # Configuración de Logs
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("SimonsAI")
 
-class WhaleHunter:
+class UltimateQuantBot:
     def __init__(self):
+        # Conexión a BingX (Dinero Real)
         self.exchange = ccxt.bingx({
             'apiKey': os.getenv('BINGX_API_KEY'),
             'secret': os.getenv('BINGX_SECRET_KEY'),
             'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
+            'options': {'defaultType': 'swap'} # Para Futuros Perpetuos
         })
-        self.symbol = 'BTC/USDT:USDT'
+        
+        self.symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
         self.order_size = float(os.getenv('ORDER_SIZE', 0.001))
-        self.is_in_position = False
+        
+        # Parámetros de Riesgo
+        self.tp_pct = 0.015  # 1.5% Take Profit
+        self.sl_pct = 0.008  # 0.8% Stop Loss
+        self.trailing_pct = 0.004
+        
+        # IA y Memoria
+        self.model = RandomForestRegressor(n_estimators=100)
+        self.memory = []
+        self.is_trained = False
+        self.default_z_threshold = 2.5
+        
+        # Gestión de Posiciones
+        self.positions = {s: {'in_trade': False, 'entry': 0, 'max_seen': 0} for s in self.symbols}
 
-    async def detect_whale_trace(self):
-        """
-        Lógica de Ventaja Matemática:
-        Detecta 'Absorción'. Volumen > 300% de la media con poco movimiento de precio.
-        """
+    async def analyze_market(self, symbol):
         try:
-            # Obtener velas de 1 minuto
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, '1m', limit=20)
-            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
             
-            recent_vol = df['volume'].iloc[-1]
-            avg_vol = df['volume'].iloc[:-1].mean()
-            price_change = abs((df['close'].iloc[-1] - df['open'].iloc[-1]) / df['open'].iloc[-1]) * 100
-
-            # CRITERIO DE BALLENA:
-            # Mucho volumen (3x la media) y el precio se mueve menos de 0.05% (Absorción)
-            if recent_vol > (avg_vol * 3) and price_change < 0.05:
-                logger.info(f"🐋 HUELLA DETECTADA: Volumen {recent_vol:.2f} (Media: {avg_vol:.2f})")
-                return True
-            return False
+            # Z-Score de Volumen (La Huella de la Ballena)
+            v_mean = df['v'].rolling(30).mean().iloc[-1]
+            v_std = df['v'].rolling(30).std().iloc[-1]
+            z_vol = (df['v'].iloc[-1] - v_mean) / v_std if v_std != 0 else 0
+            
+            # Absorción: Volumen alto, rango de precio pequeño
+            range_pct = (df['h'].iloc[-1] - df['l'].iloc[-1]) / df['o'].iloc[-1]
+            abs_detected = z_vol > 3.0 and range_pct < 0.001
+            
+            return z_vol, abs_detected, df['c'].iloc[-1]
         except Exception as e:
-            logger.error(f"Error analizando huellas: {e}")
-            return False
+            logger.error(f"Error analizando {symbol}: {e}")
+            return 0, False, 0
 
-    async def trade_logic(self):
-        logger.info("🤖 Bot 'Cazador de Ballenas' activado...")
-        while True:
-            whale_active = await self.detect_whale_trace()
+    async def execute_smart_order(self, symbol, side, size):
+        """ Ejecución Maker-First para ahorrar comisiones """
+        try:
+            ob = await self.exchange.fetch_order_book(symbol, limit=5)
+            target_price = ob['bids'][0][0] if side == 'buy' else ob['asks'][0][0]
             
-            if whale_active and not self.is_in_position:
-                # Determinamos dirección basada en el flujo anterior
-                logger.info("🚀 Ejecutando entrada rápida - Front-run a la ballena")
-                try:
-                    # Ejemplo de orden de compra (puedes ajustar a Long/Short según tendencia)
-                    order = await self.exchange.create_market_order(self.symbol, 'buy', self.order_size)
-                    logger.info(f"✅ Orden ejecutada: {order['id']}")
-                    self.is_in_position = True
-                    # Esperar 5 minutos o hasta objetivo para resetear posición (simplificado)
-                    await asyncio.sleep(300) 
-                    self.is_in_position = False
-                except Exception as e:
-                    logger.error(f"Error al ejecutar orden: {e}")
+            logger.info(f"🛡️ Colocando LIMIT {side} en {target_price}")
+            order = await self.exchange.create_limit_order(symbol, side, size, target_price)
+            
+            await asyncio.sleep(8) # Esperamos a que el mercado nos toque
+            
+            check = await self.exchange.fetch_order(order['id'], symbol)
+            if check['status'] == 'closed':
+                return target_price
+            else:
+                await self.exchange.cancel_order(order['id'], symbol)
+                logger.warning("🏃 Precio escapado. Entrando a MARKET.")
+                m_order = await self.exchange.create_market_order(symbol, side, size)
+                return m_order.get('average', m_order.get('price'))
+        except Exception as e:
+            logger.error(f"Fallo en ejecución: {e}")
+            return None
 
-            await asyncio.sleep(10) # Escaneo cada 10 segundos para máxima velocidad
+    async def run(self):
+        logger.info("🚀 SISTEMA LIVE - OPERANDO DINERO REAL EN BINGX")
+        while True:
+            for symbol in self.symbols:
+                z, abs_on, price = await self.analyze_market(symbol)
+                
+                # IA ajustando el umbral
+                hour = datetime.now().hour
+                threshold = self.default_z_threshold # Aquí podrías meter self.model.predict si está entrenado
+                
+                if not self.positions[symbol]['in_trade']:
+                    if z > threshold or abs_on:
+                        logger.info(f"🔥 SEÑAL: {symbol} Z:{z:.2f}")
+                        entry = await self.execute_smart_order(symbol, 'buy', self.order_size)
+                        if entry:
+                            self.positions[symbol] = {'in_trade': True, 'entry': entry, 'max_seen': entry}
+                
+                else:
+                    # Gestión de salida
+                    pos = self.positions[symbol]
+                    if price > pos['max_seen']: self.positions[symbol]['max_seen'] = price
+                    
+                    if price <= pos['entry'] * (1 - self.sl_pct) or price >= pos['entry'] * (1 + self.tp_pct):
+                        logger.info(f"💰 CERRANDO POSICIÓN EN {symbol}")
+                        await self.execute_smart_order(symbol, 'sell', self.order_size)
+                        self.positions[symbol]['in_trade'] = False
 
-async def main():
-    bot = WhaleHunter()
-    await bot.trade_logic()
+            await asyncio.sleep(10)
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    bot = UltimateQuantBot()
+    asyncio.run(bot.run())
