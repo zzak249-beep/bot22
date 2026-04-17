@@ -1,4 +1,2 @@
-requests==2.31.0
-numpy==1.26.4
-hmmlearn==0.3.2
-scikit-learn==1.4.2
+ccxt
+pandas
