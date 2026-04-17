@@ -4,89 +4,119 @@ import ccxt.pro as ccxt
 import pandas as pd
 import numpy as np
 import logging
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger(__name__)
+# Cargar variables de entorno si existen (local)
+load_dotenv()
 
-class QuantBotSimons:
+# Configuración de Logs
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("SimonsAI")
+
+class UltimateQuantBot:
     def __init__(self):
+        # Conexión a BingX (Dinero Real)
         self.exchange = ccxt.bingx({
             'apiKey': os.getenv('BINGX_API_KEY'),
             'secret': os.getenv('BINGX_SECRET_KEY'),
             'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
+            'options': {'defaultType': 'swap'} # Para Futuros Perpetuos
         })
-        self.symbol = 'BTC/USDT:USDT'
+        
+        self.symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
         self.order_size = float(os.getenv('ORDER_SIZE', 0.001))
-        self.trailing_pct = 0.005  # 0.5% de Trailing Stop
-        self.is_in_position = False
-        self.entry_price = 0
-        self.max_price_seen = 0
+        
+        # Parámetros de Riesgo
+        self.tp_pct = 0.015  # 1.5% Take Profit
+        self.sl_pct = 0.008  # 0.8% Stop Loss
+        self.trailing_pct = 0.004
+        
+        # IA y Memoria
+        self.model = RandomForestRegressor(n_estimators=100)
+        self.memory = []
+        self.is_trained = False
+        self.default_z_threshold = 2.5
+        
+        # Gestión de Posiciones
+        self.positions = {s: {'in_trade': False, 'entry': 0, 'max_seen': 0} for s in self.symbols}
 
-    async def get_statistical_edge(self):
-        """
-        Análisis de Frecuencias (Estilo Simons):
-        Detección de agotamiento mediante Z-Score y Volumen.
-        """
+    async def analyze_market(self, symbol):
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, '1m', limit=30)
-            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
             
-            # Cálculo de Z-Score (Desviación estadística)
-            df['mean'] = df['close'].rolling(window=20).mean()
-            df['std'] = df['close'].rolling(window=20).std()
-            df['z_score'] = (df['close'] - df['mean']) / df['std']
+            # Z-Score de Volumen (La Huella de la Ballena)
+            v_mean = df['v'].rolling(30).mean().iloc[-1]
+            v_std = df['v'].rolling(30).std().iloc[-1]
+            z_vol = (df['v'].iloc[-1] - v_mean) / v_std if v_std != 0 else 0
             
-            current_z = df['z_score'].iloc[-1]
-            vol_surge = df['volume'].iloc[-1] > df['volume'].mean() * 3
+            # Absorción: Volumen alto, rango de precio pequeño
+            range_pct = (df['h'].iloc[-1] - df['l'].iloc[-1]) / df['o'].iloc[-1]
+            abs_detected = z_vol > 3.0 and range_pct < 0.001
             
-            # PATRÓN: Z-Score extremo + Pico de volumen = Agotamiento de Ballena
-            if abs(current_z) > 2.5 and vol_surge:
-                side = 'buy' if current_z < -2.5 else 'sell'
-                logger.info(f"📊 VENTAJA ESTADÍSTICA: Z-Score {current_z:.2f} detectado. Ballena agotada.")
-                return side
-            return None
+            return z_vol, abs_detected, df['c'].iloc[-1]
         except Exception as e:
-            logger.error(f"Error en análisis quant: {e}")
-            return None
+            logger.error(f"Error analizando {symbol}: {e}")
+            return 0, False, 0
 
-    async def manage_trailing_stop(self):
-        """
-        Lógica de Trailing Stop activa.
-        """
+    async def execute_smart_order(self, symbol, side, size):
+        """ Ejecución Maker-First para ahorrar comisiones """
         try:
-            ticker = await self.exchange.fetch_ticker(self.symbol)
-            current_price = ticker['last']
-
-            if current_price > self.max_price_seen:
-                self.max_price_seen = current_price
-                logger.info(f"📈 Nuevo máximo visto: {self.max_price_seen}")
-
-            # Si el precio cae un 0.5% desde el máximo visto, cerramos con ganancia
-            stop_level = self.max_price_seen * (1 - self.trailing_pct)
-            if current_price <= stop_level:
-                logger.info(f"💰 TRAILING STOP ACTIVADO. Cerrando posición en {current_price}")
-                await self.exchange.create_market_order(self.symbol, 'sell', self.order_size)
-                self.is_in_position = False
-                self.max_price_seen = 0
+            ob = await self.exchange.fetch_order_book(symbol, limit=5)
+            target_price = ob['bids'][0][0] if side == 'buy' else ob['asks'][0][0]
+            
+            logger.info(f"🛡️ Colocando LIMIT {side} en {target_price}")
+            order = await self.exchange.create_limit_order(symbol, side, size, target_price)
+            
+            await asyncio.sleep(8) # Esperamos a que el mercado nos toque
+            
+            check = await self.exchange.fetch_order(order['id'], symbol)
+            if check['status'] == 'closed':
+                return target_price
+            else:
+                await self.exchange.cancel_order(order['id'], symbol)
+                logger.warning("🏃 Precio escapado. Entrando a MARKET.")
+                m_order = await self.exchange.create_market_order(symbol, side, size)
+                return m_order.get('average', m_order.get('price'))
         except Exception as e:
-            logger.error(f"Error en Trailing Stop: {e}")
+            logger.error(f"Fallo en ejecución: {e}")
+            return None
 
     async def run(self):
-        logger.info("🚀 Bot Quant 'Simons' activo en Railway")
+        logger.info("🚀 SISTEMA LIVE - OPERANDO DINERO REAL EN BINGX")
         while True:
-            if not self.is_in_position:
-                signal = await self.get_statistical_edge()
-                if signal == 'buy':
-                    order = await self.exchange.create_market_order(self.symbol, 'buy', self.order_size)
-                    self.entry_price = float(order['price'] if order['price'] else (await self.exchange.fetch_ticker(self.symbol))['last'])
-                    self.max_price_seen = self.entry_price
-                    self.is_in_position = True
-            else:
-                await self.manage_trailing_stop()
-            
-            await asyncio.sleep(5) # Escaneo rápido
+            for symbol in self.symbols:
+                z, abs_on, price = await self.analyze_market(symbol)
+                
+                # IA ajustando el umbral
+                hour = datetime.now().hour
+                threshold = self.default_z_threshold # Aquí podrías meter self.model.predict si está entrenado
+                
+                if not self.positions[symbol]['in_trade']:
+                    if z > threshold or abs_on:
+                        logger.info(f"🔥 SEÑAL: {symbol} Z:{z:.2f}")
+                        entry = await self.execute_smart_order(symbol, 'buy', self.order_size)
+                        if entry:
+                            self.positions[symbol] = {'in_trade': True, 'entry': entry, 'max_seen': entry}
+                
+                else:
+                    # Gestión de salida
+                    pos = self.positions[symbol]
+                    if price > pos['max_seen']: self.positions[symbol]['max_seen'] = price
+                    
+                    if price <= pos['entry'] * (1 - self.sl_pct) or price >= pos['entry'] * (1 + self.tp_pct):
+                        logger.info(f"💰 CERRANDO POSICIÓN EN {symbol}")
+                        await self.execute_smart_order(symbol, 'sell', self.order_size)
+                        self.positions[symbol]['in_trade'] = False
 
-if __name__ == '__main__':
-    bot = QuantBotSimons()
+            await asyncio.sleep(10)
+
+if __name__ == "__main__":
+    bot = UltimateQuantBot()
     asyncio.run(bot.run())
