@@ -121,11 +121,11 @@ HARVEST_MONITOR   = int(os.getenv("HARVEST_MONITOR", "300"))       # segundos en
 DGRP_POSITIVE_MAX = 35
 DGRP_NEGATIVE_MIN = 60
 
-# ── Símbolos GEX válidos ──
+# ── Símbolos GEX válidos (con opciones líquidas Y soportados por BingX) ──
 GEX_VALID_SYMBOLS = [
     "BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","BNB/USDT:USDT",
-    "XRP/USDT:USDT","LINK/USDT:USDT","ADA/USDT:USDT","MATIC/USDT:USDT",
-    "DOT/USDT:USDT","LTC/USDT:USDT",
+    "XRP/USDT:USDT","LINK/USDT:USDT","ADA/USDT:USDT","DOT/USDT:USDT",
+    "LTC/USDT:USDT","AVAX/USDT:USDT",
 ]
 _env_syms    = os.getenv("SCAN_SYMBOLS", "")
 SCAN_SYMBOLS = [s.strip() for s in _env_syms.split(",") if s.strip()] if _env_syms else GEX_VALID_SYMBOLS
@@ -164,10 +164,20 @@ _CACHE_TTL = 300
 #   BINGX
 # ══════════════════════════════════════════════
 
+# Exchange autenticado — solo para órdenes, balance, posiciones
 exchange = ccxt.bingx({
     "apiKey": BINGX_API_KEY,
     "secret": BINGX_SECRET_KEY,
     "options": {"defaultType":"swap"},
+    "enableRateLimit": True,
+})
+
+# Exchange público — para ohlcv, ticker, orderbook (sin firma)
+# FIX: fetch_ohlcv en BingX falla con "Signature mismatch" si se usan keys
+# La solución es usar una instancia sin keys para datos públicos
+exchange_pub = ccxt.bingx({
+    "options": {"defaultType":"swap"},
+    "enableRateLimit": True,
 })
 
 
@@ -183,8 +193,8 @@ def normalize_symbol(raw:str) -> str:
 
 def usd_to_contracts(symbol:str, usd:float) -> float:
     try:
-        price     = exchange.fetch_ticker(symbol)["last"]
-        market    = exchange.market(symbol)
+        price     = exchange_pub.fetch_ticker(symbol)["last"]
+        market    = exchange_pub.market(symbol)
         precision = int(market.get("precision",{}).get("amount",3))
         step      = market.get("contractSize",1)
         contracts = round((usd * LEVERAGE) / price, precision)
@@ -298,7 +308,8 @@ def fetch_btc_dominance() -> float:
 
 def fetch_oi_momentum(symbol:str) -> dict:
     """
-    OI Momentum desde BingX (gratis).
+    OI Momentum via BingX REST API público (sin ccxt fetchOpenInterestHistory
+    que no está soportado en BingX).
     OI↑ + Precio↑ = tendencia fuerte (confirma LONG)
     OI↑ + Precio↓ = shorts atrapados (señal LONG explosivo)
     OI↓ + Precio↑ = longs cerrando (debilidad)
@@ -311,31 +322,43 @@ def fetch_oi_momentum(symbol:str) -> dict:
 
     result = {"oi_change_pct":0.0,"signal":"neutral","trapped":"none"}
     try:
-        history = exchange.fetch_open_interest_history(symbol,"1h",limit=3)
-        if len(history)<2:
-            return result
-        prev_oi = float(history[-2].get("openInterest",0))
-        curr_oi = float(history[-1].get("openInterest",0))
+        # BingX REST API pública para OI
+        # Convertir símbolo: BTC/USDT:USDT → BTC-USDT
+        base = symbol.split("/")[0]
+        sym_rest = f"{base}-USDT"
+        url = "https://open-api.bingx.com/openApi/swap/v2/quote/openInterest"
+        r   = requests.get(url, params={"symbol": sym_rest}, timeout=5)
+
+        if r.status_code == 200:
+            data    = r.json().get("data", {})
+            curr_oi = float(data.get("openInterest", 0))
+        else:
+            raise Exception(f"BingX OI status {r.status_code}")
+
+        # Comparar con OI previo cacheado
+        prev_key = f"oi_prev_{symbol}"
+        prev_oi  = _cache.get(prev_key, curr_oi)
+        _cache[prev_key] = curr_oi
+
         if prev_oi == 0:
             return result
 
-        oi_chg = round((curr_oi - prev_oi) / prev_oi * 100, 2)
-        ticker = exchange.fetch_ticker(symbol)
-        price_chg = float(ticker.get("percentage",0) or 0)
+        oi_chg    = round((curr_oi - prev_oi) / prev_oi * 100, 2)
+        ticker    = exchange_pub.fetch_ticker(symbol)
+        price_chg = float(ticker.get("percentage", 0) or 0)
 
         if oi_chg > OI_CHANGE_MIN and price_chg > 0:
-            sig = "strong_long"       # Tendencia alcista confirmada
+            sig = "strong_long"
         elif oi_chg > OI_CHANGE_MIN and price_chg < 0:
-            sig = "trapped_shorts"    # Shorts atrapados → explosión alcista inminente
-            result["trapped"] = "shorts"
+            sig = "trapped_shorts"
         elif oi_chg < -OI_CHANGE_MIN and price_chg > 0:
-            sig = "weak_long"         # Longs cerrando, debilidad
+            sig = "weak_long"
         elif oi_chg < -OI_CHANGE_MIN and price_chg < 0:
-            sig = "capitulation"      # Pánico / posible suelo
+            sig = "capitulation"
         else:
             sig = "neutral"
 
-        result = {"oi_change_pct":oi_chg,"signal":sig,"trapped":result["trapped"],"price_chg":price_chg}
+        result = {"oi_change_pct":oi_chg,"signal":sig,"trapped":"shorts" if sig=="trapped_shorts" else "none","price_chg":price_chg}
         _cache["oi"][symbol] = result
         _cache["oi_ts"] = now
         log.info(f"[OI] {symbol}: {oi_chg:+.2f}% | {sig}")
@@ -495,7 +518,7 @@ def check_max_pos():
 
 def check_orderbook(symbol, side):
     try:
-        ob   = exchange.fetch_order_book(symbol,limit=20)
+        ob   = exchange_pub.fetch_order_book(symbol,limit=20)
         bids = ob.get("bids",[]); asks = ob.get("asks",[])
         bv   = sum(v for _,v in bids[:5]); av=sum(v for _,v in asks[:5])
         tot  = bv+av
@@ -681,7 +704,7 @@ def process_signal(data:dict, source:str="TradingView", intel:dict=None) -> dict
                 else: _open_positions.add(sym)
 
         if TRAILING_ENABLED and side!="close" and order:
-            try: ep=exchange.fetch_ticker(sym)["last"]
+            try: ep=exchange_pub.fetch_ticker(sym)["last"]
             except: ep=float(data.get("price",0) or 0)
             _trailing_state[sym]={
                 "side":side,"entry":ep,"best":ep,"contracts":contracts,
@@ -735,7 +758,7 @@ def funding_harvest_loop():
                         n=1; oid=f"HARVEST-PAPER-{datetime.utcnow().strftime('%H%M%S')}"
 
                     _harvest_state[sym]={
-                        "side":"short","entry":exchange.fetch_ticker(sym)["last"] if MODE=="live" else 0,
+                        "side":"short","entry":exchange_pub.fetch_ticker(sym)["last"] if MODE=="live" else 0,
                         "contracts":n,"funding_rate":rate,"funding_collected":0.0,
                         "cycles":0,"order_id":oid,
                     }
@@ -813,7 +836,7 @@ def trailing_monitor_loop():
         if not _trailing_state: continue
         for sym, state in list(_trailing_state.items()):
             try:
-                price=exchange.fetch_ticker(sym)["last"]
+                price=exchange_pub.fetch_ticker(sym)["last"]
             except Exception as e:
                 log.warning(f"Trailing {sym}: {e}"); continue
 
@@ -934,7 +957,7 @@ def detect_absorption(H,L,C,V,lb=10):
 
 def confirm_multitf(symbol,side,tf):
     try:
-        ohlcv=exchange.fetch_ohlcv(symbol,tf,limit=30)
+        ohlcv=exchange_pub.fetch_ohlcv(symbol,tf,limit=30)
         C=[x[4] for x in ohlcv]; e9=calc_ema(C,9); e21=calc_ema(C,21)
         if e9[-1] is None or e21[-1] is None: return True
         return e9[-1]>e21[-1] if side=="long" else e9[-1]<e21[-1]
@@ -959,7 +982,8 @@ def analyze_symbol(symbol:str, timeframe:str, intel:dict) -> dict|None:
     Filtros: F&G · SPX · USDT · BTC.D · OI · OB · Funding · Multi-TF
     """
     try:
-        ohlcv=exchange.fetch_ohlcv(symbol,timeframe,limit=120)
+        # FIX: usar exchange_pub (sin API keys) para datos públicos
+        ohlcv=exchange_pub.fetch_ohlcv(symbol,timeframe,limit=120)
     except Exception as e:
         log.warning(f"fetch_ohlcv {symbol}: {e}"); return None
     if len(ohlcv)<60: return None
@@ -1102,7 +1126,7 @@ def scanner_loop():
                     key=f"OI_{sym}"
                     if _last_signal.get(key)!=oi_sig["signal"]:
                         _last_signal[key]=oi_sig["signal"]
-                        try: oi_sig["price"]=f"{exchange.fetch_ticker(sym)['last']:.4f}"
+                        try: oi_sig["price"]=f"{exchange_pub.fetch_ticker(sym)['last']:.4f}"
                         except: pass
                         log.info(f"  🔥 OI TRAPPED {sym} → {oi_sig['signal']}")
                         process_signal(oi_sig, source="Scanner", intel=sym_intel)
@@ -1217,7 +1241,6 @@ def scan_now():
             if res: results.append(res)
         except Exception as e: results.append({"symbol":sym,"error":str(e)})
     return jsonify({"scanned":len(SCAN_SYMBOLS),"found":len(results),"signals":results,"intel":intel}), 200
-
 @app.route("/harvest", methods=["GET"])
 def harvest_status():
     details=[]
