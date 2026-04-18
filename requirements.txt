@@ -1,13 +1,25 @@
-flask==3.1.0
-ccxt==4.4.57
+# ═══════════════════════════════════════════════════════════
+# AEGIS GEX APEX QUANT v6.1 — requirements.txt
+# ═══════════════════════════════════════════════════════════
+
+# ── Core trading ──
+ccxt==4.3.89
+
+# ── Web framework ──
+flask==3.0.3
+gunicorn==22.0.0
+
+# ── HTTP ──
 requests==2.32.3
-gunicorn==23.0.0
+
+# ── Data science ──
 numpy==1.26.4
-ccxt
-pandas
-numpy
-ccxt
-pandas
-numpy
-scikit-learn
-python-dotenv
+pandas==2.2.2
+scikit-learn==1.5.0
+
+# ── HMM Regime Detector ──
+# Si falla en Railway, el bot usa fallback ADX+BB automáticamente
+hmmlearn==0.3.2
+
+# ── Env vars (desarrollo local) ──
+python-dotenv==1.0.1

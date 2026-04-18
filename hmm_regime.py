@@ -2,36 +2,28 @@
 hmm_regime.py — Detector de Régimen con Hidden Markov Model (HMM)
 ═══════════════════════════════════════════════════════════════════
 
-¿QUÉ ES UN HMM? (para quien empieza desde cero)
-────────────────────────────────────────────────
-Un HMM asume que el mercado se encuentra siempre en uno de N "estados ocultos"
-(no los vemos directamente), y que lo que SÍ vemos (precio, volumen, volatilidad)
-son "observaciones" que se generan según una distribución de probabilidad
-diferente en cada estado.
+INTEGRACIÓN CON app.py (v6.1):
+  from hmm_regime import get_regime, active_regimes
 
-Los 5 componentes de un HMM (de las imágenes que enviaste):
-  N  → número de estados ocultos        (aquí: 3 → RANGING, TRENDING, VOLATILE)
-  M  → número de posibles observaciones (aquí: continuo → usamos Gaussianas)
-  A  → matriz de transición A[i][j]     P(estado_j | estado_i) ← aprende sola
-  B  → distribución de emisión          P(observación | estado) ← aprende sola
-  π  → probabilidad inicial de estado                           ← aprende sola
+  En analyze_symbol():
+    hmm_regime = get_regime(symbol, candles_hmm, notify_fn=send_telegram)
+    if hmm_regime == "RANGING":   → return None (skip)
+    if hmm_regime == "VOLATILE":  → effective_usd = ORDER_SIZE_USD * 0.5
+    if hmm_regime == "TRENDING":  → parámetros normales
 
-El modelo aprende A, B y π automáticamente con el algoritmo Baum-Welch
-(un tipo de Expectation-Maximization) usando las velas históricas.
-Para predecir el estado más probable usa el algoritmo de Viterbi.
+ESTADOS HMM:
+  RANGING  → mercado lateral, no operar
+  TRENDING → tendencia activa, parámetros normales
+  VOLATILE → alta volatilidad, reducir tamaño ×0.5, SL ×1.2
 
-ARQUITECTURA EN ESTE BOT
-────────────────────────
-- Cada symbol tiene su PROPIO modelo HMM (instancia de SymbolHMM)
-- Se re-entrena y predice en cada scan del bot (cada 60 segundos)
-- Si el régimen cambia respecto al scan anterior → notificación Telegram
-- Fallback automático a reglas ADX+BB si hmmlearn no está instalado
+ARQUITECTURA:
+  - Cada símbolo tiene su propio modelo (SymbolHMM)
+  - Reentrenamiento en cada scan (Baum-Welch, 60s)
+  - Viterbi para predicción del estado actual
+  - Fallback automático a reglas ADX+BB si hmmlearn no está
 
-INTEGRACIÓN CON BULL TARAMA (aplicado en bot.py)
-─────────────────────────────────────────────────
-  RANGING  → skip entrada (no abrir posiciones para ese par)
-  TRENDING → parámetros normales
-  VOLATILE → TRADE_USDT × 0.5  +  SL_ATR × 1.2
+INSTALACIÓN:
+  pip install hmmlearn scikit-learn
 """
 
 import os
@@ -42,8 +34,7 @@ import numpy as np
 logger = logging.getLogger("hmm_regime")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INTENTO DE IMPORTAR hmmlearn
-# Si no está instalado, el bot funciona igualmente con reglas ADX+BB
+# IMPORTAR hmmlearn — fallback automático si no está instalado
 # ══════════════════════════════════════════════════════════════════════════════
 try:
     from hmmlearn.hmm import GaussianHMM
@@ -51,8 +42,10 @@ try:
     logger.info("✅ hmmlearn disponible — HMM activo")
 except ImportError:
     HMM_AVAILABLE = False
-    logger.warning("⚠️  hmmlearn no instalado — usando fallback ADX+BB. "
-                   "Instala con: pip install hmmlearn scikit-learn")
+    logger.warning(
+        "⚠️  hmmlearn no instalado — usando fallback ADX+BB. "
+        "Instala con: pip install hmmlearn scikit-learn"
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
@@ -62,39 +55,24 @@ MIN_TRAIN_BARS = int(os.environ.get("HMM_MIN_BARS",   80))
 N_ITER         = int(os.environ.get("HMM_N_ITER",    100))
 ATR_LEN        = int(os.environ.get("ATR_LEN",        14))
 ADX_LEN        = int(os.environ.get("ADX_LEN",        14))
-ADX_TREND      = float(os.environ.get("ADX_TREND",  22.0))
+ADX_TREND      = float(os.environ.get("ADX_TREND",   22.0))
 BB_LEN         = int(os.environ.get("BB_LEN",         20))
 BB_VOL_PCTILE  = float(os.environ.get("BB_VOL_PCTILE", 0.35))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FEATURE ENGINEERING
-# Las "observaciones" que ve el HMM son estas 4 features por vela
+# Las 4 features que observa el HMM por cada vela
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_features(candles: list) -> np.ndarray:
     """
     Construye la matriz de observaciones X de shape [N-1, 4]:
 
-    Feature 0 — log-return
-        log(close_i / close_{i-1})
-        Captura dirección y magnitud del movimiento de precio.
-
-    Feature 1 — ATR normalizado  (volatilidad intra-barra)
-        True Range del bar / close
-        Valores altos = mercado volátil o con gaps.
-
-    Feature 2 — volumen normalizado
-        vol_i / media_vol_20_barras_anteriores
-        > 1 = actividad inusual, posible breakout o liquidación.
-
-    Feature 3 — BB width normalizado  (expansión/contracción)
-        2 × std(closes_últimas_20) / close
-        Ancho alto = tendencia o volatilidad. Estrecho = lateralización.
-
-    Por qué estas 4:
-        Cubren las 3 dimensiones que distinguen regímenes:
-        dirección (log-return), volatilidad (ATR, BB), actividad (volumen).
+    Feature 0 — log-return:        log(close_i / close_{i-1})
+    Feature 1 — ATR normalizado:   True Range / close
+    Feature 2 — volumen relativo:  vol_i / media_vol_20_barras
+    Feature 3 — BB width:          2×std(closes_20) / close
     """
     n     = len(candles)
     feats = []
@@ -133,26 +111,20 @@ def _build_features(candles: list) -> np.ndarray:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ASIGNACIÓN DINÁMICA DE ETIQUETAS
-# El HMM aprende 3 estados numerados (0,1,2) pero no sabe sus nombres.
-# Los etiquetamos comparando las medias de cada estado entrenado.
+# El HMM aprende 3 estados (0,1,2) sin nombre. Los etiquetamos por sus medias.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _assign_labels(model) -> dict:
     """
-    Lee model.means_ (shape: [N_STATES, 4]) y asigna etiquetas:
-      - Mayor ATR normalizado (col 1) → VOLATILE
+    Lee model.means_ [N_STATES, 4] y asigna:
+      - Mayor ATR (col 1) → VOLATILE
       - De los restantes, mayor BB width (col 3) → TRENDING
       - El que queda → RANGING
-
-    Por ejemplo tras entrenar con BTC podría quedar:
-      {0: "RANGING", 1: "TRENDING", 2: "VOLATILE"}
-    o cualquier otra combinación — el orden varía por entrenamiento.
     """
-    means = model.means_   # [N_STATES, 4]
-
-    volatile_idx = int(np.argmax(means[:, 1]))   # mayor ATR
+    means        = model.means_
+    volatile_idx = int(np.argmax(means[:, 1]))
     remaining    = [i for i in range(N_STATES) if i != volatile_idx]
-    trending_idx = remaining[int(np.argmax(means[remaining, 3]))]   # mayor BB
+    trending_idx = remaining[int(np.argmax(means[remaining, 3]))]
     ranging_idx  = [i for i in range(N_STATES)
                     if i not in (volatile_idx, trending_idx)][0]
 
@@ -166,39 +138,27 @@ def _assign_labels(model) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLASE SymbolHMM — un modelo independiente por símbolo
+# CLASE SymbolHMM — modelo independiente por símbolo
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SymbolHMM:
     """
-    Modelo HMM individual para un símbolo (ej: BTC-USDT).
+    Un modelo HMM independiente por símbolo (ej: BTC/USDT:USDT).
 
-    Ciclo de vida por cada scan (60 segundos):
-      1. bot.py llama a get_regime(symbol, candles)
-      2. SymbolHMM.predict(candles) → entrena → predice con Viterbi
+    Ciclo de vida por scan:
+      1. get_regime() llama a predict(candles)
+      2. predict() → _train() con Baum-Welch → predice con Viterbi
       3. Devuelve "RANGING", "TRENDING" o "VOLATILE"
-      4. El registro global detecta cambio → notifica Telegram si aplica
+      4. Si el régimen cambia → notifica Telegram
     """
 
     def __init__(self, symbol: str):
-        self.symbol       = symbol
-        self._model       = None    # GaussianHMM entrenado
-        self._label_map   = {}      # {estado_idx: "RANGING"|"TRENDING"|"VOLATILE"}
-        self.last_regime  = None    # último régimen predicho (para detectar cambios)
+        self.symbol      = symbol
+        self._model      = None
+        self._label_map  = {}
+        self.last_regime = None
 
     def _train(self, candles: list):
-        """
-        Entrena el GaussianHMM con las velas disponibles usando Baum-Welch.
-
-        GaussianHMM de hmmlearn:
-          - n_components = número de estados ocultos (3)
-          - covariance_type = "diag": cada estado tiene su propia varianza
-            por feature, sin correlaciones cruzadas (más rápido, suficiente aquí)
-          - n_iter: número de iteraciones del EM (más = más preciso, más lento)
-          - random_state: semilla para reproducibilidad
-
-        model.fit(X) hace el aprendizaje completo de A, B y π.
-        """
         if not HMM_AVAILABLE:
             return
 
@@ -215,7 +175,7 @@ class SymbolHMM:
                 verbose=False,
             )
             model.fit(X)
-            self._model   = model
+            self._model     = model
             self._label_map = _assign_labels(model)
             logger.debug(f"{self.symbol} HMM entrenado con {len(X)} observaciones")
         except Exception as e:
@@ -223,17 +183,6 @@ class SymbolHMM:
             self._model = None
 
     def predict(self, candles: list) -> str:
-        """
-        Entrena con las últimas velas y predice el régimen actual.
-
-        Proceso:
-          1. _train() → model.fit(X) → aprende A, B, π con Baum-Welch
-          2. model.predict(X) → algoritmo Viterbi → secuencia de estados
-          3. states[-1] → estado de la última vela → traducir con label_map
-
-        El re-entrenamiento en cada scan (no solo periódico) garantiza que
-        el modelo siempre refleja las condiciones más recientes.
-        """
         if len(candles) < MIN_TRAIN_BARS:
             return _rule_based_regime(candles)
 
@@ -242,8 +191,8 @@ class SymbolHMM:
         if self._model is not None and HMM_AVAILABLE:
             try:
                 X      = _build_features(candles[-MIN_TRAIN_BARS:])
-                states = self._model.predict(X)     # ← Viterbi aquí
-                idx    = int(states[-1])             # estado de la última vela
+                states = self._model.predict(X)
+                idx    = int(states[-1])
                 regime = self._label_map.get(idx, "RANGING")
                 logger.debug(f"{self.symbol} → estado {idx} → {regime}")
                 return regime
@@ -257,22 +206,20 @@ class SymbolHMM:
 # REGISTRO GLOBAL — un SymbolHMM por símbolo
 # ══════════════════════════════════════════════════════════════════════════════
 
-_registry: dict = {}   # {symbol: SymbolHMM}
+_registry: dict = {}
 
 
 def get_regime(symbol: str, candles: list, notify_fn=None) -> str:
     """
-    Función principal. Llamar desde bot.py en cada scan por símbolo.
+    Función principal. Llamar desde app.py en cada scan.
 
     Args:
-        symbol:    ej. "BTC-USDT"
-        candles:   lista de velas 1min [{open,high,low,close,volume}, ...]
-        notify_fn: notifier.send — para avisar cambios por Telegram
+        symbol:    ej. "BTC/USDT:USDT"
+        candles:   lista de dicts [{open, high, low, close, volume}, ...]
+        notify_fn: send_telegram — para avisar cambios por Telegram
 
     Returns:
         "TRENDING" | "RANGING" | "VOLATILE"
-
-    Detecta automáticamente cambios de régimen y notifica por Telegram.
     """
     if symbol not in _registry:
         _registry[symbol] = SymbolHMM(symbol)
@@ -281,7 +228,7 @@ def get_regime(symbol: str, candles: list, notify_fn=None) -> str:
     prev   = hmm.last_regime
     regime = hmm.predict(candles)
 
-    # ── Detectar cambio y notificar ───────────────────────────────────────────
+    # Detectar cambio y notificar
     if prev is not None and prev != regime and notify_fn is not None:
         emoji = {"TRENDING": "📈", "RANGING": "😴", "VOLATILE": "⚡"}.get(regime, "🔄")
         notify_fn(
@@ -299,8 +246,8 @@ def get_regime(symbol: str, candles: list, notify_fn=None) -> str:
 
 
 def _action_text(regime: str) -> str:
-    if regime == "RANGING":   return "🚫 Entradas pausadas para este par"
-    if regime == "VOLATILE":  return "⚠️ Tamaño ×0.5 | SL ×1.2"
+    if regime == "RANGING":  return "🚫 Entradas pausadas para este par"
+    if regime == "VOLATILE": return "⚠️ Tamaño ×0.5 | SL ×1.2"
     return "✅ Parámetros normales"
 
 
@@ -310,7 +257,7 @@ def active_regimes() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FALLBACK — reglas ADX+BB sin hmmlearn
+# FALLBACK — reglas ADX+BB si hmmlearn no está disponible
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _rule_based_regime(candles: list) -> str:
@@ -322,8 +269,8 @@ def _rule_based_regime(candles: list) -> str:
     atr_now = _atr_simple(candles, ATR_LEN)
     series  = _atr_series(candles, ATR_LEN)
     atr_avg = float(np.nanmean(series[-50:])) or 1.0
-    if atr_now / atr_avg > 2.0:   return "VOLATILE"
-    if adx_val < ADX_TREND and bb_pct < BB_VOL_PCTILE:   return "RANGING"
+    if atr_now / atr_avg > 2.0:                          return "VOLATILE"
+    if adx_val < ADX_TREND and bb_pct < BB_VOL_PCTILE:  return "RANGING"
     return "TRENDING"
 
 
@@ -349,27 +296,36 @@ def _atr_series(candles, period=14) -> np.ndarray:
 
 def _adx_simple(candles, period=14) -> float:
     if len(candles) < period * 2: return 0.0
-    H = [c["high"] for c in candles]; L = [c["low"] for c in candles]
+    H = [c["high"] for c in candles]
+    L = [c["low"]  for c in candles]
     C = [c["close"] for c in candles]
     pdm, mdm, trl = [], [], []
     for i in range(1, len(candles)):
-        hd = H[i]-H[i-1]; ld = L[i-1]-L[i]
+        hd = H[i] - H[i-1]; ld = L[i-1] - L[i]
         pdm.append(hd if hd > ld and hd > 0 else 0)
         mdm.append(ld if ld > hd and ld > 0 else 0)
         trl.append(max(H[i]-L[i], abs(H[i]-C[i-1]), abs(L[i]-C[i-1])))
+
     def wilder(a, p):
         r = [sum(a[:p])]
         for x in a[p:]: r.append(r[-1] - r[-1]/p + x)
         return r
-    aw=wilder(trl,period); pw=wilder(pdm,period); mw=wilder(mdm,period)
-    dx = [100*abs(100*p/a - 100*m/a)/(100*p/a + 100*m/a)
-          for a,p,m in zip(aw,pw,mw) if a > 0 and (p+m) > 0]
+
+    aw = wilder(trl, period); pw = wilder(pdm, period); mw = wilder(mdm, period)
+    dx = [
+        100 * abs(100*p/a - 100*m/a) / (100*p/a + 100*m/a)
+        for a, p, m in zip(aw, pw, mw)
+        if a > 0 and (p + m) > 0
+    ]
     return float(np.mean(dx[-period:])) if len(dx) >= period else 0.0
 
 
 def _bb_percentile(closes, period=20, lookback=100) -> float:
     if len(closes) < period + lookback: return 0.5
-    widths = [float(np.std(closes[i-period:i])*2)
-              for i in range(len(closes)-lookback, len(closes)) if i >= period]
+    widths = [
+        float(np.std(closes[i-period:i]) * 2)
+        for i in range(len(closes) - lookback, len(closes))
+        if i >= period
+    ]
     if not widths: return 0.5
     return sum(1 for w in widths if w <= widths[-1]) / len(widths)
