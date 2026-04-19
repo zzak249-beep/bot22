@@ -1,214 +1,162 @@
 #!/usr/bin/env python3
 """
-BOT LONGS v6.0 — PRECISION EDITION
+BINGX BOT COMPLETO v8.0 — SCANNER + TRADER INTEGRADOS
 ════════════════════════════════════════════════════════════════════════════════
 
-DIAGNÓSTICO de los bots anteriores:
-  ❌ AEGIS + SuperBot corriendo en paralelo → SHORTs descontrolados en ALTUSDT,
-     BANANAUSDT (5 SHORTs en 1 hora → pérdida pura de comisiones)
-  ❌ 72 páginas de historial = ~500 trades → comisiones ~$30 con cuenta de $67
-  ❌ SKY-USDT y REZ-USDT abiertos con 10x (bug en _recover)
-  ❌ Score mínimo 60 demasiado bajo → señales de baja calidad
-  ❌ AUROLO_MIN_PTS=1 en v5.9 → ruido enorme
-  ❌ Sin filtro de sesión en v5.9/v5.9-FULLSCAN → opera 24/7
-  ❌ CAUTION_BLOCK=false → opera en mercados laterales
-  ❌ Múltiples bots compitiendo por el mismo capital
+ARQUITECTURA:
+  Thread 1 (principal) → Bot trader: gestiona trades, monitorea posiciones
+  Thread 2 (background) → Explosion scanner: busca pumps cada 2 min
+  Thread 3 (background) → Telegram commands: /status /top /trades /pause
 
-CAMBIOS v6.0 PRECISION:
-  ✅ FIX CRÍTICO: PARAR AEGIS Y SUPERBOT — solo un bot activo
-  ✅ Score mínimo subido a 75 (bull) / 85 (neutral)
-  ✅ AUROLO_MIN_PTS=2 por defecto, con gate extra de calidad
-  ✅ Sesión ESTRICTA: solo London (7-12h) + NY open (13-17h) UTC
-  ✅ trend_4h == 1 requerido SIEMPRE (no solo en neutral)
-  ✅ BTC 1h debe ser > -0.3% (era -1.0%)
-  ✅ Breadth mínimo 50% (era 35%)
-  ✅ VOL_RATIO_MIN=1.5 (era 1.2)
-  ✅ MAX_DAILY_TRADES=3 (nuevo: máximo 3 trades por día)
-  ✅ MAX_TRADES=2 (era 3)
-  ✅ RSI 1h < 65 (evitar sobrecompra)
-  ✅ Require OFI alcista O MTF15m alcista (al menos uno)
-  ✅ Fix bug leverage en _recover() — ignora posiciones con leverage > LEVERAGE+1
-  ✅ Cooldown SL: 6h (era 4h)
-  ✅ TP1_RATIO subido a 2.5 (era 2.0) para cubrir comisiones con margen
-  ✅ Awareness de comisiones: TP neto mínimo 0.6%
-  ✅ Filtro change_24h: solo -5% a +12% (evita pumps/dumps extremos)
-  ✅ Trailing stop manual robusto cuando BingX lo rechaza
-  ✅ Reporte diario de calidad de señales
+MEJORAS v7.0 vs v6.0 + Scanner separado:
+  ✅ Scanner integrado → bot escanea primero las monedas "calientes"
+  ✅ Position sizing dinámico → más size si scanner confidence ≥ 80%
+  ✅ Confluencia dual → señal del bot + confirmación del scanner = entrada
+  ✅ Comandos Telegram: /status /top /pause /resume /trades
+  ✅ Pre-sesión alert: 15min antes de London/NY avisa las mejores monedas
+  ✅ Anti-sobretrading: si scanner no encuentra nada bueno, bot espera
+  ✅ Trailing inteligente: ajuste según volatilidad ATR del momento
+  ✅ Reporte diario automático a las 17h UTC con P&L y estadísticas
+  ✅ Health check: bot se auto-reinicia si lleva >5min sin responder
+
+MEJORAS v8.0 (5 fixes críticos):
+  ✅ FIX 1 — PERSISTENCIA REAL: learning se guarda en ruta configurable
+             (PERSIST_PATH=/data con Railway Volume → survives redeploys)
+  ✅ FIX 2 — SCANNER OBLIGATORIO: SCANNER_REQUIRED=true bloquea entradas
+             sin confirmación del scanner (no más Aurolo solo)
+  ✅ FIX 3 — DAILY_TRADES PERSISTIDO: contador diario sobrevive reinicios,
+             evita sobretrading si el bot se reinicia a mitad del día
+  ✅ FIX 4 — TRAILING SIN GAP: nuevo SL se coloca ANTES de cancelar el
+             viejo, posición nunca queda sin protección durante el update
+  ✅ FIX 5 — ENTRY TIMEOUT GLOBAL: _entry() tiene timeout de 30s,
+             no bloquea el loop principal si BingX está lento
 """
 
-import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json, random
+import os, sys, time, math, re, json, hmac, hashlib, logging, asyncio
+import random, threading, traceback
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+
 # ============================================================================
-# CONFIG
+# CONFIGURACIÓN GLOBAL
 # ============================================================================
 
-def clean(key, default, typ='str'):
-    v = os.getenv(key, str(default)).strip()
-    if v.startswith('"') and v.endswith('"'): v = v[1:-1]
-    elif v.startswith("'") and v.endswith("'"): v = v[1:-1]
-    if typ in ('int', 'float'):
-        v = v.replace(',', '.')
-        m = re.match(r'^-?\d+\.?\d*', v)
-        v = m.group(0) if m else str(default)
-    if typ == 'int':   return int(float(v))
-    if typ == 'float': return float(v)
-    if typ == 'bool':  return v.lower() == 'true'
+def _e(key, default, typ='str'):
+    v = os.getenv(key, str(default)).strip().strip('"').strip("'")
+    if typ in ('int','float'): v = re.sub(r'[^\d\.\-]','',v) or str(default)
+    if typ=='int':   return int(float(v))
+    if typ=='float': return float(v)
+    if typ=='bool':  return v.lower()=='true'
     return v
 
-def _strip_quotes(s):
-    s = s.strip()
-    if (s.startswith('"') and s.endswith('"')) or \
-       (s.startswith("'") and s.endswith("'")):
-        return s[1:-1]
-    return s
+# API
+API_KEY    = os.getenv('BINGX_API_KEY','').strip().strip('"')
+API_SECRET = os.getenv('BINGX_API_SECRET','').strip().strip('"')
+TG_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN','')
+TG_CHAT    = os.getenv('TELEGRAM_CHAT_ID','')
+BASE_URL   = "https://open-api.bingx.com"
 
-API_KEY    = _strip_quotes(os.getenv('BINGX_API_KEY',    ''))
-API_SECRET = _strip_quotes(os.getenv('BINGX_API_SECRET', ''))
-TG_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TG_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
+# Capital
+AUTO           = _e('AUTO_TRADING_ENABLED','true','bool')
+POS_SIZE       = _e('MAX_POSITION_SIZE','10','float')
+MIN_TRADE      = _e('MIN_TRADE_USDT','10','float')
+LEVERAGE       = min(_e('LEVERAGE','2','int'), 3)
+MAX_TRADES     = _e('MAX_OPEN_TRADES','2','int')
+MAX_DAILY      = _e('MAX_DAILY_TRADES','3','int')
+RISK_PCT       = _e('RISK_PCT','1.0','float')
+ACCOUNT_EQUITY = _e('ACCOUNT_EQUITY','100','float')
 
-# ── Capital ────────────────────────────────────────────────────────────────
-AUTO           = clean('AUTO_TRADING_ENABLED', 'true',  'bool')
-POS_SIZE       = clean('MAX_POSITION_SIZE',    '10',    'float')
-MIN_TRADE      = clean('MIN_TRADE_USDT',       '10',    'float')
-_lev           = clean('LEVERAGE',             '2',     'int')
-LEVERAGE       = min(_lev, 3)
-MAX_TRADES     = clean('MAX_OPEN_TRADES',      '2',     'int')   # v6.0: era 3
-MAX_DAILY_TRADES = clean('MAX_DAILY_TRADES',   '3',     'int')   # v6.0: NUEVO
-RISK_PCT       = clean('RISK_PCT',             '1.0',   'float')
-ACCOUNT_EQUITY = clean('ACCOUNT_EQUITY',       '100',   'float')
+# TP/SL
+TP1_PCT    = _e('TP1_PCT','40','float')
+TP2_PCT    = _e('TP2_PCT','35','float')
+TP1_RATIO  = _e('TP1_RATIO','2.5','float')
+TP2_RATIO  = _e('TP2_RATIO','4.0','float')
+SL_MAX_PCT = _e('SL_MAX_PCT','2.5','float')
+SL_MIN_PCT = _e('SL_MIN_PCT','0.7','float')
+SL_ATR_M   = _e('SL_ATR_MULT','1.5','float')
+MIN_RR     = _e('MIN_RR','2.5','float')
+TP_MIN     = _e('TAKE_PROFIT_PCT','1.5','float')
+ATR_TP_M   = _e('ATR_TP_MULT','3.0','float')
 
-# ── TPs Escalonados ────────────────────────────────────────────────────────
-TP1_PCT   = clean('TP1_PCT',   '40',  'float')
-TP2_PCT   = clean('TP2_PCT',   '35',  'float')
-TP1_RATIO = clean('TP1_RATIO', '2.5', 'float')  # v6.0: era 2.0 — más margen sobre comisiones
-TP2_RATIO = clean('TP2_RATIO', '4.0', 'float')  # v6.0: era 3.5
+# Trailing
+USE_TRAIL      = _e('USE_TRAILING_EXIT','true','bool')
+TRAIL_RATE     = _e('TRAIL_RATE_PCT','1.2','float')
+TRAIL_ACT      = _e('TRAIL_ACTIVATION','1.0','float')
 
-# ── TP/SL ──────────────────────────────────────────────────────────────────
-TP_MIN    = clean('TAKE_PROFIT_PCT', '1.5',  'float')
-ATR_TP_M  = clean('ATR_TP_MULT',    '3.0',  'float')
-MIN_RR    = clean('MIN_RR',         '2.5',  'float')   # v6.0: era 2.2
-SL_ATR_M  = clean('SL_ATR_MULT',   '1.5',  'float')
-SL_MAX_PCT = clean('SL_MAX_PCT',   '2.5',  'float')    # v6.0: era 3.5 — más tight
-SL_MIN_PCT = clean('SL_MIN_PCT',   '0.7',  'float')
+# Símbolos
+MIN_VOL    = _e('MIN_VOLUME_24H','1000000','float')
+MAX_SYMS   = _e('MAX_SYMBOLS','100','int')
+MIN_SCORE  = _e('MIN_SCORE','75','float')
+BTC_BLOCK  = _e('BTC_BLOCK_PCT','0.3','float')
 
-# ── Trailing Stop ──────────────────────────────────────────────────────────
-USE_TRAILING_EXIT = clean('USE_TRAILING_EXIT', 'true', 'bool')
-TRAIL_RATE_PCT    = clean('TRAIL_RATE_PCT',    '1.2',  'float')  # v6.0: era 1.5
-TRAIL_ACTIVATION  = clean('TRAIL_ACTIVATION',  '1.0',  'float')  # v6.0: era 0.8
+# Régimen
+BREADTH_MIN       = _e('BREADTH_MIN','0.50','float')
+BREADTH_BEAR      = _e('BREADTH_BEAR_HARD','0.30','float')
+BTC4H_CRASH       = _e('BTC_4H_CRASH_PCT','2.5','float')
+BTC4H_PAUSE       = _e('BTC_4H_CRASH_HOURS','3','int')
+DAILY_LOSS_CAP    = _e('DAILY_LOSS_CAP_PCT','8.0','float')
+CAUTION_BLOCK     = _e('CAUTION_BLOCK','true','bool')
+SCORE_BULL        = _e('SCORE_BULL','75','float')
+SCORE_NEUTRAL     = _e('SCORE_NEUTRAL','85','float')
 
-# ── Zombie cleanup ────────────────────────────────────────────────────────
-ZOMBIE_CLEANUP_MIN = clean('ZOMBIE_CLEANUP_MIN', '10', 'int')
-ZOMBIE_MAX_AGE_MIN = clean('ZOMBIE_MAX_AGE_MIN', '20', 'int')
+# Aurolo
+AUROLO_EMA    = _e('AUROLO_EMA_LEN','55','int')
+AUROLO_MIN_PT = _e('AUROLO_MIN_PTS','2','int')
+VOL_RATIO_MIN = _e('VOL_RATIO_MIN','1.5','float')
+WT_OB1 = 60.0; WT_OB2 = 42.0; WT_OS1 = -60.0; WT_OS2 = -42.0; WT_OS_E = -20.0
+ADX_KEY = 20.0
 
-# ── Símbolos y volumen ────────────────────────────────────────────────────
-MIN_VOL   = clean('MIN_VOLUME_24H',  '1000000', 'float')  # v6.0: era 300K — más liquidez
-MAX_SYMS  = clean('MAX_SYMBOLS',     '100',     'int')    # v6.0: limitar a 100 mejores
-MIN_SCORE = clean('MIN_SCORE',       '75',      'float')  # v6.0: era 60
-BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '0.3', 'float')  # v6.0: era 1.0 — más estricto
+# Cooldowns
+CD_TP          = _e('COOLDOWN_TP_MIN','15','int')
+CD_SL          = _e('COOLDOWN_SL_MIN','360','int')
+CD_SL_TODAY    = _e('COOLDOWN_SL_TODAY','true','bool')
+CD_SL_FAST_MIN = _e('COOLDOWN_SL_FAST_MIN','10','int')
+CD_SL_FAST_H   = _e('COOLDOWN_SL_FAST_HOURS','12','int')
+MAX_STREAK     = _e('MAX_LOSING_STREAK','3','int')
 
-# ── Régimen de mercado ────────────────────────────────────────────────────
-REGIME_CHECK      = clean('REGIME_CHECK',      'true',  'bool')
-BREADTH_MIN       = clean('BREADTH_MIN',        '0.50',  'float')  # v6.0: era 0.35
-BREADTH_BEAR_HARD = clean('BREADTH_BEAR_HARD',  '0.30',  'float')  # v6.0: era 0.20
-BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '2.5',   'float')
-BTC_4H_CRASH_PAUSE= clean('BTC_4H_CRASH_HOURS','3',      'int')    # v6.0: era 2
-DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','8.0',   'float')
-CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'true',  'bool')
-SCORE_BULL        = clean('SCORE_BULL',         '75',    'float')  # v6.0: era 60
-SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',      '85',    'float')  # v6.0: era 68
+# Circuit Breaker
+CB_PCT   = _e('CIRCUIT_BREAKER_PCT','5.0','float')
+CB_HOURS = _e('CB_PAUSE_HOURS','4','int')
 
-# ── VWAP ──────────────────────────────────────────────────────────────────
-VWAP_CANDLES   = clean('VWAP_CANDLES',  '50',   'int')
-VWAP_AS_FILTER = clean('VWAP_FILTER',  'true',  'bool')
+# Scanner
+SCAN_INTERVAL   = _e('SCAN_INTERVAL','120','int')
+SCAN_MIN_CONF   = _e('SCANNER_MIN_CONFIDENCE','55','int')
+SCAN_HOT_MIN    = _e('SCANNER_HOT_MIN_CONF','70','int')
+SCAN_SIZE_BOOST = _e('SCANNER_SIZE_BOOST','true','bool')
+SCAN_WORKERS    = _e('SCAN_WORKERS','8','int')
 
-# ── Motor Aurolo ──────────────────────────────────────────────────────────
-AUROLO_EMA_LEN    = clean('AUROLO_EMA_LEN',   '55',   'int')
-AUROLO_ZONA_AUTO  = clean('AUROLO_ZONA_AUTO',  'true', 'bool')
-AUROLO_ZONA_PCT   = clean('AUROLO_ZONA_PCT',   '0.8',  'float')
-AUROLO_ZONA_VELAS = clean('AUROLO_ZONA_VELAS', '6',    'int')
-AUROLO_MIN_PTS    = clean('AUROLO_MIN_PTS',    '2',    'int')   # v6.0: mínimo 2/3
-AUROLO_ENTRY      = clean('AUROLO_ENTRY',      'close','str')
-VOL_RATIO_MIN     = clean('VOL_RATIO_MIN',     '1.5',  'float') # v6.0: era 1.2
+# Sesión
+SESSION_ON = _e('SESSION_FILTER','true','bool')
+LON_S = _e('SESSION_LONDON_S','7','int'); LON_E = _e('SESSION_LONDON_E','12','int')
+NY_S  = _e('SESSION_NY_S','13','int');   NY_E  = _e('SESSION_NY_E','17','int')
 
-# WaveTrend
-WT_CH_LEN   = clean('WT_CH_LEN',   '10',  'int')
-WT_AVG_LEN  = clean('WT_AVG_LEN',  '21',  'int')
-WT_OB1      = clean('WT_OB1',      '60',  'float')
-WT_OB2      = clean('WT_OB2',      '42',  'float')
-WT_OS1      = clean('WT_OS1',      '-60', 'float')
-WT_OS2      = clean('WT_OS2',      '-42', 'float')
-WT_OS_ENTRY = clean('WT_OS_ENTRY', '-20', 'float')
+# Misc
+INTERVAL = _e('CHECK_INTERVAL','90','int')
+LTV_WARN = _e('LTV_WARNING_PCT','75','float')
 
-# ADX
-ADX_LEN    = clean('ADX_LEN',    '14',  'int')
-ADX_DI_LEN = clean('ADX_DI_LEN', '14',  'int')
-ADX_KEY    = clean('ADX_KEY',    '20',  'float')
+# ── v8.0: Persistencia y scanner gate ─────────────────────────────────────
+# PERSIST_PATH: directorio donde se guarda el estado de aprendizaje.
+#   - En Railway: añadir un Volume montado en /data y poner PERSIST_PATH=/data
+#   - Sin volume: usar /tmp (se borra en cada redeploy, comportamiento original)
+PERSIST_PATH     = _e('PERSIST_PATH',     '/tmp',  'str').rstrip('/')
+# SCANNER_REQUIRED: si true, solo entra si scanner_conf >= SCANNER_MIN_CONFIDENCE
+# Esto evita que Aurolo solo abra trades sin confirmación del scanner de explosión
+SCANNER_REQUIRED = _e('SCANNER_REQUIRED', 'true',  'bool')
+# ENTRY_TIMEOUT_SEC: segundos máximos para completar una entrada (fix #5)
+ENTRY_TIMEOUT    = _e('ENTRY_TIMEOUT_SEC','30',    'int')
 
-# ── Circuit breaker ───────────────────────────────────────────────────────
-CB_PCT     = clean('CIRCUIT_BREAKER_PCT', '5.0',  'float')  # v6.0: era 6.0
-CB_HOURS   = clean('CB_PAUSE_HOURS',      '4',    'int')    # v6.0: era 2
-MAX_STREAK = clean('MAX_LOSING_STREAK',   '3',    'int')    # v6.0: era 4
+EXCLUDE = {'USDC','BUSD','TUSD','FRAX','DAI','USDP','FDUSD','EUR','GBP','JPY','CHF','AUD','CAD'}
+BREADTH_COINS = ['BTC-USDT','ETH-USDT','BNB-USDT','SOL-USDT','XRP-USDT',
+                 'ADA-USDT','AVAX-USDT','DOGE-USDT','DOT-USDT','MATIC-USDT',
+                 'LINK-USDT','UNI-USDT','ATOM-USDT','LTC-USDT','BCH-USDT',
+                 'NEAR-USDT','APT-USDT','OP-USDT','ARB-USDT','SUI-USDT']
 
-# ── Cooldowns ─────────────────────────────────────────────────────────────
-CD_TP            = clean('COOLDOWN_TP_MIN',       '15',  'int')   # v6.0: era 10
-CD_SL            = clean('COOLDOWN_SL_MIN',       '360', 'int')   # v6.0: era 240 → 6h
-CD_SL_TODAY      = clean('COOLDOWN_SL_TODAY',     'true','bool')
-CD_SL_FAST_MIN   = clean('COOLDOWN_SL_FAST_MIN',  '10',  'int')
-CD_SL_FAST_HOURS = clean('COOLDOWN_SL_FAST_HOURS','12',  'int')   # v6.0: era 8 → 12h
-
-# ── Aprendizaje ───────────────────────────────────────────────────────────
-LEARN_MIN_TRADES_SCORE = clean('LEARN_MIN_TRADES',    '10', 'int')
-LEARN_MIN_TRADES_BL    = clean('LEARN_MIN_TRADES_BL', '5',  'int')
-SCORE_CAP_LOW          = clean('SCORE_CAP_LOW',       '80', 'float')
-SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH',      '92', 'float')
-
-# ── Sesión (v6.0: ESTRICTA) ───────────────────────────────────────────────
-SESSION_FILTER   = clean('SESSION_FILTER',   'true', 'bool')
-SESSION_LONDON_S = clean('SESSION_LONDON_S', '7',    'int')   # 07:00 UTC
-SESSION_LONDON_E = clean('SESSION_LONDON_E', '12',   'int')   # 12:00 UTC
-SESSION_NY_S     = clean('SESSION_NY_S',     '13',   'int')   # 13:00 UTC
-SESSION_NY_E     = clean('SESSION_NY_E',     '17',   'int')   # 17:00 UTC
-
-# ── Smart Money (v6.0) ────────────────────────────────────────────────────
-STOP_HUNT_DETECT  = clean('STOP_HUNT_DETECT', 'true', 'bool')
-STOP_HUNT_WICK    = clean('STOP_HUNT_WICK',   '0.6',  'float')
-STOP_HUNT_VOL_M   = clean('STOP_HUNT_VOL_M',  '2.5',  'float')
-OFI_BULL_THRESH   = clean('OFI_BULL_THRESH',  '0.58', 'float')
-OFI_SCORE_BONUS   = clean('OFI_SCORE_BONUS',  '15',   'float')
-MTF_SCORE_BONUS   = clean('MTF_SCORE_BONUS',  '20',   'float')
-SL_HUNT_OFFSET    = clean('SL_HUNT_OFFSET',   '0.05', 'float')
-ATR_HIGH_PCT      = clean('ATR_HIGH_PCT',     '3.5',  'float')
-ATR_HIGH_SIZE_M   = clean('ATR_HIGH_SIZE_M',  '0.5',  'float')
-
-# ── Misc ──────────────────────────────────────────────────────────────────
-INTERVAL     = clean('CHECK_INTERVAL', '90', 'int')
-LTV_WARN     = clean('LTV_WARNING_PCT','75',  'float')
-SCAN_WORKERS = clean('SCAN_WORKERS',   '6',   'int')  # v6.0: era 8, reducir para más cuidado
-
-BASE_URL = "https://open-api.bingx.com"
-FEE      = 0.0002  # maker
-FEE_TAKER = 0.001  # taker
-# v6.0: asumir worst-case taker para calcular rentabilidad real
-FEE_COST_PCT  = FEE_TAKER * LEVERAGE * 2 * 100  # % round-trip al tamaño
-TP_MIN_NET_PCT = FEE_COST_PCT + 0.2  # TP neto mínimo tras comisiones
-
-# Excluir stablecoins y forex
-EXCLUDE = {
-    'USDC', 'BUSD', 'TUSD', 'FRAX', 'DAI', 'USDP', 'FDUSD',
-    'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD',
-}
-
-BREADTH_COINS = [
-    'BTC-USDT','ETH-USDT','BNB-USDT','SOL-USDT','XRP-USDT',
-    'ADA-USDT','AVAX-USDT','DOGE-USDT','DOT-USDT','MATIC-USDT',
-    'LINK-USDT','UNI-USDT','ATOM-USDT','LTC-USDT','BCH-USDT',
-    'NEAR-USDT','APT-USDT','OP-USDT','ARB-USDT','SUI-USDT',
-]
+FEE_TAKER    = 0.001
+FEE_COST_PCT = FEE_TAKER * LEVERAGE * 2 * 100
 
 # ============================================================================
 # LOGGING
@@ -216,46 +164,43 @@ BREADTH_COINS = [
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    format='%(asctime)s | %(levelname)-7s | %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger('BOT')
 
 # ============================================================================
-# API
+# API HELPERS
 # ============================================================================
 
 def api(method, endpoint, params=None, retries=3):
     params = params or {}
-    for attempt in range(retries + 1):
+    for attempt in range(retries+1):
         try:
-            p   = {**{k: str(v) for k, v in params.items()},
-                   'timestamp': str(int(time.time() * 1000))}
+            p   = {**{k:str(v) for k,v in params.items()},
+                   'timestamp':str(int(time.time()*1000))}
             qs  = urlencode(sorted(p.items()))
             sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
             url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
-            hdr = {'X-BX-APIKEY': API_KEY,
-                   'Content-Type': 'application/x-www-form-urlencoded'}
+            hdr = {'X-BX-APIKEY':API_KEY,'Content-Type':'application/x-www-form-urlencoded'}
             r   = getattr(requests, method.lower())(url, headers=hdr, timeout=15)
             return r.json()
         except Exception as e:
-            if attempt < retries: time.sleep(2 ** attempt)
+            if attempt < retries: time.sleep(2**attempt)
             else: log.error(f"API {endpoint}: {e}"); return {}
 
 def pub(path, params=None):
-    try:
-        return requests.get(f"{BASE_URL}{path}", params=params or {}, timeout=10).json()
-    except:
-        return {}
+    try: return requests.get(f"{BASE_URL}{path}", params=params or {}, timeout=10).json()
+    except: return {}
 
-def _safe_float(val, default=0.0):
-    if val is None: return default
+def _sf(val, d=0.0):
+    if val is None: return d
     if isinstance(val, dict):
-        for k in ('equity', 'balance', 'availableMargin', 'amount'):
-            if k in val: return _safe_float(val[k], default)
-        return default
+        for k in ('equity','balance','availableMargin','amount'):
+            if k in val: return _sf(val[k], d)
+        return d
     try: return float(val)
-    except: return default
+    except: return d
 
 # ============================================================================
 # INDICADORES
@@ -263,1487 +208,1554 @@ def _safe_float(val, default=0.0):
 
 def ema(prices, n):
     if not prices: return 0
-    if len(prices) < n: return sum(prices) / len(prices)
-    k, e = 2 / (n + 1), prices[0]
-    for p in prices[1:]: e = p * k + e * (1 - k)
+    if len(prices) < n: return sum(prices)/len(prices)
+    k, e = 2/(n+1), prices[0]
+    for p in prices[1:]: e = p*k + e*(1-k)
     return e
 
 def rsi(prices, n=14):
-    if len(prices) < n + 1: return 50.0
-    g = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
-    l = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
-    ag, al = sum(g[-n:]) / n, sum(l[-n:]) / n
-    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    if len(prices) < n+1: return 50.0
+    g = [max(prices[i]-prices[i-1],0) for i in range(1,len(prices))]
+    l = [max(prices[i-1]-prices[i],0) for i in range(1,len(prices))]
+    ag,al = sum(g[-n:])/n, sum(l[-n:])/n
+    return 100.0 if al==0 else 100-100/(1+ag/al)
 
 def atr_calc(highs, lows, closes, n=14):
     if len(closes) < 2: return 0
     trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-           for i in range(1, min(len(closes), n+1))]
-    return sum(trs) / len(trs) if trs else 0
+           for i in range(1, min(len(closes),n+1))]
+    return sum(trs)/len(trs) if trs else 0
 
-def calc_vwap(closes, highs, lows, volumes, n=None):
-    n = n or len(closes)
-    c = closes[-n:]; h = highs[-n:]; l = lows[-n:]; v = volumes[-n:]
-    tp_vol  = sum(((h[i]+l[i]+c[i])/3) * v[i] for i in range(len(c)))
-    vol_sum = sum(v)
-    return tp_vol / vol_sum if vol_sum > 0 else c[-1]
+def bollinger(closes, n=20, k=2.0):
+    if len(closes) < n: return closes[-1], closes[-1], closes[-1], 99.0
+    w = closes[-n:]; mid = sum(w)/n
+    std = math.sqrt(sum((x-mid)**2 for x in w)/n)
+    u = mid+k*std; l = mid-k*std
+    return u, mid, l, (u-l)/mid*100 if mid>0 else 99.0
 
-# ============================================================================
-# SMART MONEY FILTERS (v6.0)
-# ============================================================================
+def vwap_calc(closes, highs, lows, volumes, n=50):
+    if len(closes)<n: n=len(closes)
+    c=closes[-n:];h=highs[-n:];l=lows[-n:];v=volumes[-n:]
+    tv = sum(((h[i]+l[i]+c[i])/3)*v[i] for i in range(len(c)))
+    vs = sum(v)
+    return tv/vs if vs>0 else closes[-1]
 
-def session_ok(hora_utc):
-    """Filtra SOLO London open y NY open — las ventanas de mayor calidad institucional."""
-    if not SESSION_FILTER: return True, "sin filtro"
-    h = hora_utc
-    if SESSION_LONDON_S <= h < SESSION_LONDON_E:
-        return True, f"London ({h}h UTC)"
-    if SESSION_NY_S <= h < SESSION_NY_E:
-        return True, f"NY ({h}h UTC)"
-    return False, f"fuera de sesión ({h}h UTC)"
+def z_score_vol(volumes, period=30):
+    if len(volumes)<period+1: return 0.0
+    w = volumes[-period-1:-1]; mean=sum(w)/len(w)
+    var = sum((v-mean)**2 for v in w)/len(w)
+    std = math.sqrt(var) if var>0 else 1e-10
+    return (volumes[-1]-mean)/std
 
+def cvd_ratio(closes, opens, volumes, n=20):
+    if len(closes)<n: return 0.5
+    bull=bear=0.0
+    for i in range(-n,0):
+        c=closes[i]; o=opens[i] if opens else closes[i-1]; v=volumes[i]
+        if c>o: bull+=v
+        elif c<o: bear+=v
+        else: bull+=v*0.5; bear+=v*0.5
+    total=bull+bear
+    return bull/total if total>0 else 0.5
 
-def detect_stop_hunt(closes, highs, lows, volumes, n_lookback=3):
-    """Detecta barrido de liquidez antes de entrar."""
-    if len(closes) < n_lookback + 6: return False, "datos insuf."
-    vol_avg = sum(volumes[-8:-2]) / 6 if len(volumes) >= 8 else volumes[-1]
-    if vol_avg <= 0: return False, "vol avg cero"
-    for i in range(-n_lookback, 0):
-        c = closes[i]; o = closes[i-1]
-        mecha_inf = min(o, c) - lows[i]
-        cuerpo = abs(c - o) + 1e-10
-        ratio_wick = mecha_inf / cuerpo
-        vol_r = volumes[i] / (vol_avg + 1e-10)
-        if ratio_wick >= STOP_HUNT_WICK and vol_r >= STOP_HUNT_VOL_M and c > o:
-            return True, f"hunt wick={ratio_wick:.1f}x vol={vol_r:.1f}x"
-    return False, "limpio"
+def wavetrend(closes, highs, lows, ch=10, avg=21):
+    n = len(closes)
+    if n < ch+avg+2: return [0.0]*n
+    hlc3 = [(highs[i]+lows[i]+closes[i])/3 for i in range(n)]
+    k = 2/(ch+1)
+    esa=[hlc3[0]]*n
+    for i in range(1,n): esa[i]=hlc3[i]*k+esa[i-1]*(1-k)
+    d=[abs(hlc3[i]-esa[i]) for i in range(n)]
+    de=[d[0]]*n
+    for i in range(1,n): de[i]=d[i]*k+de[i-1]*(1-k)
+    ci=[(hlc3[i]-esa[i])/(0.015*de[i]) if de[i]!=0 else 0 for i in range(n)]
+    k2=2/(avg+1); wt1=[ci[0]]*n
+    for i in range(1,n): wt1[i]=ci[i]*k2+wt1[i-1]*(1-k2)
+    return wt1
 
-
-def order_flow_imbalance(closes, opens, volumes, n=10):
-    """Presión compradora vs vendedora (proxy con velas)."""
-    if len(closes) < n + 1: return 0.5, "insuf."
-    bull_vol = bear_vol = 0.0
-    for i in range(-n, 0):
-        c = closes[i]; o = opens[i] if opens else closes[i-1]
-        v = volumes[i]
-        if c > o:   bull_vol += v
-        elif c < o: bear_vol += v
-        else:       bull_vol += v * 0.5; bear_vol += v * 0.5
-    total = bull_vol + bear_vol
-    if total <= 0: return 0.5, "sin vol"
-    ratio = bull_vol / total
-    desc = f"OFI {int(ratio*100)}% bull" if ratio >= OFI_BULL_THRESH else f"OFI {int(ratio*100)}% bear"
-    return ratio, desc
-
-
-def sl_anti_hunt(sl_price, price):
-    """Offset aleatorio al SL para romper niveles redondos cazados por MMs."""
-    offset_pct = random.uniform(-SL_HUNT_OFFSET * 2, SL_HUNT_OFFSET * 0.5)
-    sl_adj = sl_price * (1 + offset_pct / 100)
-    sl_max = price * (1 - SL_MIN_PCT / 100)
-    sl_min = price * (1 - SL_MAX_PCT * 1.1 / 100)
-    return round(max(sl_min, min(sl_max, sl_adj)), 8)
+def adx_di(highs, lows, closes, di_len=14, smooth=14):
+    n=len(closes)
+    if n<di_len+smooth+2: return [0.0]*n,[0.0]*n,[0.0]*n
+    tr=[0.0]*n;pdm=[0.0]*n;ndm=[0.0]*n
+    for i in range(1,n):
+        h,l,pc=highs[i],lows[i],closes[i-1]
+        tr[i]=max(h-l,abs(h-pc),abs(l-pc))
+        up,dn=highs[i]-highs[i-1],lows[i-1]-lows[i]
+        pdm[i]=max(up,0) if up>dn else 0
+        ndm[i]=max(dn,0) if dn>up else 0
+    def wilder(d,n):
+        s=[0.0]*len(d)
+        if n<len(d):
+            s[n]=sum(d[1:n+1])
+            for i in range(n+1,len(d)): s[i]=s[i-1]-s[i-1]/n+d[i]
+        return s
+    as_=wilder(tr,di_len);ps=wilder(pdm,di_len);ns=wilder(ndm,di_len)
+    dip=[100*ps[i]/as_[i] if as_[i]>0 else 0 for i in range(n)]
+    din=[100*ns[i]/as_[i] if as_[i]>0 else 0 for i in range(n)]
+    dx=[abs(dip[i]-din[i])/(dip[i]+din[i])*100 if (dip[i]+din[i])>0 else 0 for i in range(n)]
+    adxv=[0.0]*n; start=di_len+smooth
+    if start<n:
+        adxv[start]=sum(dx[di_len:start+1])/smooth
+        for i in range(start+1,n): adxv[i]=(adxv[i-1]*(smooth-1)+dx[i])/smooth
+    return adxv,dip,din
 
 # ============================================================================
 # MOTOR AUROLO
 # ============================================================================
 
-def _wavetrend_series(closes, highs, lows, ch_len=10, avg_len=21):
-    n = len(closes)
-    if n < ch_len + avg_len + 2: return [0.0] * n
-    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(n)]
-    k  = 2 / (ch_len + 1)
-    esa = [hlc3[0]] * n
-    for i in range(1, n): esa[i] = hlc3[i] * k + esa[i-1] * (1 - k)
-    d  = [abs(hlc3[i] - esa[i]) for i in range(n)]
-    de = [d[0]] * n
-    for i in range(1, n): de[i] = d[i] * k + de[i-1] * (1 - k)
-    ci = [(hlc3[i] - esa[i]) / (0.015 * de[i]) if de[i] != 0 else 0 for i in range(n)]
-    k2  = 2 / (avg_len + 1)
-    wt1 = [ci[0]] * n
-    for i in range(1, n): wt1[i] = ci[i] * k2 + wt1[i-1] * (1 - k2)
-    return wt1
-
-
-def _adx_di_series(highs, lows, closes, di_len=14, adx_smooth=14):
-    n = len(closes)
-    if n < di_len + adx_smooth + 2: return [0.0]*n, [0.0]*n, [0.0]*n
-    tr = [0.0]*n; pdm = [0.0]*n; ndm = [0.0]*n
-    for i in range(1, n):
-        h, l, pc = highs[i], lows[i], closes[i-1]
-        tr[i]  = max(h-l, abs(h-pc), abs(l-pc))
-        up, dn = highs[i]-highs[i-1], lows[i-1]-lows[i]
-        pdm[i] = max(up, 0) if up > dn else 0
-        ndm[i] = max(dn, 0) if dn > up else 0
-    def wilder(data, n):
-        s = [0.0] * len(data)
-        if n < len(data):
-            s[n] = sum(data[1:n+1])
-            for i in range(n+1, len(data)):
-                s[i] = s[i-1] - s[i-1]/n + data[i]
-        return s
-    atr_s = wilder(tr, di_len); pdm_s = wilder(pdm, di_len); ndm_s = wilder(ndm, di_len)
-    dip = [100*pdm_s[i]/atr_s[i] if atr_s[i]>0 else 0 for i in range(n)]
-    din = [100*ndm_s[i]/atr_s[i] if atr_s[i]>0 else 0 for i in range(n)]
-    dx  = [abs(dip[i]-din[i])/(dip[i]+din[i])*100 if (dip[i]+din[i])>0 else 0 for i in range(n)]
-    adx_v = [0.0] * n
-    start = di_len + adx_smooth
-    if start < n:
-        adx_v[start] = sum(dx[di_len:start+1]) / adx_smooth
-        for i in range(start+1, n):
-            adx_v[i] = (adx_v[i-1]*(adx_smooth-1) + dx[i]) / adx_smooth
-    return adx_v, dip, din
-
-
 def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
-    result = {
-        'puntos': 0, 'señal': 'NO', 'p1': False, 'p2': False, 'p3': False,
-        'ema55': 0, 'zona_inf': 0, 'zona_sup': 0,
-        'wt_now': 0, 'wt_prev': 0, 'adx_now': 0, 'dip': 0, 'din': 0,
-        'sl_price': 0, 'sl_pct': 0, 'debilidad': False,
-        'cambio_tend': False, 'descripcion': '', 'vol_ratio': 1,
-    }
-    min_len = AUROLO_EMA_LEN + WT_CH_LEN + WT_AVG_LEN + 5
-    if len(closes) < min_len:
-        result['descripcion'] = 'Datos insuficientes'
-        return result
+    res = {'puntos':0,'señal':'NO','p1':False,'p2':False,'p3':False,
+           'ema55':0,'sl_price':0,'sl_pct':0,'wt_now':0,'adx_now':0,
+           'dip':0,'din':0,'debilidad':False,'cambio_tend':False,
+           'vol_ratio':1,'zona_inf':0,'zona_sup':0,'descripcion':''}
+    min_len = AUROLO_EMA+10+21+5
+    if len(closes)<min_len: return res
 
-    price  = closes[-1]
-    ema55  = ema(closes, AUROLO_EMA_LEN)
-    result['ema55'] = ema55
+    price=closes[-1]; e55=ema(closes,AUROLO_EMA)
+    res['ema55']=e55
+    e55p=ema(closes[:-1],AUROLO_EMA)
+    res['cambio_tend']=(price>e55)!=(closes[-2]>e55p if len(closes)>=2 else price>e55)
+    if price<=e55: res['descripcion']='Bajista'; return res
 
-    ema55_prev      = ema(closes[:-1], AUROLO_EMA_LEN)
-    tendencia_ahora = price > ema55
-    tendencia_antes = closes[-2] > ema55_prev if len(closes) >= 2 else tendencia_ahora
-    result['cambio_tend'] = (tendencia_ahora != tendencia_antes)
+    atr_a=atr_v or atr_calc(highs,lows,closes,14)
+    zp=max(min((atr_a/price*100)*1.0,2.0),0.3) if atr_a>0 else 0.8
+    zi=e55*(1-zp/100); zs=e55*(1+zp/100)
+    res['zona_inf']=zi; res['zona_sup']=zs
 
-    if not tendencia_ahora:
-        result['señal'] = 'NO'
-        result['descripcion'] = f'Bajista (p={round(price,4)} < EMA55={round(ema55,4)})'
-        return result
+    toco=False
+    for i in range(-min(6,len(closes)-1),0):
+        if zi<=closes[i]<=zs: toco=True; break
+    res['p1']=toco and closes[-1]>e55*0.999
 
-    if AUROLO_ZONA_AUTO and atr_v and atr_v > 0:
-        zona_pct = (atr_v / price * 100) * 1.0
-        zona_pct = max(min(zona_pct, 2.0), 0.3)
-    else:
-        zona_pct = AUROLO_ZONA_PCT
-    zona_inf = ema55 * (1 - zona_pct / 100)
-    zona_sup = ema55 * (1 + zona_pct / 100)
-    result['zona_inf'] = zona_inf; result['zona_sup'] = zona_sup
+    wt1=wavetrend(closes,highs,lows,10,21)
+    wn=wt1[-1]; wp=wt1[-2] if len(wt1)>=2 else wn; wp2=wt1[-3] if len(wt1)>=3 else wp
+    res['wt_now']=wn
+    res['p2']=(wn>wp and (wp<=WT_OS_E or wp2<=WT_OS2)) or (wn<=WT_OS2 and wn>wp)
 
-    toco_zona = False
-    n_velas = min(AUROLO_ZONA_VELAS, len(closes) - 1)
-    for i in range(-n_velas, 0):
-        c_i = closes[i]; l_i = lows[i]
-        if AUROLO_ENTRY == 'close':
-            if zona_inf <= c_i <= zona_sup: toco_zona = True; break
-        else:
-            if l_i <= zona_sup and c_i >= zona_inf * 0.993: toco_zona = True; break
+    adxv,dip,din=adx_di(highs,lows,closes,14,14)
+    res['adx_now']=adxv[-1]; res['dip']=dip[-1]; res['din']=din[-1]
+    res['p3']=adxv[-1]>=ADX_KEY and dip[-1]>din[-1]
 
-    rebota = closes[-1] > ema55 * 0.999
-    result['p1'] = toco_zona and rebota
+    pts=int(res['p1'])+int(res['p2'])+int(res['p3']); res['puntos']=pts
 
-    wt1      = _wavetrend_series(closes, highs, lows, WT_CH_LEN, WT_AVG_LEN)
-    wt_now   = wt1[-1]
-    wt_prev  = wt1[-2] if len(wt1) >= 2 else wt_now
-    wt_prev2 = wt1[-3] if len(wt1) >= 3 else wt_prev
-    result['wt_now'] = wt_now; result['wt_prev'] = wt_prev
+    mr=min(lows[-8:-1]) if len(lows)>=8 else lows[-1]
+    sl_c=min(mr-atr_a*SL_ATR_M, e55*(1-0.20/100))
+    sl=max(min(sl_c, price*(1-SL_MIN_PCT/100)), price*(1-SL_MAX_PCT/100))
+    if sl>=price: sl=price*(1-SL_MIN_PCT/100)
+    slp=(price-sl)/price*100
+    if slp<SL_MIN_PCT: sl=price*(1-SL_MIN_PCT/100); slp=SL_MIN_PCT
+    res['sl_price']=round(sl,8); res['sl_pct']=round(slp,3)
 
-    cruce_alc = (wt_now > wt_prev) and (wt_prev <= WT_OS_ENTRY or wt_prev2 <= WT_OS2)
-    en_os     = wt_now <= WT_OS2
-    result['p2'] = cruce_alc or (en_os and wt_now > wt_prev)
+    adxp=adxv[-2] if len(adxv)>=2 else adxv[-1]
+    res['debilidad']=bool(adxv[-1]<adxp and wn<wp and wn>=WT_OB1 and din[-1]>dip[-1]*0.80)
 
-    adx_vals, dip_vals, din_vals = _adx_di_series(highs, lows, closes, ADX_DI_LEN, ADX_LEN)
-    adx_now  = adx_vals[-1]; adx_prev = adx_vals[-2] if len(adx_vals) >= 2 else adx_now
-    dip_now  = dip_vals[-1]; din_now  = din_vals[-1]
-    result['adx_now'] = adx_now; result['dip'] = dip_now; result['din'] = din_now
+    va=sum(volumes[-6:-1])/5 if len(volumes)>=6 else volumes[-1]
+    res['vol_ratio']=volumes[-1]/va if va>0 else 1
 
-    result['p3'] = (adx_now >= ADX_KEY) and (dip_now > din_now)
+    p1i='✅' if res['p1'] else '❌'; p2i='✅' if res['p2'] else '❌'; p3i='✅' if res['p3'] else '❌'
+    res['descripcion']=f"P1({p1i})EMA55 | P2({p2i})WT={round(wn,1)} | P3({p3i})ADX={round(adxv[-1],1)}"
 
-    pts = int(result['p1']) + int(result['p2']) + int(result['p3'])
-    result['puntos'] = pts
-
-    atr_actual   = atr_v or atr_calc(highs, lows, closes, 14)
-    min_reciente = min(lows[-8:-1]) if len(lows) >= 8 else lows[-1]
-    sl_vulner    = min_reciente - atr_actual * SL_ATR_M
-    sl_bajo_ema  = ema55 * (1 - 0.20/100)
-    sl_calculado = min(sl_vulner, sl_bajo_ema)
-
-    sl_max_price = price * (1 - SL_MAX_PCT / 100)
-    sl_min_price = price * (1 - SL_MIN_PCT / 100)
-    sl_price = max(sl_calculado, sl_max_price)
-    sl_price = min(sl_price, sl_min_price)
-    if sl_price >= price: sl_price = price * (1 - SL_MIN_PCT / 100)
-
-    sl_pct = (price - sl_price) / price * 100
-    if sl_pct < SL_MIN_PCT: sl_price = price * (1 - SL_MIN_PCT / 100); sl_pct = SL_MIN_PCT
-
-    result['sl_price'] = round(sl_price, 8); result['sl_pct'] = round(sl_pct, 3)
-
-    wt_ob_baj   = wt_now < wt_prev and wt_prev >= WT_OB2
-    di_gira     = din_now > dip_now * 0.80
-    adx_cayendo = adx_now < adx_prev
-    result['debilidad'] = bool(adx_cayendo and (wt_ob_baj or wt_now >= WT_OB1) and di_gira)
-
-    vol_avg = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else volumes[-1]
-    result['vol_ratio'] = volumes[-1] / vol_avg if vol_avg > 0 else 1
-
-    p1i = '✅' if result['p1'] else '❌'
-    p2i = '✅' if result['p2'] else '❌'
-    p3i = '✅' if result['p3'] else '❌'
-    result['descripcion'] = (f"P1({p1i})EMA55 | P2({p2i})WT={round(wt_now,1)} | "
-                             f"P3({p3i})ADX={round(adx_now,1)} DI+={round(dip_now,1)}")
-
-    if pts >= 3:   result['señal'] = 'LONG_3/3'
-    elif pts == 2: result['señal'] = 'LONG_2/3'
-    elif pts == 1: result['señal'] = 'LONG_1/3'
-    else:          result['señal'] = 'NO'
-    return result
-
-
-def vwap_contexto(closes, highs, lows, volumes, n=50):
-    if len(closes) < n: return closes[-1], True
-    vwap = calc_vwap(closes, highs, lows, volumes, n)
-    return vwap, closes[-1] > vwap
+    if pts>=3: res['señal']='LONG_3/3'
+    elif pts==2: res['señal']='LONG_2/3'
+    elif pts==1: res['señal']='LONG_1/3'
+    return res
 
 # ============================================================================
-# APRENDIZAJE
+# EXPLOSION SCANNER (integrado como módulo)
+# ============================================================================
+
+class ExplosionScanner:
+    """
+    Corre en background thread. Actualiza hot_symbols cada SCAN_INTERVAL seg.
+    El bot lee hot_symbols para priorizar qué monedas analizar primero.
+    """
+
+    def __init__(self, tg_fn):
+        self.hot_symbols  = []          # [(symbol, confidence), ...]
+        self.hot_lock     = threading.Lock()
+        self.oi_cache     = {}
+        self.alerted      = {}          # {symbol: (conf, ts)}
+        self.daily_alerts = []
+        self._tg          = tg_fn
+        self._running     = True
+        self._last_scan   = 0
+        log.info("  [SCANNER] Iniciado")
+
+    def stop(self): self._running = False
+
+    def get_hot(self, min_conf=65, n=30):
+        with self.hot_lock:
+            return [s for s,c in self.hot_symbols if c>=min_conf][:n]
+
+    def get_confidence(self, symbol):
+        with self.hot_lock:
+            for s,c in self.hot_symbols:
+                if s==symbol: return c
+        return 0
+
+    def _klines(self, symbol, interval='5m', limit=100):
+        d=pub('/openApi/swap/v3/quote/klines',{'symbol':symbol,'interval':interval,'limit':limit})
+        if d.get('code')==0 and d.get('data'):
+            kl=d['data']
+            return {'closes':[float(k['close'])for k in kl],
+                    'highs': [float(k['high']) for k in kl],
+                    'lows':  [float(k['low'])  for k in kl],
+                    'volumes':[float(k['volume'])for k in kl],
+                    'opens': [float(k['open']) for k in kl]}
+        return None
+
+    def _analyze(self, symbol):
+        try:
+            d=pub('/openApi/swap/v2/quote/ticker',{'symbol':symbol})
+            if d.get('code')!=0 or not d.get('data'): return None
+            t=d['data']; price=float(t.get('lastPrice',0)); chg=float(t.get('priceChangePercent',0))
+            if price<=0 or chg>25 or chg<-15: return None
+
+            k5=self._klines(symbol,'5m',120)
+            if not k5 or len(k5['closes'])<50: return None
+            c5=k5['closes'];h5=k5['highs'];l5=k5['lows'];v5=k5['volumes'];o5=k5['opens']
+
+            k1h=self._klines(symbol,'1h',50)
+            k15=self._klines(symbol,'15m',60)
+
+            conf=0; sigs=[]
+
+            # BB Squeeze
+            _,_,_,bbw=bollinger(c5,20,2.0)
+            if bbw<2.0: pts=min(int(25*(2.0-bbw)/2.0+10),25); conf+=pts; sigs.append(f"🎯 BB Squeeze {bbw:.1f}%")
+            elif bbw<3.0: conf+=8; sigs.append(f"📊 BB comprimiendo {bbw:.1f}%")
+
+            # Z-Score volumen
+            zv=z_score_vol(v5,30)
+            if zv>=4.5: conf+=20; sigs.append(f"🐳 Vol EXTREMO Z={zv:.1f}")
+            elif zv>=3.0: conf+=14; sigs.append(f"⚡ Vol spike Z={zv:.1f}")
+            elif zv>=2.0: conf+=6; sigs.append(f"📈 Vol elevado Z={zv:.1f}")
+
+            va=sum(v5[-10:-3])/7 if len(v5)>=10 else v5[-1]
+            vr=sum(v5[-3:])/3/va if va>0 else 1.0
+            if vr>=3.0: conf+=12; sigs.append(f"🔥 Vol acelerado {vr:.1f}x")
+            elif vr>=2.0: conf+=7; sigs.append(f"📊 Vol aumentando {vr:.1f}x")
+
+            # OI
+            d_oi=pub('/openApi/swap/v2/quote/openInterest',{'symbol':symbol})
+            oi_curr=float((d_oi.get('data') or {}).get('openInterest',0) or 0)
+            oi_prev=self.oi_cache.get(symbol,{}).get('oi',oi_curr)
+            oi_chg=(oi_curr-oi_prev)/oi_prev*100 if oi_prev>0 else 0
+            self.oi_cache[symbol]={'oi':oi_curr,'ts':time.time()}
+            if oi_chg>=6 and abs(chg)<3: conf+=22; sigs.append(f"🐳 OI +{oi_chg:.1f}% precio plano")
+            elif oi_chg>=3: conf+=10; sigs.append(f"📈 OI +{oi_chg:.1f}%")
+
+            # Funding
+            d_f=pub('/openApi/swap/v2/quote/premiumIndex',{'symbol':symbol})
+            fund=float((d_f.get('data') or {}).get('lastFundingRate',0) or 0)*100
+            if fund<=-0.06: conf+=18; sigs.append(f"💰 Funding {fund:.3f}% MUY negativo")
+            elif fund<=-0.02: conf+=10; sigs.append(f"💰 Funding {fund:.3f}% negativo")
+            elif fund<=0: conf+=4
+            elif fund>=0.05: conf-=8
+
+            # CVD
+            cvd=cvd_ratio(c5,o5,v5,20)
+            if cvd>=0.65: pts=min(int((cvd-0.5)*60),20); conf+=pts; sigs.append(f"🌊 CVD {int(cvd*100)}% bull")
+            elif cvd<=0.35: conf-=10
+
+            # Breakout 20 velas
+            if len(h5)>=22:
+                res=max(h5[-21:-1]); broke=c5[-1]>res and c5[-2]<=res
+                if broke:
+                    bstr=(c5[-1]/res-1)*100
+                    if bstr>0.5: conf+=20; sigs.append(f"🚀 BREAKOUT {bstr:.2f}%")
+                    else: conf+=14; sigs.append(f"📈 Breakout leve")
+
+            # MTF
+            tf=0
+            if ema(c5,9)>ema(c5,21): tf+=1
+            if k15 and len(k15['closes'])>=25:
+                if ema(k15['closes'],9)>ema(k15['closes'],21): tf+=1
+            if k1h and len(k1h['closes'])>=25:
+                if ema(k1h['closes'],9)>ema(k1h['closes'],21): tf+=1
+            if tf==3: conf+=18; sigs.append("✅ MTF 3/3")
+            elif tf==2: conf+=10; sigs.append("✅ MTF 2/3")
+
+            # RSI
+            rsiv=rsi(c5,14); rsip=rsi(c5[:-1],14)
+            if rsip<45 and rsiv>rsip: pts=int((45-rsip)/45*18); conf+=pts; sigs.append(f"📈 RSI rebota {rsip:.0f}→{rsiv:.0f}")
+            elif rsiv>72: conf-=8
+
+            # VWAP
+            vwap=vwap_calc(c5,h5,l5,v5,50)
+            vdist=(price-vwap)/vwap*100 if vwap>0 else 0
+            if -0.5<=vdist<=0.5: conf+=10; sigs.append(f"🎯 Precio en VWAP")
+            elif 0<vdist<=2: conf+=6
+
+            # Momentum velas
+            if o5 and len(o5)>=3:
+                if all(c5[i]>o5[i] for i in [-3,-2,-1]): conf+=10; sigs.append("🚀 3 velas bull")
+
+            # Combos bonus
+            if bbw<2.0 and broke: conf+=15; sigs.append("💥 SQUEEZE+BREAKOUT")
+            if zv>=3.0 and oi_chg>=3 and cvd>=0.65: conf+=12; sigs.append("🐳 BALLENA+OI+CVD")
+
+            conf=min(conf,100)
+            if conf<SCAN_MIN_CONF: return None
+
+            return {'symbol':symbol,'confidence':conf,'price':price,'change':chg,
+                    'signals':sigs,'tf':tf,'zv':round(zv,2),'bbw':round(bbw,2),
+                    'oi_chg':round(oi_chg,2),'fund':round(fund,4),'cvd':round(cvd,3),
+                    'rsi':round(rsiv,1),'vdist':round(vdist,2)}
+        except Exception as e:
+            log.debug(f"[SCANNER] {symbol}: {e}"); return None
+
+    def _get_symbols(self):
+        d=pub('/openApi/swap/v2/quote/ticker')
+        if d.get('code')!=0: return []
+        items=[]
+        for t in d.get('data',[]):
+            sym=t.get('symbol','')
+            if not sym.endswith('-USDT'): continue
+            base=sym.replace('-USDT','').upper()
+            if any(base==ex for ex in EXCLUDE): continue
+            try:
+                price=float(t.get('lastPrice',0)); vol=float(t.get('volume',0))*price
+                if vol>=MIN_VOL and price>0: items.append((sym,vol))
+            except: continue
+        items.sort(key=lambda x:x[1],reverse=True)
+        return [s for s,_ in items[:200]]
+
+    def scan_once(self):
+        symbols=self._get_symbols()
+        if not symbols: return
+
+        results=[]
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futures={ex.submit(self._analyze,sym):sym for sym in symbols}
+            for fut in as_completed(futures):
+                r=fut.result()
+                if r: results.append(r)
+
+        results.sort(key=lambda x:x['confidence'],reverse=True)
+
+        with self.hot_lock:
+            self.hot_symbols=[(r['symbol'],r['confidence']) for r in results]
+
+        # Alertas Telegram para señales altas
+        for r in results:
+            sym=r['symbol']; conf=r['confidence']
+            if conf<SCAN_HOT_MIN: continue
+            prev=self.alerted.get(sym)
+            should_alert=(not prev) or \
+                         (time.time()-prev[1]>1800) or \
+                         (conf>=prev[0]+15)
+            if should_alert:
+                lvl="🔴 CRÍTICO" if conf>=80 else "🟠 ALTO"
+                sigs_txt="\n".join(f"  {s}" for s in r['signals'][:5])
+                self._tg(
+                    f"{lvl} <b>{sym}</b> — <b>{conf}%</b>\n"
+                    f"💲 ${r['price']:.6f} | 24h: {r['change']:+.2f}%\n"
+                    f"BB:{r['bbw']:.1f}% Z:{r['zv']} CVD:{int(r['cvd']*100)}% "
+                    f"OI:{r['oi_chg']:+.1f}% MTF:{r['tf']}/3\n"
+                    f"Señales:\n{sigs_txt}\n"
+                    f"⏰ {datetime.utcnow().strftime('%H:%M UTC')}"
+                    + ("\n🚀 <b>BREAKOUT ACTIVO</b>" if any('BREAKOUT' in s for s in r['signals']) else "")
+                )
+                self.alerted[sym]=(conf,time.time())
+                self.daily_alerts.append(r)
+
+        log.info(f"  [SCANNER] {len(results)} señales | Top: "
+                 + " ".join(f"{r['symbol']}({r['confidence']}%)" for r in results[:3]))
+
+    def run_loop(self):
+        """Loop del thread de background."""
+        log.info("  [SCANNER] Thread arrancado")
+        while self._running:
+            try:
+                self.scan_once()
+                self._last_scan=time.time()
+            except Exception as e:
+                log.error(f"[SCANNER] Error: {e}")
+            time.sleep(SCAN_INTERVAL)
+
+    def daily_summary(self):
+        if not self.daily_alerts: return
+        n=len(self.daily_alerts)
+        top=sorted(self.daily_alerts,key=lambda x:x['confidence'],reverse=True)[:5]
+        self._tg(
+            f"<b>📊 Resumen Scanner — {datetime.utcnow().date()}</b>\n"
+            f"Total alertas: {n}\n"
+            f"🔴 Críticas (≥80%): {sum(1 for a in self.daily_alerts if a['confidence']>=80)}\n"
+            f"🟠 Altas (65-79%): {sum(1 for a in self.daily_alerts if 65<=a['confidence']<80)}\n\n"
+            f"Top 5:\n"
+            + "\n".join(f"  {a['symbol']} — {a['confidence']}%" for a in top)
+        )
+        self.daily_alerts=[]
+
+# ============================================================================
+# SISTEMA DE APRENDIZAJE
 # ============================================================================
 
 class Learning:
     def __init__(self):
-        self.history       = []
-        self.sym_stats     = defaultdict(lambda: {'w':0,'l':0,'pnl':0.0,'n':0})
-        self.opt_score     = MIN_SCORE
-        self.blacklist     = set()
-        self.streak        = 0
-        self.last10        = []
-        self.by_hour       = defaultdict(lambda: {'w':0,'l':0,'pnl':0.0})
-        self.by_pts        = defaultdict(lambda: {'w':0,'l':0,'pnl':0.0})
-        self.factor_wins   = defaultdict(int)
-        self.factor_losses = defaultdict(int)
-        self.score_boost   = {}
-        self.daily_losers  = set()
-        self._daily_date   = datetime.utcnow().date()
+        self.history=[];self.sym_stats=defaultdict(lambda:{'w':0,'l':0,'pnl':0.0,'n':0})
+        self.opt_score=MIN_SCORE;self.blacklist=set();self.streak=0;self.last10=[]
+        self.by_hour=defaultdict(lambda:{'w':0,'l':0,'pnl':0.0})
+        self.by_pts=defaultdict(lambda:{'w':0,'l':0,'pnl':0.0})
+        self.factor_wins=defaultdict(int);self.factor_losses=defaultdict(int)
+        self.score_boost={};self.daily_losers=set();self._daily=datetime.utcnow().date()
 
-    def _check_daily_reset(self):
-        today = datetime.utcnow().date()
-        if today != self._daily_date: self.daily_losers = set(); self._daily_date = today
+    def _dr(self):
+        today=datetime.utcnow().date()
+        if today!=self._daily: self.daily_losers=set();self._daily=today
 
-    def _score_cap(self):
-        return SCORE_CAP_LOW if len(self.history) < LEARN_MIN_TRADES_SCORE else SCORE_CAP_HIGH
+    def _cap(self): return 80 if len(self.history)<10 else 92
 
-    def record(self, symbol, score, pnl, win, hora_utc=None,
-               pts_aurolo=0, btc_dir='flat', reason='?', factors=None):
-        self._check_daily_reset()
-        rec = {'ts': datetime.now().isoformat(), 'sym': symbol, 'score': score,
-               'pnl': pnl, 'win': win, 'hora': hora_utc or datetime.utcnow().hour,
-               'pts': pts_aurolo, 'btc': btc_dir, 'reason': reason, 'factors': factors or []}
-        self.history.append(rec); self.last10.append(rec)
-        if len(self.last10) > 10: self.last10.pop(0)
-        s = self.sym_stats[symbol]; s['n'] += 1; s['pnl'] += pnl
-        if win: s['w'] += 1; self.streak = 0
-        else:   s['l'] += 1; self.streak += 1
-        if CD_SL_TODAY and not win and 'SL' in reason.upper():
-            self.daily_losers.add(symbol)
-        self.by_hour[rec['hora']]['w' if win else 'l'] += 1
-        self.by_hour[rec['hora']]['pnl'] += pnl
-        self.by_pts[pts_aurolo]['w' if win else 'l'] += 1
+    def record(self,symbol,score,pnl,win,hora=None,pts=0,btc='flat',reason='?',factors=None):
+        self._dr()
+        rec={'ts':datetime.now().isoformat(),'sym':symbol,'score':score,'pnl':pnl,
+             'win':win,'hora':hora or datetime.utcnow().hour,'pts':pts,'btc':btc,
+             'reason':reason,'factors':factors or []}
+        self.history.append(rec);self.last10.append(rec)
+        if len(self.last10)>10: self.last10.pop(0)
+        s=self.sym_stats[symbol];s['n']+=1;s['pnl']+=pnl
+        if win: s['w']+=1;self.streak=0
+        else:   s['l']+=1;self.streak+=1
+        if CD_SL_TODAY and not win and 'SL' in reason.upper(): self.daily_losers.add(symbol)
         for f in (factors or []):
-            if win: self.factor_wins[f] += 1
-            else:   self.factor_losses[f] += 1
+            if win: self.factor_wins[f]+=1
+            else:   self.factor_losses[f]+=1
         self._adjust()
-        if len(self.history) % 5 == 0: self._reporte()
 
     def _adjust(self):
-        cap = self._score_cap()
-        if len(self.history) >= LEARN_MIN_TRADES_SCORE:
-            wr = sum(1 for t in self.last10 if t['win']) / len(self.last10)
-            if   wr < 0.30: self.opt_score = min(self.opt_score + 5, cap)
-            elif wr < 0.40: self.opt_score = min(self.opt_score + 2, cap)
-            elif wr > 0.65: self.opt_score = max(self.opt_score - 2, MIN_SCORE)
-            elif wr > 0.75: self.opt_score = max(self.opt_score - 4, MIN_SCORE)
-        self.opt_score = max(min(self.opt_score, cap), MIN_SCORE)
+        cap=self._cap()
+        if len(self.history)>=10:
+            wr=sum(1 for t in self.last10 if t['win'])/len(self.last10)
+            if   wr<0.30: self.opt_score=min(self.opt_score+5,cap)
+            elif wr<0.40: self.opt_score=min(self.opt_score+2,cap)
+            elif wr>0.65: self.opt_score=max(self.opt_score-2,MIN_SCORE)
+            elif wr>0.75: self.opt_score=max(self.opt_score-4,MIN_SCORE)
+        self.opt_score=max(min(self.opt_score,cap),MIN_SCORE)
+        for sym,s in self.sym_stats.items():
+            tot=s['w']+s['l']
+            if tot>=5 and s['pnl']<-1.5 and s['w']/tot<0.25 and sym not in self.blacklist:
+                self.blacklist.add(sym);log.warning(f"  [LEARN] 🚫 {sym} → blacklist")
+        if len(self.history)>=15:
+            for f in set(list(self.factor_wins)+list(self.factor_losses)):
+                w=self.factor_wins.get(f,0);l=self.factor_losses.get(f,0)
+                if w+l<5: continue
+                wr_f=w/(w+l)
+                if   wr_f<0.30: self.score_boost[f]=-10
+                elif wr_f>0.70: self.score_boost[f]=+6
+                else:           self.score_boost.pop(f,None)
 
-        for sym, s in self.sym_stats.items():
-            tot = s['w'] + s['l']
-            if tot >= LEARN_MIN_TRADES_BL and s['pnl'] < -1.5 and s['w']/tot < 0.25:
-                if sym not in self.blacklist:
-                    self.blacklist.add(sym); log.warning(f"  [LEARN] 🚫 {sym} → blacklist")
+    def hora_ok(self,h):
+        d=self.by_hour.get(h)
+        if not d: return True
+        tot=d['w']+d['l']
+        if tot<6: return True
+        return d['w']/tot>=0.25
 
-        if len(self.history) >= 15:
-            for f in set(list(self.factor_wins) + list(self.factor_losses)):
-                w = self.factor_wins.get(f, 0); l = self.factor_losses.get(f, 0)
-                if w+l < 5: continue
-                wr_f = w/(w+l)
-                if   wr_f < 0.30: self.score_boost[f] = -10
-                elif wr_f > 0.70: self.score_boost[f] = +6
-                else:             self.score_boost.pop(f, None)
+    def ok(self,sym,score):
+        self._dr()
+        if sym in self.blacklist:     return False,"blacklist"
+        if sym in self.daily_losers:  return False,"SL hoy"
+        thr=max(self.opt_score,MIN_SCORE)
+        if score<thr:                 return False,f"score {int(score)}<{int(thr)}"
+        if self.streak>=MAX_STREAK:   return False,f"streak -{self.streak}"
+        return True,"ok"
 
-    def hora_ok(self, h):
-        d = self.by_hour.get(h)
-        if not d: return True, "ok"
-        tot = d['w']+d['l']
-        if tot < 6: return True, "ok"
-        wr_hora = d['w'] / tot
-        if wr_hora < 0.25: return False, f"hora {h}h WR={int(wr_hora*100)}%"
-        return True, "ok"
+    def adj(self,factors): return sum(self.score_boost.get(f,0) for f in factors)
 
-    def bonus_pts(self, pts):
-        d = self.by_pts.get(pts)
-        if not d: return 0
-        tot = d['w']+d['l']
-        if tot < 5: return 0
-        wr = d['w']/tot
-        if wr > 0.65: return +10
-        if wr < 0.35: return -15
-        return 0
-
-    def ok(self, sym, score):
-        self._check_daily_reset()
-        if sym in self.blacklist:    return False, "blacklist"
-        if sym in self.daily_losers: return False, "SL hoy"
-        threshold = max(self.opt_score, MIN_SCORE)
-        if score < threshold:        return False, f"score {int(score)}<{int(threshold)}"
-        if self.streak >= MAX_STREAK:return False, f"streak -{self.streak}"
-        return True, "ok"
-
-    def adj(self, factors):
-        return sum(self.score_boost.get(f, 0) for f in factors)
-
-    def _reporte(self):
-        n = len(self.history)
-        wr  = sum(1 for t in self.history if t['win'])/n*100 if n else 0
-        pnl = sum(t['pnl'] for t in self.history)
-        log.info(f"[LEARN] #{n}: WR={int(wr)}% PnL=${pnl:+.4f} Score≥{int(self.opt_score)}")
-
-    def save(self, fp='/tmp/bot_v60.json'):
+    def save(self, fp=None):
+        # v8.0 FIX 1: ruta configurable → Railway Volume sobrevive redeploys
+        fp = fp or f'{PERSIST_PATH}/bot_v80.json'
         try:
-            json.dump({
-                'history': self.history[-200:], 'sym_stats': dict(self.sym_stats),
-                'opt_score': self.opt_score, 'blacklist': list(self.blacklist),
-                'by_hour': dict(self.by_hour), 'by_pts': dict(self.by_pts),
-                'factor_wins': dict(self.factor_wins), 'factor_losses': dict(self.factor_losses),
-                'score_boost': self.score_boost, 'daily_losers': list(self.daily_losers),
-            }, open(fp,'w'), indent=2)
-        except: pass
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            json.dump({'history':self.history[-200:],'sym_stats':dict(self.sym_stats),
+                       'opt_score':self.opt_score,'blacklist':list(self.blacklist),
+                       'factor_wins':dict(self.factor_wins),'factor_losses':dict(self.factor_losses),
+                       'score_boost':self.score_boost,'daily_losers':list(self.daily_losers),
+                       # v8.0 FIX 3: persiste contador diario para sobrevivir reinicios
+                       'daily_trades':getattr(self,'_persisted_daily_trades',0),
+                       'daily_date':str(getattr(self,'_persisted_daily_date',datetime.utcnow().date()))},
+                      open(fp,'w'),indent=2)
+        except Exception as e:
+            log.warning(f"  [LEARN] save error: {e}")
 
-    def load(self, fp='/tmp/bot_v60.json'):
-        for path in [fp, '/tmp/bot_learn_v511.json', '/tmp/bot_learn_v59.json',
-                     '/tmp/bot_learn.json']:
+    def load(self, fp=None):
+        fp = fp or f'{PERSIST_PATH}/bot_v80.json'
+        # v8.0: busca también rutas antiguas como fallback
+        search_paths = [fp, '/tmp/bot_v80.json', '/tmp/bot_v70.json',
+                        '/tmp/bot_v60.json', '/tmp/bot_learn_v511.json', '/tmp/bot_learn.json']
+        for path in search_paths:
             try:
                 if not os.path.exists(path): continue
-                d = json.load(open(path))
-                self.history       = d.get('history', [])
-                self.sym_stats     = defaultdict(lambda:{'w':0,'l':0,'pnl':0.0,'n':0},
-                                                 d.get('sym_stats', {}))
-                self.blacklist     = set(d.get('blacklist', []))
-                self.by_hour       = defaultdict(lambda:{'w':0,'l':0,'pnl':0.0},
-                                                 d.get('by_hour', {}))
-                self.by_pts        = defaultdict(lambda:{'w':0,'l':0,'pnl':0.0},
-                                                 d.get('by_pts', {}))
-                self.factor_wins   = defaultdict(int, d.get('factor_wins', {}))
-                self.factor_losses = defaultdict(int, d.get('factor_losses', {}))
-                self.score_boost   = d.get('score_boost', {})
-                self.daily_losers  = set(d.get('daily_losers', []))
-                raw_score          = d.get('opt_score', MIN_SCORE)
-                cap = self._score_cap()
-                self.opt_score = max(min(raw_score, cap), MIN_SCORE)
-                log.info(f"  [LEARN] {len(self.history)} trades | Score:{int(self.opt_score)} | BL:{len(self.blacklist)}")
+                d=json.load(open(path))
+                self.history=d.get('history',[])
+                self.sym_stats=defaultdict(lambda:{'w':0,'l':0,'pnl':0.0,'n':0},d.get('sym_stats',{}))
+                self.blacklist=set(d.get('blacklist',[]))
+                self.factor_wins=defaultdict(int,d.get('factor_wins',{}))
+                self.factor_losses=defaultdict(int,d.get('factor_losses',{}))
+                self.score_boost=d.get('score_boost',{})
+                self.daily_losers=set(d.get('daily_losers',[]))
+                cap=self._cap()
+                self.opt_score=max(min(d.get('opt_score',MIN_SCORE),cap),MIN_SCORE)
+                # v8.0 FIX 3: restaurar contador diario si es el mismo día
+                saved_date_str = d.get('daily_date','')
+                today_str = str(datetime.utcnow().date())
+                if saved_date_str == today_str:
+                    self._persisted_daily_trades = int(d.get('daily_trades', 0))
+                    self._persisted_daily_date   = datetime.utcnow().date()
+                    log.info(f"  [LEARN] Trades hoy restaurados: {self._persisted_daily_trades}")
+                else:
+                    self._persisted_daily_trades = 0
+                    self._persisted_daily_date   = datetime.utcnow().date()
+                log.info(f"  [LEARN] {len(self.history)} trades | Score:{int(self.opt_score)} | BL:{len(self.blacklist)} | path:{path}")
                 return
-            except: continue
+            except Exception as e:
+                log.debug(f"  [LEARN] load {path}: {e}"); continue
+        # Inicializar campos aunque no haya fichero
+        self._persisted_daily_trades = 0
+        self._persisted_daily_date   = datetime.utcnow().date()
 
 # ============================================================================
-# BOT PRINCIPAL v6.0 PRECISION
+# SMART MONEY HELPERS
 # ============================================================================
 
-class LongBot:
-    _opening = False
+def session_ok(h):
+    if not SESSION_ON: return True, "sin filtro"
+    if LON_S<=h<LON_E: return True, f"London ({h}h)"
+    if NY_S<=h<NY_E:   return True, f"NY ({h}h)"
+    return False, f"fuera sesión ({h}h)"
+
+def sl_anti_hunt(sl, price):
+    off=random.uniform(-0.10,0.03)
+    sl2=sl*(1+off/100)
+    return round(max(price*(1-SL_MAX_PCT*1.1/100), min(price*(1-SL_MIN_PCT/100), sl2)), 8)
+
+def ofi(closes, opens, volumes, n=10):
+    if len(closes)<n+1: return 0.5
+    bull=bear=0.0
+    for i in range(-n,0):
+        c=closes[i];o=opens[i] if opens else closes[i-1];v=volumes[i]
+        if c>o: bull+=v
+        elif c<o: bear+=v
+        else: bull+=v*0.5;bear+=v*0.5
+    t=bull+bear
+    return bull/t if t>0 else 0.5
+
+# ============================================================================
+# BOT PRINCIPAL v8.0
+# ============================================================================
+
+class Bot:
+    _opening=False
 
     def __init__(self):
-        log.info("=" * 72)
-        log.info("  BOT LONGS v6.0 — PRECISION EDITION")
-        log.info(f"  Capital: ${POS_SIZE} | {LEVERAGE}x | Max:{MAX_TRADES} trades | Diario:{MAX_DAILY_TRADES}")
-        log.info(f"  Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Aurolo≥{AUROLO_MIN_PTS}/3")
-        log.info(f"  Sesión: London {SESSION_LONDON_S}-{SESSION_LONDON_E}h + NY {SESSION_NY_S}-{SESSION_NY_E}h UTC")
-        log.info(f"  Vol min: ${MIN_VOL:,.0f} | Breadth min: {int(BREADTH_MIN*100)}%")
-        log.info("=" * 72)
+        log.info("="*72)
+        log.info("  BINGX BOT COMPLETO v8.0 — SCANNER + TRADER INTEGRADOS")
+        log.info(f"  Capital: ${POS_SIZE} | {LEVERAGE}x | Max:{MAX_TRADES} | Diario:{MAX_DAILY}")
+        log.info(f"  Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Aurolo≥{AUROLO_MIN_PT}/3")
+        log.info(f"  Scanner: confianza min={SCAN_MIN_CONF}% | hot={SCAN_HOT_MIN}%")
+        log.info("="*72)
 
-        self.symbols         = []
-        self.trades          = {}
-        self._contracts      = {}
-        self._cooldowns      = {}
-        self._pending_orders = {}
-        self._last_report    = datetime.now() - timedelta(hours=3)
-        self._last_zombie_clean = 0
-        self._btc_1h         = 0.0
-        self._btc_4h         = 0.0
-        self._btc_ok         = True
-        self._regime         = 'neutral'
-        self._regime_until   = None
-        self._breadth        = 0.5
-        self._mode           = 'hedge'
-        self._daily_pnl      = 0.0
-        self._daily_trades   = 0          # v6.0: contador diario
-        self._daily_date     = datetime.utcnow().date()
-        self._equity_start   = ACCOUNT_EQUITY
-        self._cb_active      = False
-        self._cb_until       = None
-        self.learn           = Learning()
-        self.learn.load()
-        self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0,'fees':0.0,
-                      'filtered_session':0,'filtered_regime':0,'filtered_score':0}
+        self.symbols=[]; self.trades={}; self._contracts={}
+        self._cooldowns={}; self._pending={}
+        self._last_report=datetime.now()-timedelta(hours=3)
+        self._last_zombie=0; self._last_daily_summary=0
+        self._btc_1h=0.0; self._btc_4h=0.0; self._btc_ok=True
+        self._regime='neutral'; self._regime_until=None; self._breadth=0.5
+        self._mode='hedge'; self._daily_pnl=0.0
+        self._daily_date=datetime.utcnow().date()
+        self._equity_start=ACCOUNT_EQUITY
+        self._cb_active=False; self._cb_until=None
+        self._paused=False  # Control manual via Telegram
+        self.learn=Learning(); self.learn.load()
+
+        # v8.0 FIX 3: restaurar daily_trades si el bot se reinicia el mismo día
+        self._daily_trades = getattr(self.learn, '_persisted_daily_trades', 0)
+        log.info(f"  Trades hoy (restaurado): {self._daily_trades}/{MAX_DAILY}")
+
+        self.stats={'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0,'fees':0.0}
+
+        # Arrancar scanner en background
+        self.scanner=ExplosionScanner(self._tg)
+        self._scanner_thread=threading.Thread(target=self.scanner.run_loop, daemon=True)
+        self._scanner_thread.start()
+        log.info("  [SCANNER] Thread arrancado en background")
+
+        # Arrancar listener de comandos Telegram
+        self._tg_offset=0
+        self._cmd_thread=threading.Thread(target=self._telegram_commands_loop, daemon=True)
+        self._cmd_thread.start()
+        log.info("  [TELEGRAM] Listener de comandos activo")
 
         if not self._connect(): log.error("❌ Sin conexión BingX"); sys.exit(1)
-        self._detect_mode()
-        self._load_contracts()
-        self._refresh_symbols()
-        n_killed = self._nuke_zombie_orders()
-        self._recover()
+        self._detect_mode(); self._load_contracts(); self._refresh_symbols()
+        n_killed=self._nuke_zombie_orders(); self._recover()
 
         self._tg(
-            f"<b>🎯 Bot LONGS v6.0 PRECISION</b>\n"
-            f"Max {MAX_TRADES} trades | Máx {MAX_DAILY_TRADES}/día\n"
-            f"Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL}\n"
-            f"Sesión: London+NY | Breadth≥{int(BREADTH_MIN*100)}%\n"
-            f"SL max {SL_MAX_PCT}% | TP1 {TP1_RATIO}R | TP2 {TP2_RATIO}R\n"
-            f"🧟 Zombies: {n_killed} | ♻️ Recuperadas: {len(self.trades)}\n"
-            f"<b>⚠️ PARAR AEGIS Y SUPERBOT — solo un bot activo</b>"
+            f"<b>🤖 BINGX BOT COMPLETO v8.0</b>\n"
+            f"Trader + Scanner integrados\n"
+            f"Max {MAX_TRADES} trades | {MAX_DAILY}/día\n"
+            f"Score bull≥{SCORE_BULL} | neutral≥{SCORE_NEUTRAL}\n"
+            f"Scanner {'obligatorio' if SCANNER_REQUIRED else 'opcional'} (min {SCAN_MIN_CONF}%)\n"
+            f"Persist: {PERSIST_PATH} | Trades hoy: {self._daily_trades}/{MAX_DAILY}\n"
+            f"🧟 Zombies: {n_killed} | ♻️ Recuperadas: {len(self.trades)}\n\n"
+            f"<b>Comandos disponibles:</b>\n"
+            f"/status — Estado actual\n"
+            f"/top — Top 10 del scanner\n"
+            f"/trades — Posiciones abiertas\n"
+            f"/pause — Pausar entradas\n"
+            f"/resume — Reanudar entradas"
         )
 
-    # ── Conexión ──────────────────────────────────────────────────────────
-    def _connect(self) -> bool:
+    # ── TELEGRAM COMMANDS ─────────────────────────────────────────────────
+
+    def _telegram_commands_loop(self):
+        """Escucha comandos de Telegram en background."""
+        while True:
+            try:
+                r=requests.get(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                    params={'offset':self._tg_offset,'timeout':30},
+                    timeout=35
+                )
+                if r.status_code!=200: time.sleep(5); continue
+                data=r.json()
+                for upd in data.get('result',[]):
+                    self._tg_offset=upd['update_id']+1
+                    msg=upd.get('message',{})
+                    text=msg.get('text','').strip().lower()
+                    chat_id=str(msg.get('chat',{}).get('id',''))
+                    if not text or chat_id!=str(TG_CHAT): continue
+                    self._handle_command(text)
+            except Exception as e:
+                log.debug(f"[CMD] {e}"); time.sleep(10)
+
+    def _handle_command(self, cmd):
+        total=self.stats['wins']+self.stats['losses']
+        wr=self.stats['wins']/total*100 if total else 0
+
+        if cmd in ('/status','status'):
+            hot=self.scanner.get_hot(SCAN_HOT_MIN,5)
+            self._tg(
+                f"<b>📊 STATUS v7.0</b>\n"
+                f"Posiciones: {len(self.trades)}/{MAX_TRADES}\n"
+                f"Trades hoy: {self._daily_trades}/{MAX_DAILY}\n"
+                f"PnL hoy: ${self._daily_pnl:+.4f}\n"
+                f"WR total: {wr:.0f}% ({total}t)\n"
+                f"Régimen: {self._regime} | Breadth: {int(self._breadth*100)}%\n"
+                f"BTC 1h: {self._btc_1h:+.2f}% | 4h: {self._btc_4h:+.2f}%\n"
+                f"Estado: {'⏸️ PAUSADO' if self._paused else '✅ ACTIVO'}\n"
+                f"Scanner hot: {', '.join(hot) if hot else 'ninguno'}"
+            )
+        elif cmd in ('/top','top'):
+            with self.scanner.hot_lock:
+                top=self.scanner.hot_symbols[:10]
+            if not top: self._tg("Scanner sin resultados aún")
+            else:
+                lines="\n".join(f"  {'🔴' if c>=80 else '🟠' if c>=65 else '🟡'} {s} — {c}%"
+                                for s,c in top)
+                self._tg(f"<b>🔥 TOP 10 SCANNER</b>\n{lines}")
+        elif cmd in ('/trades','trades'):
+            if not self.trades: self._tg("Sin posiciones abiertas")
+            else:
+                lines=[]
+                for sym,t in self.trades.items():
+                    tk=self._ticker(sym); cur=tk['price'] if tk else t['entry']
+                    pct=(cur-t['entry'])/t['entry']*100
+                    sc=self.scanner.get_confidence(sym)
+                    lines.append(f"  {'✅' if pct>0 else '📌'} {sym}: {pct:+.2f}% | Scanner: {sc}%")
+                self._tg("<b>📍 POSICIONES ABIERTAS</b>\n"+"\n".join(lines))
+        elif cmd in ('/pause','pause'):
+            self._paused=True; self._tg("⏸️ Bot PAUSADO — no abrirá nuevas entradas")
+        elif cmd in ('/resume','resume'):
+            self._paused=False; self._tg("▶️ Bot REANUDADO")
+        elif cmd in ('/help','help','/start'):
+            self._tg(
+                "<b>Comandos disponibles:</b>\n"
+                "/status — Estado completo\n"
+                "/top — Top 10 del scanner\n"
+                "/trades — Posiciones abiertas\n"
+                "/pause — Pausar nuevas entradas\n"
+                "/resume — Reanudar entradas"
+            )
+
+    # ── CONEXIÓN ──────────────────────────────────────────────────────────
+
+    def _connect(self):
         global AUTO, ACCOUNT_EQUITY
         if not AUTO: return True
         if not API_KEY or not API_SECRET:
-            log.error("❌ API keys no configuradas"); AUTO = False; return False
-        d = api('GET', '/openApi/swap/v2/user/balance')
-        if d.get('code') == 0:
-            b = d.get('data', {})
-            if isinstance(b, list):
-                eq = 0.0
+            log.error("❌ API keys no configuradas"); AUTO=False; return False
+        d=api('GET','/openApi/swap/v2/user/balance')
+        if d.get('code')==0:
+            b=d.get('data',{})
+            if isinstance(b,list):
                 for item in b:
-                    v = _safe_float(item)
-                    if v > 0: eq = v; break
+                    v=_sf(item)
+                    if v>0: ACCOUNT_EQUITY=v; break
             else:
-                eq = _safe_float(b.get('equity', b.get('balance', 0)))
-                if eq <= 0:
-                    for _, val in b.items():
-                        v = _safe_float(val)
-                        if v > 0: eq = v; break
-            if eq > 0: ACCOUNT_EQUITY = eq; self._equity_start = eq
-            log.info(f"✅ BingX conectado | ${ACCOUNT_EQUITY:.2f} USDT")
-            return True
-        log.error(f"❌ [{d.get('code')}]: {d.get('msg')}")
-        AUTO = False; return False
+                eq=_sf(b.get('equity',b.get('balance',0)))
+                if eq<=0:
+                    for _,val in b.items():
+                        v=_sf(val)
+                        if v>0: eq=v; break
+                if eq>0: ACCOUNT_EQUITY=eq
+            self._equity_start=ACCOUNT_EQUITY
+            log.info(f"✅ BingX conectado | ${ACCOUNT_EQUITY:.2f} USDT"); return True
+        AUTO=False; return False
 
     def _detect_mode(self):
         try:
-            d = api('GET', '/openApi/swap/v2/user/positions', {'symbol': 'BTC-USDT'})
+            d=api('GET','/openApi/swap/v2/user/positions',{'symbol':'BTC-USDT'})
             for p in (d.get('data') or []):
-                s = str(p.get('positionSide', '')).upper()
-                if s in ('LONG', 'SHORT'): self._mode = 'hedge'; log.info("  Modo: HEDGE"); return
-                if s == 'BOTH': self._mode = 'oneway'; log.info("  Modo: ONE-WAY"); return
+                s=str(p.get('positionSide','')).upper()
+                if s in ('LONG','SHORT'): self._mode='hedge'; log.info("  Modo: HEDGE"); return
+                if s=='BOTH': self._mode='oneway'; log.info("  Modo: ONE-WAY"); return
         except: pass
         log.info("  Modo: HEDGE (default)")
 
     def _load_contracts(self):
-        d = pub('/openApi/swap/v2/quote/contracts')
-        if d.get('code') == 0:
-            for c in d.get('data', []):
-                s = c.get('symbol', '')
-                if s: self._contracts[s] = {
-                    'step': float(c.get('tradeMinQuantity', 1)),
-                    'prec': int(c.get('quantityPrecision', 2)),
-                    'ctval': float(c.get('contractSize', 1)),
-                }
+        d=pub('/openApi/swap/v2/quote/contracts')
+        if d.get('code')==0:
+            for c in d.get('data',[]):
+                s=c.get('symbol','')
+                if s: self._contracts[s]={'step':float(c.get('tradeMinQuantity',1)),
+                                          'prec':int(c.get('quantityPrecision',2)),
+                                          'ctval':float(c.get('contractSize',1))}
             log.info(f"  Contratos: {len(self._contracts)}")
 
     def _refresh_symbols(self):
-        """v6.0: Mínimo $1M volumen, top 100 por liquidez."""
-        d = pub('/openApi/swap/v2/quote/ticker')
-        if d.get('code') != 0:
-            self.symbols = self.symbols or ['BTC-USDT', 'ETH-USDT', 'SOL-USDT']; return
-        items = []
-        for t in d.get('data', []):
-            sym = t.get('symbol', '')
+        d=pub('/openApi/swap/v2/quote/ticker')
+        if d.get('code')!=0: return
+        items=[]
+        for t in d.get('data',[]):
+            sym=t.get('symbol','')
             if not sym.endswith('-USDT'): continue
-            base = sym.replace('-USDT', '').upper()
-            if any(base == ex for ex in EXCLUDE): continue
-            if any(base.startswith(ex) for ex in EXCLUDE): continue
+            base=sym.replace('-USDT','').upper()
+            if any(base==ex for ex in EXCLUDE): continue
             try:
-                price = float(t.get('lastPrice', 0))
-                vol   = float(t.get('volume', 0)) * price
-                if vol >= MIN_VOL and price > 0:
-                    items.append({'sym': sym, 'vol': vol})
+                price=float(t.get('lastPrice',0)); vol=float(t.get('volume',0))*price
+                if vol>=MIN_VOL and price>0: items.append((sym,vol))
             except: continue
-        items.sort(key=lambda x: x['vol'], reverse=True)
-        items = items[:MAX_SYMS]  # Top 100 más líquidos
-        self.symbols = [x['sym'] for x in items]
-        log.info(f"  Símbolos: {len(self.symbols)} (vol>${MIN_VOL/1e6:.1f}M)")
+        items.sort(key=lambda x:x[1],reverse=True)
+        self.symbols=[s for s,_ in items[:MAX_SYMS]]
+        log.info(f"  Símbolos: {len(self.symbols)}")
 
-    def _analyze_parallel(self, symbols_batch):
-        results = []
-        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-            futures = {ex.submit(self.analyze, sym): sym for sym in symbols_batch}
-            for fut in as_completed(futures):
-                try:
-                    sig = fut.result()
-                    if sig: results.append((futures[fut], sig))
-                except Exception as e:
-                    log.debug(f"analyze error: {e}")
-        results.sort(key=lambda x: x[1]['score'], reverse=True)
-        return results
+    def _get_scan_order(self):
+        """
+        v7.0 KEY: ordena símbolos poniendo los HOT del scanner primero.
+        Bot analiza antes los que el scanner ya marcó como candidatos.
+        """
+        hot=self.scanner.get_hot(SCAN_HOT_MIN, 40)
+        non_hot=[s for s in self.symbols if s not in hot]
+        # Hot symbols primero, luego el resto
+        ordered=hot+non_hot
+        return ordered[:MAX_SYMS]
 
-    def _nuke_zombie_orders(self) -> int:
+    def _nuke_zombie_orders(self):
         if not AUTO: return 0
-        protected_ids = set()
+        protected=set()
         for sym in list(self.trades.keys()):
-            d = api('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': sym})
-            for o in (d.get('data', {}).get('orders') or []):
-                otype = str(o.get('type', '')).upper()
+            d=api('GET','/openApi/swap/v2/trade/openOrders',{'symbol':sym})
+            for o in (d.get('data',{}).get('orders') or []):
+                otype=str(o.get('type','')).upper()
                 if 'STOP' in otype or 'TRAILING' in otype:
-                    oid = o.get('orderId')
-                    if oid: protected_ids.add(str(oid))
-        killed = 0; now_ms = int(time.time() * 1000)
-        all_syms = set(self.symbols or [])
+                    oid=o.get('orderId')
+                    if oid: protected.add(str(oid))
+        killed=0; now_ms=int(time.time()*1000)
+        all_syms=set(self.symbols or [])
         try:
-            d_pos = api('GET', '/openApi/swap/v2/user/positions', {})
-            for p in (d_pos.get('data') or []):
-                s = p.get('symbol', '')
+            dp=api('GET','/openApi/swap/v2/user/positions',{})
+            for p in (dp.get('data') or []):
+                s=p.get('symbol','')
                 if s: all_syms.add(s)
         except: pass
         for sym in list(all_syms)[:80]:
             try:
-                d = api('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': sym})
-                for o in (d.get('data', {}).get('orders') or []):
-                    oid   = str(o.get('orderId', ''))
-                    otype = str(o.get('type', '')).upper()
-                    otime = int(o.get('time', now_ms) or now_ms)
-                    age_min = (now_ms - otime) / 60000
-                    if oid in protected_ids: continue
-                    if (otype in ('LIMIT', 'TRIGGER', 'STOP', 'TAKE_PROFIT') and
-                            (sym not in self.trades or age_min > ZOMBIE_MAX_AGE_MIN)):
-                        r = api('DELETE', '/openApi/swap/v2/trade/order',
-                                {'symbol': sym, 'orderId': oid})
-                        if r.get('code') == 0: killed += 1
+                d=api('GET','/openApi/swap/v2/trade/openOrders',{'symbol':sym})
+                for o in (d.get('data',{}).get('orders') or []):
+                    oid=str(o.get('orderId',''));otype=str(o.get('type','')).upper()
+                    otime=int(o.get('time',now_ms) or now_ms)
+                    age=(now_ms-otime)/60000
+                    if oid in protected: continue
+                    if otype in ('LIMIT','TRIGGER','STOP','TAKE_PROFIT') and \
+                       (sym not in self.trades or age>20):
+                        r=api('DELETE','/openApi/swap/v2/trade/order',{'symbol':sym,'orderId':oid})
+                        if r.get('code')==0: killed+=1
                         time.sleep(0.12)
             except: pass
-        if killed: log.info(f"  🧟 Zombies eliminados: {killed}")
-        self._last_zombie_clean = time.time()
-        return killed
+        if killed: log.info(f"  🧟 Zombies: {killed}")
+        self._last_zombie=time.time(); return killed
 
-    def _update_market_regime(self):
-        if not REGIME_CHECK: return
-        c4h, *_ = self._klines('BTC-USDT', '4h', 10)
-        if c4h and len(c4h) >= 4:
-            self._btc_4h = (c4h[-1] - c4h[-4]) / c4h[-4] * 100
-            if self._btc_4h < -BTC_4H_CRASH_PCT:
-                if not self._regime_until or datetime.utcnow() > self._regime_until:
-                    self._regime_until = datetime.utcnow() + timedelta(hours=BTC_4H_CRASH_PAUSE)
-                    self._tg(f"<b>🚨 CRASH GUARD</b>\nBTC {self._btc_4h:.1f}% en 4h → Pausa {BTC_4H_CRASH_PAUSE}h")
-
-        bulls = 0; total = 0
+    def _update_regime(self):
+        c4h,*_=self._klines('BTC-USDT','4h',10)
+        if c4h and len(c4h)>=4:
+            self._btc_4h=(c4h[-1]-c4h[-4])/c4h[-4]*100
+            if self._btc_4h<-BTC4H_CRASH:
+                if not self._regime_until or datetime.utcnow()>self._regime_until:
+                    self._regime_until=datetime.utcnow()+timedelta(hours=BTC4H_PAUSE)
+                    self._tg(f"<b>🚨 CRASH GUARD</b>\nBTC {self._btc_4h:.1f}% → Pausa {BTC4H_PAUSE}h")
+        bulls=0;total=0
         for coin in BREADTH_COINS[:10]:
             try:
-                c, *_ = self._klines(coin, '1h', 25)
-                if c and len(c) >= 21:
-                    e21 = ema(c, 21)
-                    if c[-1] > e21: bulls += 1
-                    total += 1
+                c,*_=self._klines(coin,'1h',25)
+                if c and len(c)>=21:
+                    if c[-1]>ema(c,21): bulls+=1
+                    total+=1
             except: pass
-        if total > 0: self._breadth = bulls / total
-
-        # v6.0: bear duro si breadth < 30%
-        if self._breadth < BREADTH_BEAR_HARD:
-            if self._regime != 'bear':
-                log.warning(f"  🛑 BEAR FORZADO — Breadth {int(self._breadth*100)}%")
-                self._tg(f"<b>🛑 BEAR FORZADO</b>\nBreadth {int(self._breadth*100)}% < {int(BREADTH_BEAR_HARD*100)}%")
-            self._regime = 'bear'; return
-
-        btc_bear    = (self._btc_4h < -1.5) or (self._btc_1h < -BTC_BLOCK)
-        low_breadth = self._breadth < BREADTH_MIN  # v6.0: 50%
-
-        if btc_bear and low_breadth:    nuevo = 'bear'
-        elif btc_bear or low_breadth:   nuevo = 'caution'
-        elif self._btc_4h > 1.0 and self._breadth > 0.65: nuevo = 'bull'
-        else:                           nuevo = 'neutral'
-
-        if nuevo != self._regime: log.info(f"  📊 RÉGIMEN: {self._regime} → {nuevo}")
-        self._regime = nuevo
+        if total>0: self._breadth=bulls/total
+        if self._breadth<BREADTH_BEAR:
+            if self._regime!='bear': self._tg(f"<b>🛑 BEAR FORZADO</b>\nBreadth {int(self._breadth*100)}%")
+            self._regime='bear'; return
+        btc_bear=(self._btc_4h<-1.5) or (self._btc_1h<-BTC_BLOCK)
+        low_b=self._breadth<BREADTH_MIN
+        if btc_bear and low_b: nuevo='bear'
+        elif btc_bear or low_b: nuevo='caution'
+        elif self._btc_4h>1.0 and self._breadth>0.65: nuevo='bull'
+        else: nuevo='neutral'
+        if nuevo!=self._regime: log.info(f"  📊 RÉGIMEN: {self._regime}→{nuevo}")
+        self._regime=nuevo
 
     def _regime_ok(self):
-        if self._regime_until and datetime.utcnow() < self._regime_until:
-            remaining = int((self._regime_until - datetime.utcnow()).total_seconds() / 60)
-            return False, f"crash guard {remaining}min"
-        if self._regime == 'bear':    return False, "régimen bajista"
-        if CAUTION_BLOCK and self._regime == 'caution': return False, "régimen caution"
-        return True, "ok"
+        if self._regime_until and datetime.utcnow()<self._regime_until:
+            rm=int((self._regime_until-datetime.utcnow()).total_seconds()/60)
+            return False,f"crash guard {rm}min"
+        if self._regime=='bear': return False,"bajista"
+        if CAUTION_BLOCK and self._regime=='caution': return False,"caution"
+        return True,"ok"
 
-    def _score_min_for_regime(self):
-        if self._regime == 'bull': return max(self.learn.opt_score, SCORE_BULL)
-        return max(self.learn.opt_score, SCORE_NEUTRAL)
+    def _score_min(self):
+        if self._regime=='bull': return max(self.learn.opt_score,SCORE_BULL)
+        return max(self.learn.opt_score,SCORE_NEUTRAL)
 
-    def _get_exchange_positions(self, symbol=None):
-        params = {}
-        if symbol: params['symbol'] = symbol
-        d = api('GET', '/openApi/swap/v2/user/positions', params)
-        result = defaultdict(lambda: {'long': 0.0, 'short': 0.0})
+    def _get_positions(self,symbol=None):
+        params={}
+        if symbol: params['symbol']=symbol
+        d=api('GET','/openApi/swap/v2/user/positions',params)
+        res=defaultdict(lambda:{'long':0.0,'short':0.0})
         for p in (d.get('data') or []):
             try:
-                amt  = float(p.get('positionAmt', 0) or 0)
-                sym  = p.get('symbol', '')
-                side = str(p.get('positionSide', '')).upper()
-                if not sym or abs(amt) == 0: continue
-                if side == 'LONG' or (side == 'BOTH' and amt > 0): result[sym]['long'] = abs(amt)
-                elif side == 'SHORT' or (side == 'BOTH' and amt < 0): result[sym]['short'] = abs(amt)
+                amt=float(p.get('positionAmt',0) or 0); sym=p.get('symbol','')
+                side=str(p.get('positionSide','')).upper()
+                if not sym or abs(amt)==0: continue
+                if side=='LONG' or (side=='BOTH' and amt>0): res[sym]['long']=abs(amt)
+                elif side=='SHORT' or (side=='BOTH' and amt<0): res[sym]['short']=abs(amt)
             except: continue
-        return result
+        return res
 
-    def _has_any_position(self, symbol):
-        pos = self._get_exchange_positions(symbol)
-        return pos[symbol]['long'] > 0 or pos[symbol]['short'] > 0
+    def _has_pos(self,sym): p=self._get_positions(sym); return p[sym]['long']>0 or p[sym]['short']>0
 
-    def _order_close_short(self, sym, qty):
-        params = {'symbol': sym, 'side': 'BUY', 'type': 'MARKET', 'quantity': str(qty)}
-        if self._mode == 'hedge': params['positionSide'] = 'SHORT'
-        else: params['reduceOnly'] = 'true'
-        return api('POST', '/openApi/swap/v2/trade/order', params)
+    def _close_short(self,sym,qty):
+        params={'symbol':sym,'side':'BUY','type':'MARKET','quantity':str(qty)}
+        if self._mode=='hedge': params['positionSide']='SHORT'
+        else: params['reduceOnly']='true'
+        return api('POST','/openApi/swap/v2/trade/order',params)
 
     def _recover(self):
-        """v6.0: FIX — ignora posiciones con leverage > LEVERAGE+1 (manuales)."""
         if not AUTO: return
-        all_pos = self._get_exchange_positions(); n_rec = 0; n_sh = 0
-        for sym, sides in all_pos.items():
-            if sides['short'] > 0:
-                log.warning(f"  ⚠️ SHORT huérfano: {sym} → cerrando")
-                if self._order_close_short(sym, sides['short']).get('code') == 0: n_sh += 1
+        all_pos=self._get_positions(); n_rec=0; n_sh=0
+        for sym,sides in all_pos.items():
+            if sides['short']>0:
+                log.warning(f"  ⚠️ SHORT huérfano: {sym}")
+                if self._close_short(sym,sides['short']).get('code')==0: n_sh+=1
                 time.sleep(0.5)
-            if sides['long'] > 0 and sym not in self.trades:
-                d2 = api('GET', '/openApi/swap/v2/user/positions', {'symbol': sym})
-                entry = 0.0; lev_pos = 1.0
+            if sides['long']>0 and sym not in self.trades:
+                d2=api('GET','/openApi/swap/v2/user/positions',{'symbol':sym})
+                entry=0.0; lev=1.0
                 for p in (d2.get('data') or []):
-                    s2  = str(p.get('positionSide', '')).upper()
-                    a2  = float(p.get('positionAmt', 0) or 0)
-                    if (s2 == 'LONG' and abs(a2) > 0) or (s2 == 'BOTH' and a2 > 0):
-                        entry   = float(p.get('avgPrice') or p.get('entryPrice') or 0)
-                        lev_pos = float(p.get('leverage', LEVERAGE) or LEVERAGE)
-                        break
-                # v6.0 FIX: ignorar posiciones manuales con leverage diferente
-                if lev_pos > LEVERAGE + 1:
-                    log.info(f"  ⚠️ {sym} lev={lev_pos}x > {LEVERAGE+1}x → posición manual, ignorada")
-                    continue
-                if entry <= 0: continue
-                qty    = sides['long']
-                sl_rec = entry * (1 - SL_MAX_PCT / 100)
-                self.trades[sym] = {
-                    'entry': entry, 'qty_total': qty, 'qty_runner': qty,
-                    'qty_tp1': round(qty * TP1_PCT/100, 6),
-                    'qty_tp2': round(qty * TP2_PCT/100, 6),
-                    'tp1_hit': False, 'tp2_hit': False,
-                    'tp1_price': entry * (1 + TP1_RATIO * SL_MAX_PCT / 100),
-                    'tp2_price': entry * (1 + TP2_RATIO * SL_MAX_PCT / 100),
-                    'sl': sl_rec, 'sl_orig': sl_rec, 'sl_pct': SL_MAX_PCT,
-                    'highest': entry, 'opened': datetime.now(),
-                    'score': 0, 'ema25': entry, 'ema55': entry,
-                    'aurolo_pts': 0, 'entrada_label': 'recovered',
-                    'usdt': POS_SIZE, 'pnl_parcial': 0.0,
-                    'factors': [], 'hora_utc': datetime.utcnow().hour,
-                    'btc_dir': self._btc_dir(), 'debilidad_alertada': False,
-                    'trailing_placed': False, 'trailing_sl': sl_rec,
-                }
-                n_rec += 1
-                log.info(f"  ♻️ LONG recuperado: {sym} @ ${entry:.6f} ({lev_pos}x)")
+                    s2=str(p.get('positionSide','')).upper(); a2=float(p.get('positionAmt',0) or 0)
+                    if (s2=='LONG' and abs(a2)>0) or (s2=='BOTH' and a2>0):
+                        entry=float(p.get('avgPrice') or p.get('entryPrice') or 0)
+                        lev=float(p.get('leverage',LEVERAGE) or LEVERAGE); break
+                if lev>LEVERAGE+1: log.info(f"  ⚠️ {sym} lev={lev}x manual, ignorada"); continue
+                if entry<=0: continue
+                sl_r=entry*(1-SL_MAX_PCT/100)
+                self.trades[sym]={'entry':entry,'qty_total':sides['long'],'qty_runner':sides['long'],
+                    'qty_tp1':round(sides['long']*TP1_PCT/100,6),'qty_tp2':round(sides['long']*TP2_PCT/100,6),
+                    'tp1_hit':False,'tp2_hit':False,'tp1_price':entry*(1+TP1_RATIO*SL_MAX_PCT/100),
+                    'tp2_price':entry*(1+TP2_RATIO*SL_MAX_PCT/100),'sl':sl_r,'sl_orig':sl_r,
+                    'sl_pct':SL_MAX_PCT,'trailing_sl':sl_r,'highest':entry,'opened':datetime.now(),
+                    'score':0,'aurolo_pts':0,'entrada_label':'recovered','usdt':POS_SIZE,'pnl_parcial':0.0,
+                    'factors':[],'hora_utc':datetime.utcnow().hour,'btc_dir':self._btc_dir(),
+                    'debilidad_alertada':False,'trailing_placed':False,'size_mult':1.0,'scanner_conf':0}
+                n_rec+=1; log.info(f"  ♻️ {sym} @ ${entry:.6f}")
         log.info(f"  Recuperadas: {n_rec} | SHORTs cerrados: {n_sh}")
 
-    def _klines(self, symbol, interval='5m', limit=130):
-        d = pub('/openApi/swap/v3/quote/klines',
-                {'symbol': symbol, 'interval': interval, 'limit': limit})
-        if d.get('code') == 0 and d.get('data'):
-            kl = d['data']
-            return ([float(k['close'])  for k in kl],
-                    [float(k['high'])   for k in kl],
-                    [float(k['low'])    for k in kl],
-                    [float(k['volume']) for k in kl],
-                    [float(k['open'])   for k in kl])
-        return None, None, None, None, None
+    def _klines(self,symbol,interval='5m',limit=130):
+        d=pub('/openApi/swap/v3/quote/klines',{'symbol':symbol,'interval':interval,'limit':limit})
+        if d.get('code')==0 and d.get('data'):
+            kl=d['data']
+            return ([float(k['close'])for k in kl],[float(k['high'])for k in kl],
+                    [float(k['low'])for k in kl],[float(k['volume'])for k in kl],
+                    [float(k['open'])for k in kl])
+        return None,None,None,None,None
 
-    def _ticker(self, sym):
-        d = pub('/openApi/swap/v2/quote/ticker', {'symbol': sym})
-        if d.get('code') == 0 and d.get('data'):
-            t = d['data']
-            return {'price': float(t.get('lastPrice', 0)),
-                    'change': float(t.get('priceChangePercent', 0))}
+    def _ticker(self,sym):
+        d=pub('/openApi/swap/v2/quote/ticker',{'symbol':sym})
+        if d.get('code')==0 and d.get('data'):
+            t=d['data']
+            return {'price':float(t.get('lastPrice',0)),'change':float(t.get('priceChangePercent',0))}
         return None
 
     def _update_btc(self):
-        c, *_ = self._klines('BTC-USDT', '1h', 4)
-        if c and len(c) >= 2:
-            self._btc_1h = (c[-1] - c[-2]) / c[-2] * 100
-            self._btc_ok = self._btc_1h >= -BTC_BLOCK  # v6.0: más estricto
-        else:
-            self._btc_ok = True
+        c,*_=self._klines('BTC-USDT','1h',4)
+        if c and len(c)>=2:
+            self._btc_1h=(c[-1]-c[-2])/c[-2]*100; self._btc_ok=self._btc_1h>=-BTC_BLOCK
+        else: self._btc_ok=True
 
     def _btc_dir(self):
-        if self._btc_1h > 0.5:  return 'up'
-        if self._btc_1h < -0.5: return 'down'
+        if self._btc_1h>0.5: return 'up'
+        if self._btc_1h<-0.5: return 'down'
         return 'flat'
 
     def _update_equity(self):
         global ACCOUNT_EQUITY
-        d = api('GET', '/openApi/swap/v2/user/balance')
-        if d.get('code') == 0:
-            b  = d.get('data', {})
-            if isinstance(b, list):
+        d=api('GET','/openApi/swap/v2/user/balance')
+        if d.get('code')==0:
+            b=d.get('data',{})
+            if isinstance(b,list):
                 for item in b:
-                    v = _safe_float(item)
-                    if v > 0: ACCOUNT_EQUITY = v; break
+                    v=_sf(item)
+                    if v>0: ACCOUNT_EQUITY=v; break
             else:
-                eq = _safe_float(b.get('equity', b.get('balance', 0)))
-                if eq <= 0:
-                    for _, val in b.items():
-                        v = _safe_float(val)
-                        if v > 0: eq = v; break
-                if eq > 0: ACCOUNT_EQUITY = eq
+                eq=_sf(b.get('equity',b.get('balance',0)))
+                if eq<=0:
+                    for _,val in b.items():
+                        v=_sf(val)
+                        if v>0: eq=v; break
+                if eq>0: ACCOUNT_EQUITY=eq
 
-    def _check_ltv(self):
-        if not AUTO: return
-        d = api('GET', '/openApi/swap/v2/user/balance')
-        if d.get('code') != 0: return
-        try:
-            b   = d.get('data', {}); eq = _safe_float(b.get('equity', b.get('balance', 0)))
-            mg  = _safe_float(b.get('usedMargin', b.get('initialMargin', 0)))
-            ltv = mg / eq * 100 if eq > 0 else 0
-            if eq > 0 and ltv >= LTV_WARN:
-                self._tg("<b>⚠️ LTV ALTO — cerrando posiciones</b>")
-                for sym in list(self.trades):
-                    tk = self._ticker(sym)
-                    if tk: self._close_all(sym, tk['price'], "LTV EMERGENCIA")
-        except: pass
+    # ── ANÁLISIS v7.0 ─────────────────────────────────────────────────────
 
-    # ── ANALYZE v6.0 — PRECISION GATE ────────────────────────────────────
     def analyze(self, symbol):
-        """
-        v6.0: Gate de calidad estricto.
-        Requiere: Sesión + Régimen + BTC positivo + trend_4h=1 SIEMPRE
-                  + Aurolo ≥2/3 + Vol ratio ≥1.5 + (OFI bull OR MTF15m bull)
-                  + Score ≥75 (bull) / ≥85 (neutral)
-        """
         if symbol in self.trades: return None
         if not self._cd_ok(symbol): return None
-        if symbol in self._pending_orders: return None
+        if symbol in self._pending: return None
+        hora=datetime.utcnow().hour
+        ses_ok,_=session_ok(hora)
+        if not ses_ok: return None
+        ro,_=self._regime_ok()
+        if not ro or not self._btc_ok or self._cb_active: return None
+        if self._breadth<BREADTH_MIN: return None
+        if not self.learn.hora_ok(hora): return None
+        if self._daily_trades>=MAX_DAILY: return None
 
-        hora = datetime.utcnow().hour
+        c5,h5,l5,v5,o5=self._klines(symbol,'5m',130)
+        if not c5 or len(c5)<AUROLO_EMA+50: return None
 
-        # v6.0: GATE 1 — Sesión estricta
-        ses_ok, ses_reason = session_ok(hora)
-        if not ses_ok:
-            self.stats['filtered_session'] += 1
-            return None
+        tk=self._ticker(symbol)
+        if not tk or tk['price']<=0: return None
+        price=tk['price']; chg=tk['change']
+        if chg>12 or chg<-5: return None
 
-        # v6.0: GATE 2 — Régimen de mercado
-        regime_ok, _ = self._regime_ok()
-        if not regime_ok:
-            self.stats['filtered_regime'] += 1
-            return None
+        c1h,h1h,l1h,v1h,_=self._klines(symbol,'1h',50)
+        c4h,h4h,l4h,v4h,_=self._klines(symbol,'4h',30)
 
-        # v6.0: GATE 3 — BTC positivo (no solo "no muy negativo")
-        if not self._btc_ok: return None
-        if self._cb_active: return None
+        if not (c1h and len(c1h)>=25): return None
+        e9_1h=ema(c1h,9); e21_1h=ema(c1h,21)
+        if e9_1h<=e21_1h: return None
+        rsi_1h=rsi(c1h,14)
+        if rsi_1h>65: return None
 
-        # v6.0: GATE 4 — Breadth suficiente
-        if self._breadth < BREADTH_MIN: return None
+        if not (c4h and len(c4h)>=21): return None
+        if ema(c4h,9)<=ema(c4h,21): return None
 
-        hora_ok, _ = self.learn.hora_ok(hora)
-        if not hora_ok: return None
+        atr_v_val=atr_calc(h5,l5,c5,14)
+        atr_pct=atr_v_val/price*100 if price>0 else 0
+        if atr_pct<0.10 or atr_pct>5.0: return None
 
-        # v6.0: GATE 5 — Máximo trades diarios
-        if self._daily_trades >= MAX_DAILY_TRADES: return None
+        sig=aurolo_signal(c5,h5,l5,v5,o5,atr_v_val)
+        if sig['puntos']<AUROLO_MIN_PT or sig['cambio_tend']: return None
+        if sig['vol_ratio']<VOL_RATIO_MIN: return None
 
-        c5, h5, l5, v5, o5 = self._klines(symbol, '5m', 130)
-        if not c5 or len(c5) < AUROLO_EMA_LEN + 50: return None
+        vwap=vwap_calc(c5,h5,l5,v5,50)
+        if price<=vwap: return None
 
-        tk = self._ticker(symbol)
-        if not tk or tk['price'] <= 0: return None
-        price    = tk['price']
-        change_24 = tk['change']
+        sl_price=sig['sl_price']; sl_pct=sig['sl_pct']
+        if sl_pct<SL_MIN_PCT*0.9 or sl_pct>SL_MAX_PCT*1.1: return None
 
-        # v6.0: Filtro change_24h estricto
-        if change_24 > 12.0 or change_24 < -5.0: return None
+        tp1=price*(1+sl_pct*TP1_RATIO/100); tp2=price*(1+sl_pct*TP2_RATIO/100)
+        rr=max(sl_pct*MIN_RR,TP_MIN,atr_pct*ATR_TP_M)/sl_pct if sl_pct>0 else 0
+        if rr<MIN_RR*0.80: return None
+        if sl_pct*TP1_RATIO-FEE_COST_PCT<0.6: return None
 
-        # v6.0: GATE 6 — Stop hunt detection
-        if STOP_HUNT_DETECT:
-            hunt, _ = detect_stop_hunt(c5, h5, l5, v5)
-            if hunt: return None
-
-        # v6.0: GATE 7 — Trend 1h y 4h (AMBOS requeridos)
-        c1h, h1h, l1h, v1h, _ = self._klines(symbol, '1h', 50)
-        c4h, h4h, l4h, v4h, _ = self._klines(symbol, '4h', 30)
-
-        trend_1h = 0; rsi_1h = 50.0
-        if c1h and len(c1h) >= 25:
-            e9_1h = ema(c1h, 9); e21_1h = ema(c1h, 21)
-            rsi_1h = rsi(c1h, 14)
-            if e9_1h > e21_1h: trend_1h = 1
-            elif e9_1h < e21_1h: trend_1h = -1
-
-        # v6.0: 1h debe ser alcista
-        if trend_1h != 1: return None
-
-        # v6.0: RSI 1h no sobrecomprado
-        if rsi_1h > 65: return None
-
-        trend_4h = 0
-        if c4h and len(c4h) >= 21:
-            e9_4h = ema(c4h, 9); e21_4h = ema(c4h, 21)
-            if e9_4h > e21_4h: trend_4h = 1
-            elif e9_4h < e21_4h: trend_4h = -1
-
-        # v6.0: 4h SIEMPRE debe ser alcista (no solo en neutral)
-        if trend_4h != 1: return None
-
-        atr_v   = atr_calc(h5, l5, c5, 14)
-        atr_pct = atr_v / price * 100 if price > 0 else 0
-        if atr_pct < 0.10 or atr_pct > ATR_HIGH_PCT * 1.5: return None
-
-        sig_aurolo = aurolo_signal(c5, h5, l5, v5, o5, atr_v)
-
-        # v6.0: Aurolo mínimo + vol ratio
-        if sig_aurolo['puntos'] < AUROLO_MIN_PTS: return None
-        if sig_aurolo['cambio_tend']: return None
-        if sig_aurolo['vol_ratio'] < VOL_RATIO_MIN: return None
-
-        vwap_val, precio_sobre_vwap = vwap_contexto(c5, h5, l5, v5, VWAP_CANDLES)
-        if VWAP_AS_FILTER and not precio_sobre_vwap: return None
-
-        sl_price = sig_aurolo['sl_price']
-        sl_pct   = sig_aurolo['sl_pct']
-        if sl_pct < SL_MIN_PCT * 0.9 or sl_pct > SL_MAX_PCT * 1.1: return None
-
-        tp1_price = price * (1 + sl_pct * TP1_RATIO / 100)
-        tp2_price = price * (1 + sl_pct * TP2_RATIO / 100)
-        tp_ref    = max(sl_pct * MIN_RR, TP_MIN, atr_pct * ATR_TP_M)
-        rr        = tp_ref / sl_pct if sl_pct > 0 else 0
-        if rr < MIN_RR * 0.80: return None
-
-        # v6.0: TP1 neto debe cubrir comisiones taker con margen
-        tp1_neto = sl_pct * TP1_RATIO - FEE_COST_PCT
-        if tp1_neto < 0.6: return None  # v6.0: era 0.3 — margen real
-
-        # Smart Money
-        ofi_ratio, ofi_desc = order_flow_imbalance(c5, o5, v5, n=10)
-
-        trend_15m = 0
+        ofi_r=ofi(c5,o5,v5,10)
+        trend_15=0
         try:
-            c15, h15, l15, v15, o15 = self._klines(symbol, '15m', 40)
-            if c15 and len(c15) >= 25:
-                e9_15 = ema(c15, 9); e21_15 = ema(c15, 21)
-                trend_15m = 1 if e9_15 > e21_15 else -1
+            c15,*_=self._klines(symbol,'15m',40)
+            if c15 and len(c15)>=25:
+                trend_15=1 if ema(c15,9)>ema(c15,21) else -1
         except: pass
 
-        # v6.0: GATE 8 — Requiere al menos OFI alcista O MTF15m alcista
-        ofi_bull = ofi_ratio >= OFI_BULL_THRESH
-        mtf_bull = trend_15m == 1
-        if not ofi_bull and not mtf_bull: return None
+        if ofi_r<0.58 and trend_15!=1: return None
 
         # ── SCORING ──────────────────────────────────────────────────────
-        score = 0; reasons = []; factors = []
-        pts   = sig_aurolo['puntos']
+        score=0; factors=[]
+        pts=sig['puntos']
+        if pts==3: score+=55; factors.append("aurolo_3")
+        elif pts==2: score+=35; factors.append("aurolo_2")
+        if sig['p1']: score+=10; factors.append("p1")
+        if sig['p2']: score+=10; factors.append("p2")
+        if sig['p3']: score+=10; factors.append("p3")
+        if sig['wt_now']<=WT_OS1: score+=8; factors.append("wt_deep")
+        elif sig['wt_now']<=WT_OS2: score+=4; factors.append("wt_os")
+        vr=sig['vol_ratio']
+        if vr>=2.5: score+=12; factors.append("vol_fuerte")
+        elif vr>=1.8: score+=7; factors.append("vol_medio")
+        elif vr>=1.5: score+=3; factors.append("vol_ok")
+        score+=12; factors.append("trend_1h")
+        score+=10; factors.append("trend_4h")
+        if trend_15==1: score+=15; factors.append("mtf_15m")
+        else: score-=5
+        if ofi_r>=0.58: score+=12; factors.append("ofi_bull")
+        else: score-=5
+        score+=8; factors.append("vwap_ok")
+        if self._regime=='bull': score+=12; factors.append("bull")
+        elif self._regime=='neutral': score+=5
+        if self._btc_1h>1.0: score+=8; factors.append("btc_up")
+        elif self._btc_1h>0.3: score+=4
+        if self._btc_4h>1.5: score+=8; factors.append("btc4h_up")
+        if rsi_1h<40: score+=8; factors.append("rsi_os")
+        elif rsi_1h<55: score+=4
+        if self._breadth>0.70: score+=10; factors.append("breadth_great")
+        elif self._breadth>0.55: score+=5
+        if sl_pct<SL_MAX_PCT*0.5: score+=6
 
-        # Base Aurolo
-        if pts == 3:   score += 55; reasons.append("Aurolo3/3(55)"); factors.append("aurolo_3")
-        elif pts == 2: score += 35; reasons.append("Aurolo2/3(35)"); factors.append("aurolo_2")
+        # v8.0 FIX 2 + v7.0: scanner confidence
+        sc_conf=self.scanner.get_confidence(symbol)
 
-        if sig_aurolo['p1']: score += 10; factors.append("p1_tend")
-        if sig_aurolo['p2']: score += 10; factors.append("p2_wt")
-        if sig_aurolo['p3']: score += 10; factors.append("p3_adx")
-
-        wt_val = sig_aurolo['wt_now']
-        if wt_val <= WT_OS1:   score += 8; factors.append("wt_deep")
-        elif wt_val <= WT_OS2: score += 4; factors.append("wt_os")
-
-        adx_val = sig_aurolo['adx_now']
-        if adx_val > ADX_KEY * 1.4: score += 6; factors.append("adx_strong")
-
-        vr = sig_aurolo['vol_ratio']
-        if vr >= 2.5:   score += 12; factors.append("vol_fuerte")
-        elif vr >= 1.8: score += 7;  factors.append("vol_medio")
-        elif vr >= 1.5: score += 3;  factors.append("vol_ok")
-
-        if precio_sobre_vwap: score += 8; factors.append("vwap_arriba")
-
-        # Trend (1h y 4h ya validados como +1)
-        score += 12; factors.append("trend_1h_up")
-        score += 10; factors.append("trend_4h_up")
-
-        # MTF 15m
-        if mtf_bull:  score += MTF_SCORE_BONUS; factors.append("mtf_15m_bull"); reasons.append(f"MTF15m(+{int(MTF_SCORE_BONUS)})")
-        else:         score -= 5;               factors.append("mtf_15m_miss")
-
-        # OFI
-        if ofi_bull:  score += OFI_SCORE_BONUS; factors.append("ofi_bull"); reasons.append(f"OFI({int(ofi_ratio*100)}%)")
-        else:         score -= 5;               factors.append("ofi_miss")
-
-        # Régimen
-        if self._regime == 'bull':    score += 12; factors.append("regime_bull")
-        elif self._regime == 'neutral': score += 5; factors.append("regime_neutral")
-
-        # BTC
-        if self._btc_1h > 1.0:    score += 8; factors.append("btc_up")
-        elif self._btc_1h > 0.3:  score += 4; factors.append("btc_ok")
-
-        if self._btc_4h > 1.5:   score += 8; factors.append("btc4h_up")
-
-        # RSI
-        if rsi_1h < 40:   score += 8; factors.append("rsi_1h_os")
-        elif rsi_1h < 55: score += 4; factors.append("rsi_1h_ok")
-
-        # Breadth
-        if self._breadth > 0.70:   score += 10; factors.append("breadth_great")
-        elif self._breadth > 0.55: score += 5;  factors.append("breadth_good")
-
-        # SL ajustado
-        if sl_pct < SL_MAX_PCT * 0.5: score += 6; factors.append("sl_tight")
-
-        # Aprendizaje
-        bonus_p = self.learn.bonus_pts(pts)
-        if bonus_p != 0: score += bonus_p
-        adj = self.learn.adj(factors)
-        if adj != 0: score += adj
-
-        score_min = self._score_min_for_regime()
-        if score < score_min:
-            self.stats['filtered_score'] += 1
-            log.debug(f"  {symbol}: score {int(score)}<{int(score_min)}")
+        # GATE: si SCANNER_REQUIRED=true, bloquear entradas sin confirmación del scanner
+        # Esto evita que Aurolo solo opere sin el filtro de explosión de volumen
+        if SCANNER_REQUIRED and sc_conf < SCAN_MIN_CONF:
+            log.debug(f"  {symbol}: scanner {sc_conf}%<{SCAN_MIN_CONF}% → bloqueado")
             return None
 
-        ok, reason = self.learn.ok(symbol, score)
+        if sc_conf>=80: score+=20; factors.append("scanner_critico")
+        elif sc_conf>=65: score+=12; factors.append("scanner_alto")
+        elif sc_conf>=50: score+=6; factors.append("scanner_medio")
+
+        score+=self.learn.adj(factors)
+        score_min=self._score_min()
+        if score<score_min: return None
+
+        ok,_=self.learn.ok(symbol,score)
         if not ok: return None
 
-        # Anti-hunt SL
-        sl_price = sl_anti_hunt(sl_price, price)
-        sl_pct   = (price - sl_price) / price * 100
+        sl_price=sl_anti_hunt(sl_price,price)
+        sl_pct=(price-sl_price)/price*100
 
-        # Size multiplier si ATR alto
-        size_mult = 0.5 if atr_pct > ATR_HIGH_PCT else 1.0
+        # v7.0: size_mult según volatilidad Y confianza del scanner
+        size_mult=0.5 if atr_pct>3.5 else 1.0
+        if SCAN_SIZE_BOOST and sc_conf>=80 and size_mult==1.0:
+            size_mult=1.25  # +25% size en señales de máxima calidad
 
-        return {
-            'price': price, 'change': change_24, 'score': score, 'score_min': score_min,
-            'aurolo_pts': pts, 'aurolo_p1': sig_aurolo['p1'],
-            'aurolo_p2': sig_aurolo['p2'], 'aurolo_p3': sig_aurolo['p3'],
-            'aurolo_wt': sig_aurolo['wt_now'], 'aurolo_adx': sig_aurolo['adx_now'],
-            'aurolo_desc': sig_aurolo['descripcion'], 'aurolo_señal': sig_aurolo['señal'],
-            'sl_price': round(sl_price, 8), 'sl_pct': round(sl_pct, 3),
-            'tp1_price': round(tp1_price, 8), 'tp2_price': round(tp2_price, 8),
-            'tp_pct': round(tp_ref, 2), 'rr': round(rr, 2), 'tp1_neto': round(tp1_neto, 3),
-            'vwap': vwap_val, 'ema25': ema(c5, 25), 'ema55': sig_aurolo['ema55'],
-            'trend_1h': trend_1h, 'trend_4h': trend_4h, 'trend_15m': trend_15m,
-            'rsi_1h': rsi_1h, 'ofi_ratio': ofi_ratio, 'ofi_desc': ofi_desc,
-            'vol_ratio': vr, 'atr_pct': atr_pct, 'size_mult': size_mult,
-            'reasons': ' | '.join(reasons), 'factors': factors,
-            'hora_utc': hora, 'btc_dir': self._btc_dir(),
-            'precio_sobre_vwap': precio_sobre_vwap,
-            'regime': self._regime, 'breadth': self._breadth,
-        }
+        return {'price':price,'change':chg,'score':score,'score_min':score_min,
+                'aurolo_pts':pts,'aurolo_p1':sig['p1'],'aurolo_p2':sig['p2'],'aurolo_p3':sig['p3'],
+                'aurolo_wt':sig['wt_now'],'aurolo_adx':sig['adx_now'],
+                'aurolo_señal':sig['señal'],'aurolo_desc':sig['descripcion'],
+                'sl_price':round(sl_price,8),'sl_pct':round(sl_pct,3),
+                'tp1_price':round(tp1,8),'tp2_price':round(tp2,8),
+                'rr':round(rr,2),'tp1_neto':round(sl_pct*TP1_RATIO-FEE_COST_PCT,3),
+                'vwap':vwap,'ema25':ema(c5,25),'ema55':sig['ema55'],
+                'trend_15m':trend_15,'rsi_1h':rsi_1h,'ofi':ofi_r,'atr_pct':atr_pct,
+                'factors':factors,'hora_utc':hora,'btc_dir':self._btc_dir(),
+                'regime':self._regime,'breadth':self._breadth,'size_mult':size_mult,
+                'scanner_conf':sc_conf}
 
-    def _set_lev(self, sym):
-        for side in ('LONG', 'SHORT'):
-            try: api('POST', '/openApi/swap/v2/trade/leverage',
-                     {'symbol': sym, 'side': side, 'leverage': str(LEVERAGE)})
+    def _analyze_parallel(self, symbols):
+        results=[]
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futures={ex.submit(self.analyze,sym):sym for sym in symbols}
+            for fut in as_completed(futures):
+                try:
+                    sig=fut.result()
+                    if sig: results.append((futures[fut],sig))
+                except: pass
+        results.sort(key=lambda x:x[1]['score'],reverse=True)
+        return results
+
+    # ── TRADING ──────────────────────────────────────────────────────────
+
+    def _set_lev(self,sym):
+        for s in ('LONG','SHORT'):
+            try: api('POST','/openApi/swap/v2/trade/leverage',{'symbol':sym,'side':s,'leverage':str(LEVERAGE)})
             except: pass
 
-    def _calc_qty(self, sym, price, sl_price, size_mult=1.0):
-        info  = self._contracts.get(sym, {'step': 1, 'prec': 2, 'ctval': 1})
-        step  = max(float(info.get('step', 1)), 1e-6)
-        prec  = int(info.get('prec', 2))
-        ctval = max(float(info.get('ctval', 1)), 1e-9)
-        ppc   = price * ctval
-        if ppc <= 0: return None, 0
-        dist_pct = (price - sl_price) / price * 100 if sl_price < price else SL_MIN_PCT
-        riesgo   = ACCOUNT_EQUITY * (RISK_PCT / 100)
-        notional = min(riesgo / (dist_pct / 100), POS_SIZE * LEVERAGE) * size_mult
-        notional = max(notional, MIN_TRADE)
-        qty = math.ceil((notional / ppc) / step) * step
-        qty = round(qty, prec); val = qty * ppc
+    def _calc_qty(self,sym,price,sl_price,size_mult=1.0):
+        info=self._contracts.get(sym,{'step':1,'prec':2,'ctval':1})
+        step=max(float(info.get('step',1)),1e-6); prec=int(info.get('prec',2))
+        ctval=max(float(info.get('ctval',1)),1e-9); ppc=price*ctval
+        if ppc<=0: return None,0
+        dist=(price-sl_price)/price*100 if sl_price<price else SL_MIN_PCT
+        notional=min(ACCOUNT_EQUITY*(RISK_PCT/100)/(dist/100),POS_SIZE*LEVERAGE)*size_mult
+        notional=max(notional,MIN_TRADE)
+        qty=math.ceil((notional/ppc)/step)*step; qty=round(qty,prec); val=qty*ppc
         for _ in range(200):
-            if val >= MIN_TRADE: break
-            qty += step; qty = round(qty, prec); val = qty * ppc
-        return (qty, round(val, 4)) if val >= MIN_TRADE else (None, 0)
+            if val>=MIN_TRADE: break
+            qty+=step; qty=round(qty,prec); val=qty*ppc
+        return (qty,round(val,4)) if val>=MIN_TRADE else (None,0)
 
-    def _order(self, sym, side, qty, otype='MARKET', price=None, stop_price=None,
-               reduce_only=False, activation_price=None, price_rate=None):
-        params = {'symbol': sym, 'side': side.upper(), 'type': otype, 'quantity': str(qty)}
-        if self._mode == 'hedge': params['positionSide'] = 'LONG'
+    def _order(self,sym,side,qty,otype='MARKET',price=None,stop_price=None,
+               activation_price=None,price_rate=None):
+        params={'symbol':sym,'side':side.upper(),'type':otype,'quantity':str(qty)}
+        if self._mode=='hedge': params['positionSide']='LONG'
         else:
-            if side.upper() == 'SELL' or reduce_only: params['reduceOnly'] = 'true'
-        if price:            params['price'] = str(round(price, 8)); params['timeInForce'] = 'GTC'
-        if stop_price:       params['stopPrice'] = str(round(stop_price, 8))
-        if activation_price: params['activationPrice'] = str(round(activation_price, 8))
-        if price_rate:       params['priceRate'] = str(price_rate)
-        return api('POST', '/openApi/swap/v2/trade/order', params)
+            if side.upper()=='SELL': params['reduceOnly']='true'
+        if price: params['price']=str(round(price,8)); params['timeInForce']='GTC'
+        if stop_price: params['stopPrice']=str(round(stop_price,8))
+        if activation_price: params['activationPrice']=str(round(activation_price,8))
+        if price_rate: params['priceRate']=str(price_rate)
+        return api('POST','/openApi/swap/v2/trade/order',params)
 
-    def _confirm_pos(self, sym, timeout=15):
+    def _confirm_pos(self,sym,timeout=15):
         for _ in range(timeout):
-            d = api('GET', '/openApi/swap/v2/user/positions', {'symbol': sym})
+            d=api('GET','/openApi/swap/v2/user/positions',{'symbol':sym})
             for p in (d.get('data') or []):
-                amt  = float(p.get('positionAmt', 0) or 0)
-                side = str(p.get('positionSide', '')).upper()
-                if (side == 'LONG' and abs(amt) > 0) or (side == 'BOTH' and amt > 0):
-                    return abs(amt), float(p.get('avgPrice') or p.get('entryPrice') or 0)
+                amt=float(p.get('positionAmt',0) or 0); side=str(p.get('positionSide','')).upper()
+                if (side=='LONG' and abs(amt)>0) or (side=='BOTH' and amt>0):
+                    return abs(amt),float(p.get('avgPrice') or p.get('entryPrice') or 0)
             time.sleep(1)
-        return None, None
+        return None,None
 
-    def _cancel_open(self, sym):
-        d = api('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': sym})
-        for o in (d.get('data', {}).get('orders') or []):
-            oid = o.get('orderId')
+    def _cancel_open(self,sym):
+        d=api('GET','/openApi/swap/v2/trade/openOrders',{'symbol':sym})
+        for o in (d.get('data',{}).get('orders') or []):
+            oid=o.get('orderId')
+            if oid: api('DELETE','/openApi/swap/v2/trade/order',{'symbol':sym,'orderId':str(oid)}); time.sleep(0.1)
+
+    def _cancel_open_except_last(self, sym):
+        """v8.0 FIX 4: cancela todos los SL abiertos EXCEPTO el más reciente.
+        Usar después de colocar un nuevo SL para no dejar gap de protección."""
+        d=api('GET','/openApi/swap/v2/trade/openOrders',{'symbol':sym})
+        orders = d.get('data',{}).get('orders') or []
+        # Ordenar por tiempo descendente — conservar el más nuevo (índice 0)
+        stop_orders = [o for o in orders
+                       if 'STOP' in str(o.get('type','')).upper()
+                       or 'TRAIL' in str(o.get('type','')).upper()]
+        stop_orders.sort(key=lambda x: int(x.get('time', 0) or 0), reverse=True)
+        for o in stop_orders[1:]:  # conservar el primero (más reciente)
+            oid=o.get('orderId')
             if oid:
-                api('DELETE', '/openApi/swap/v2/trade/order', {'symbol': sym, 'orderId': str(oid)})
+                api('DELETE','/openApi/swap/v2/trade/order',{'symbol':sym,'orderId':str(oid)})
                 time.sleep(0.1)
 
-    def _place_sl(self, sym, qty, sl_price):
-        d = self._order(sym, 'SELL', qty, 'STOP_MARKET', stop_price=sl_price)
-        if d.get('code') == 0: return True
-        d = self._order(sym, 'SELL', qty, 'STOP',
-                        price=sl_price * 0.999, stop_price=sl_price)
-        if d.get('code') == 0: return True
-        d = self._order(sym, 'SELL', qty, 'STOP_MARKET', stop_price=sl_price * 0.998)
-        return d.get('code') == 0
+    def _place_sl(self,sym,qty,sl):
+        d=self._order(sym,'SELL',qty,'STOP_MARKET',stop_price=sl)
+        if d.get('code')==0: return True
+        d=self._order(sym,'SELL',qty,'STOP',price=sl*0.999,stop_price=sl)
+        if d.get('code')==0: return True
+        d=self._order(sym,'SELL',qty,'STOP_MARKET',stop_price=sl*0.998)
+        return d.get('code')==0
 
-    def _place_trailing_stop(self, sym, qty, activation_price, trail_rate_pct):
-        params = {'symbol': sym, 'side': 'SELL', 'type': 'TRAILING_STOP_MARKET',
-                  'quantity': str(qty), 'activationPrice': str(round(activation_price, 8)),
-                  'priceRate': str(trail_rate_pct)}
-        if self._mode == 'hedge': params['positionSide'] = 'LONG'
-        else: params['reduceOnly'] = 'true'
-        d = api('POST', '/openApi/swap/v2/trade/order', params)
-        return d.get('code') == 0
+    def _place_trail(self,sym,qty,act,rate):
+        params={'symbol':sym,'side':'SELL','type':'TRAILING_STOP_MARKET',
+                'quantity':str(qty),'activationPrice':str(round(act,8)),'priceRate':str(rate)}
+        if self._mode=='hedge': params['positionSide']='LONG'
+        else: params['reduceOnly']='true'
+        return api('POST','/openApi/swap/v2/trade/order',params).get('code')==0
 
-    def _chase_limit_entry(self, sym, qty):
-        d = pub('/openApi/swap/v2/quote/bookTicker', {'symbol': sym})
-        ask_price = None
-        if d.get('code') == 0 and d.get('data'):
-            ask_price = float(d['data'].get('askPrice', 0) or 0)
-        if not ask_price or ask_price <= 0:
-            tk = self._ticker(sym)
-            if tk: ask_price = tk['price'] * 1.0002
-        if not ask_price: return None, None
-        limit_price = round(ask_price * 1.0005, 8)
-        d = self._order(sym, 'BUY', qty, 'LIMIT', price=limit_price)
-        if d.get('code') != 0:
-            d = self._order(sym, 'BUY', qty, 'MARKET')
-            if d.get('code') != 0: return None, None
+    def _entry(self,sym,qty):
+        """v8.0 FIX 5: timeout global de ENTRY_TIMEOUT segundos.
+        Evita bloquear el loop principal si BingX está lento."""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(self._entry_inner, sym, qty)
+            try:
+                return fut.result(timeout=ENTRY_TIMEOUT)
+            except FuturesTimeout:
+                log.warning(f"  ⏱️ _entry timeout {ENTRY_TIMEOUT}s — {sym}")
+                # Intentar cancelar la orden limit si quedó pendiente
+                try: self._cancel_open(sym)
+                except: pass
+                return None, None
+            except Exception as e:
+                log.error(f"  _entry error {sym}: {e}")
+                return None, None
+
+    def _entry_inner(self,sym,qty):
+        d=pub('/openApi/swap/v2/quote/bookTicker',{'symbol':sym})
+        ask=None
+        if d.get('code')==0 and d.get('data'): ask=float(d['data'].get('askPrice',0) or 0)
+        if not ask or ask<=0:
+            tk=self._ticker(sym)
+            if tk: ask=tk['price']*1.0002
+        if not ask: return None,None
+        limit=round(ask*1.0005,8)
+        d=self._order(sym,'BUY',qty,'LIMIT',price=limit)
+        if d.get('code')!=0: d=self._order(sym,'BUY',qty,'MARKET')
+        if d.get('code')!=0: return None,None
         for _ in range(12):
             time.sleep(1)
-            fq, fp = self._confirm_pos(sym, 1)
-            if fq and fp: return fq, fp
+            fq,fp=self._confirm_pos(sym,1)
+            if fq and fp: return fq,fp
         self._cancel_open(sym)
         time.sleep(0.5)
-        fq, fp = self._confirm_pos(sym, 2)
-        if fq: return fq, fp
-        dm = self._order(sym, 'BUY', qty, 'MARKET')
-        if dm.get('code') == 0: return self._confirm_pos(sym, 10)
-        return None, None
+        fq,fp=self._confirm_pos(sym,2)
+        if fq: return fq,fp
+        dm=self._order(sym,'BUY',qty,'MARKET')
+        if dm.get('code')==0: return self._confirm_pos(sym,10)
+        return None,None
 
-    def open_trade(self, sym, sig):
+    def open_trade(self,sym,sig):
         if not AUTO or sym in self.trades: return False
-        if LongBot._opening or len(self.trades) >= MAX_TRADES: return False
-        if self._daily_trades >= MAX_DAILY_TRADES: return False
-        if sym in self._pending_orders: return False
-        if self._has_any_position(sym):
-            log.warning(f"  ⛔ {sym} ya tiene posición"); return False
-        LongBot._opening = True
-        try: return self._open(sym, sig)
-        finally: LongBot._opening = False
+        if Bot._opening or len(self.trades)>=MAX_TRADES: return False
+        if self._daily_trades>=MAX_DAILY: return False
+        if sym in self._pending: return False
+        if self._has_pos(sym): return False
+        Bot._opening=True
+        try: return self._open(sym,sig)
+        finally: Bot._opening=False
 
-    def _open(self, sym, sig):
-        price    = sig['price']
-        sl_price = sig['sl_price']
-        pts      = sig['aurolo_pts']
-        label    = sig['aurolo_señal']
-        size_mult= sig.get('size_mult', 1.0)
+    def _open(self,sym,sig):
+        price=sig['price']; sl_price=sig['sl_price']; pts=sig['aurolo_pts']
+        label=sig['aurolo_señal']; size_mult=sig.get('size_mult',1.0)
+        sc=sig.get('scanner_conf',0)
 
-        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1")
+        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{int(sig['score'])}/{int(sig['score_min'])} "
+                 f"| Scanner:{sc}% | RR:{sig['rr']:.2f}:1")
         self._set_lev(sym); time.sleep(0.2)
-        qty, notional = self._calc_qty(sym, price, sl_price, size_mult)
+        qty,notional=self._calc_qty(sym,price,sl_price,size_mult)
         if not qty: return False
 
-        if size_mult < 1.0:
-            log.info(f"  ⚠️ Volatilidad alta ATR={sig.get('atr_pct',0):.1f}% → size x{size_mult}")
+        self._pending[sym]='pending'
+        fq,fp=self._entry(sym,qty)
+        if not fq or not fp: log.error(f"  ❌ {sym}"); self._pending.pop(sym,None); return False
 
-        self._pending_orders[sym] = 'pending'
-        filled_qty, fill_price = self._chase_limit_entry(sym, qty)
-        if not filled_qty or not fill_price:
-            log.error(f"  ❌ No se pudo abrir {sym}")
-            self._pending_orders.pop(sym, None)
-            return False
+        sl_pct=sig['sl_pct']
+        sl_r=sl_anti_hunt(fp*(1-sl_pct/100), fp)
+        sl_r=max(sl_r, fp*(1-SL_MAX_PCT/100)); sl_r=min(sl_r, fp*(1-SL_MIN_PCT/100))
+        tp1=fp*(1+sl_pct*TP1_RATIO/100); tp2=fp*(1+sl_pct*TP2_RATIO/100)
 
-        sl_pct_real = sig['sl_pct']
-        sl_real     = fill_price * (1 - sl_pct_real / 100)
-        sl_real     = sl_anti_hunt(sl_real, fill_price)
-        sl_real     = max(sl_real, fill_price * (1 - SL_MAX_PCT / 100))
-        sl_real     = min(sl_real, fill_price * (1 - SL_MIN_PCT / 100))
-
-        tp1_price = fill_price * (1 + sl_pct_real * TP1_RATIO / 100)
-        tp2_price = fill_price * (1 + sl_pct_real * TP2_RATIO / 100)
-
-        sl_ok = self._place_sl(sym, filled_qty, sl_real)
+        sl_ok=self._place_sl(sym,fq,sl_r)
         if not sl_ok:
-            time.sleep(2); sl_ok = self._place_sl(sym, filled_qty, sl_real)
+            time.sleep(2); sl_ok=self._place_sl(sym,fq,sl_r)
         if not sl_ok:
-            log.error("  ❌ SL crítico — cerrando posición")
-            self._order(sym, 'SELL', filled_qty, 'MARKET')
-            self._pending_orders.pop(sym, None)
-            return False
+            log.error("  ❌ SL crítico — cerrando")
+            self._order(sym,'SELL',fq,'MARKET'); self._pending.pop(sym,None); return False
 
-        trailing_placed = False
-        if USE_TRAILING_EXIT:
-            activation = fill_price * (1 + TRAIL_ACTIVATION / 100)
-            trailing_placed = self._place_trailing_stop(sym, filled_qty, activation, TRAIL_RATE_PCT)
-            if not trailing_placed:
-                log.info(f"  🔧 Trailing Exchange rechazado — gestión manual activada")
+        trail_placed=False
+        if USE_TRAIL:
+            act=fp*(1+TRAIL_ACT/100)
+            trail_placed=self._place_trail(sym,fq,act,TRAIL_RATE)
+            if not trail_placed: log.info(f"  🔧 Trail manual para {sym}")
 
-        trade = {
-            'entry': fill_price, 'qty_total': filled_qty, 'qty_runner': filled_qty,
-            'qty_tp1': round(filled_qty * TP1_PCT/100, 6),
-            'qty_tp2': round(filled_qty * TP2_PCT/100, 6),
-            'tp1_hit': False, 'tp2_hit': False,
-            'tp1_price': tp1_price, 'tp2_price': tp2_price,
-            'sl': sl_real, 'sl_orig': sl_real, 'sl_pct': sl_pct_real,
-            'trailing_sl': sl_real,   # v6.0: tracking del trailing manual
-            'highest': fill_price, 'opened': datetime.now(),
-            'score': sig['score'], 'ema25': sig['ema25'], 'ema55': sig['ema55'],
-            'aurolo_pts': pts, 'entrada_label': label,
-            'vwap': sig['vwap'], 'usdt': POS_SIZE, 'pnl_parcial': 0.0,
-            'factors': sig['factors'], 'hora_utc': sig['hora_utc'],
-            'btc_dir': sig['btc_dir'], 'debilidad_alertada': False,
-            'trailing_placed': trailing_placed, 'size_mult': size_mult,
-        }
-        self.trades[sym] = trade
-        self._pending_orders.pop(sym, None)
-        self.stats['exec'] += 1
-        self.stats['fees'] += notional * FEE_TAKER
-        self._daily_trades += 1
+        trade={'entry':fp,'qty_total':fq,'qty_runner':fq,
+               'qty_tp1':round(fq*TP1_PCT/100,6),'qty_tp2':round(fq*TP2_PCT/100,6),
+               'tp1_hit':False,'tp2_hit':False,'tp1_price':tp1,'tp2_price':tp2,
+               'sl':sl_r,'sl_orig':sl_r,'sl_pct':sl_pct,'trailing_sl':sl_r,
+               'highest':fp,'opened':datetime.now(),'score':sig['score'],
+               'aurolo_pts':pts,'entrada_label':label,'vwap':sig['vwap'],
+               'usdt':POS_SIZE,'pnl_parcial':0.0,'factors':sig['factors'],
+               'hora_utc':sig['hora_utc'],'btc_dir':sig['btc_dir'],
+               'debilidad_alertada':False,'trailing_placed':trail_placed,
+               'size_mult':size_mult,'scanner_conf':sc}
+        self.trades[sym]=trade; self._pending.pop(sym,None)
+        self.stats['exec']+=1; self.stats['fees']+=notional*FEE_TAKER
+        self._daily_trades+=1
 
-        p1 = "✅" if sig['aurolo_p1'] else "❌"
-        p2 = "✅" if sig['aurolo_p2'] else "❌"
-        p3 = "✅" if sig['aurolo_p3'] else "❌"
-        size_tag = f" [x{size_mult}]" if size_mult < 1.0 else ""
+        p1="✅" if sig['aurolo_p1'] else "❌"
+        p2="✅" if sig['aurolo_p2'] else "❌"
+        p3="✅" if sig['aurolo_p3'] else "❌"
+        size_tag=f" [x{size_mult:.2f}]" if size_mult!=1.0 else ""
+        sc_tag=f"🔴 {sc}%" if sc>=80 else f"🟠 {sc}%" if sc>=65 else f"🟡 {sc}%" if sc>0 else "—"
 
         self._tg(
             f"<b>🟢 LONG [{label}]</b> — <b>{sym}</b>{size_tag}\n"
-            f"Score: {int(sig['score'])}/{int(sig['score_min'])} | RR: {sig['rr']:.2f}:1 | {sig['regime']}\n"
+            f"Score: {int(sig['score'])}/{int(sig['score_min'])} | Scanner: {sc_tag}\n"
+            f"RR: {sig['rr']:.2f}:1 | {sig['regime']} | Breadth: {int(self._breadth*100)}%\n"
             f"{p1} P1 EMA55  {p2} P2 WT:{sig['aurolo_wt']:.1f}  {p3} P3 ADX:{sig['aurolo_adx']:.1f}\n"
-            f"OFI: {sig.get('ofi_desc','?')} | MTF15m: {'✅' if sig.get('trend_15m')==1 else '❌'}\n"
-            f"📍 ${fill_price:.6f} | SL: ${sl_real:.6f} (-{sl_pct_real:.2f}%)\n"
-            f"TP1: ${tp1_price:.6f} (+{sl_pct_real*TP1_RATIO:.2f}%) | TP2: ${tp2_price:.6f}\n"
-            f"Trailing: {'✅ Exchange' if trailing_placed else '🔧 Manual'} | BTC 1h: {self._btc_1h:+.2f}%"
+            f"OFI: {int(sig.get('ofi',0.5)*100)}% | MTF15m: {'✅' if sig.get('trend_15m')==1 else '❌'}\n"
+            f"📍 ${fp:.6f} | SL: ${sl_r:.6f} (-{sl_pct:.2f}%)\n"
+            f"TP1: ${tp1:.6f} (+{sl_pct*TP1_RATIO:.2f}%)\n"
+            f"TP2: ${tp2:.6f} (+{sl_pct*TP2_RATIO:.2f}%)\n"
+            f"Trailing: {'✅' if trail_placed else '🔧 Manual'} | BTC: {self._btc_1h:+.2f}%"
         )
         return True
 
-    def _close_partial(self, sym, qty, exit_price, label):
-        if qty <= 0: return 0
-        d = self._order(sym, 'SELL', qty, 'MARKET')
-        if d.get('code') != 0: return 0
-        t = self.trades[sym]
-        chg  = (exit_price - t['entry']) / t['entry']
-        frac = qty / t['qty_total']
-        net  = POS_SIZE * LEVERAGE * chg * frac - POS_SIZE * LEVERAGE * FEE_TAKER * 2 * frac
-        t['pnl_parcial'] += net; t['qty_runner'] -= qty
-        self.stats['fees']  += POS_SIZE * LEVERAGE * FEE_TAKER * 2 * frac
-        self._daily_pnl     += net; self.stats['pnl'] += net
+    def _close_partial(self,sym,qty,exit_price,label):
+        if qty<=0: return 0
+        d=self._order(sym,'SELL',qty,'MARKET')
+        if d.get('code')!=0: return 0
+        t=self.trades[sym]; chg=(exit_price-t['entry'])/t['entry']
+        frac=qty/t['qty_total']
+        net=POS_SIZE*LEVERAGE*chg*frac - POS_SIZE*LEVERAGE*FEE_TAKER*2*frac
+        t['pnl_parcial']+=net; t['qty_runner']-=qty
+        self.stats['fees']+=POS_SIZE*LEVERAGE*FEE_TAKER*2*frac
+        self._daily_pnl+=net; self.stats['pnl']+=net
         log.info(f"  💰 {label} {sym}: ${net:+.4f}")
-        self._tg(f"<b>💰 {label}</b> — {sym}\n${exit_price:.6f}\nPnL parcial: ${net:+.4f}")
+        self._tg(f"<b>💰 {label}</b> — {sym}\n${exit_price:.6f}\nPnL: ${net:+.4f}")
         return net
 
-    def _close_all(self, sym, exit_price, reason):
+    def _close_all(self,sym,exit_price,reason):
         if sym not in self.trades: return False
-        t = self.trades[sym]
-        qty_rem = t['qty_runner']
-        if qty_rem > 0: self._order(sym, 'SELL', qty_rem, 'MARKET')
-        frac_r = qty_rem / t['qty_total'] if t['qty_total'] > 0 else 0
-        chg_r  = (exit_price - t['entry']) / t['entry']
-        net_r  = POS_SIZE * LEVERAGE * chg_r * frac_r - POS_SIZE * LEVERAGE * FEE_TAKER * 2 * frac_r
-        net_total = t['pnl_parcial'] + net_r
-        win = net_total > 0
-
-        self.stats['closed'] += 1; self.stats['pnl'] += net_r
-        self.stats['fees']   += POS_SIZE * LEVERAGE * FEE_TAKER * 2 * frac_r
-        self._daily_pnl      += net_r
-        if win: self.stats['wins'] += 1
-        else:   self.stats['losses'] += 1
-
-        total = self.stats['wins'] + self.stats['losses']
-        wr    = self.stats['wins'] / total * 100 if total else 0
-        mins  = int((datetime.now() - t['opened']).total_seconds() / 60)
-
+        t=self.trades[sym]; qr=t['qty_runner']
+        if qr>0: self._order(sym,'SELL',qr,'MARKET')
+        fr=qr/t['qty_total'] if t['qty_total']>0 else 0
+        chg=(exit_price-t['entry'])/t['entry']
+        net_r=POS_SIZE*LEVERAGE*chg*fr - POS_SIZE*LEVERAGE*FEE_TAKER*2*fr
+        net_total=t['pnl_parcial']+net_r; win=net_total>0
+        self.stats['closed']+=1; self.stats['pnl']+=net_r
+        self.stats['fees']+=POS_SIZE*LEVERAGE*FEE_TAKER*2*fr
+        self._daily_pnl+=net_r
+        if win: self.stats['wins']+=1
+        else:   self.stats['losses']+=1
+        total=self.stats['wins']+self.stats['losses']
+        wr=self.stats['wins']/total*100 if total else 0
+        mins=int((datetime.now()-t['opened']).total_seconds()/60)
         log.info(f"  {'✅' if win else '❌'} {reason} | ${net_total:+.4f} | {mins}min | WR:{wr:.0f}%")
-
-        self.learn.record(
-            symbol=sym, score=t['score'], pnl=net_total, win=win,
-            hora_utc=t.get('hora_utc', datetime.utcnow().hour),
-            pts_aurolo=t.get('aurolo_pts', 0), btc_dir=t.get('btc_dir', 'flat'),
-            reason=reason, factors=t.get('factors', []),
-        )
-
-        if 'STOP LOSS' in reason or 'SL' in reason:
-            hours = CD_SL_FAST_HOURS if mins < CD_SL_FAST_MIN else CD_SL // 60
-            self._cooldowns[sym] = (time.time() + hours * 3600, 'SL')
-        else:
-            self._cooldowns[sym] = (time.time() + CD_TP * 60, 'TP')
-
+        self.learn.record(sym,t['score'],net_total,win,t.get('hora_utc'),
+                          t.get('aurolo_pts',0),t.get('btc_dir','flat'),reason,t.get('factors',[]))
+        if 'SL' in reason or 'STOP' in reason:
+            h=CD_SL_FAST_H if mins<CD_SL_FAST_MIN else CD_SL//60
+            self._cooldowns[sym]=(time.time()+h*3600,'SL')
+        else: self._cooldowns[sym]=(time.time()+CD_TP*60,'TP')
         self._tg(
             f"<b>{'✅' if win else '❌'} CERRADO — {reason}</b>\n"
             f"<b>{sym}</b> | {mins}min\n"
             f"${t['entry']:.6f} → ${exit_price:.6f}\n"
             f"<b>PnL: ${net_total:+.4f} | WR: {wr:.0f}%</b>\n"
-            f"Trades hoy: {self._daily_trades}/{MAX_DAILY_TRADES}"
+            f"Scanner conf: {t.get('scanner_conf',0)}%"
         )
-        if self.stats['closed'] % 3 == 0: self.learn.save()
-        del self.trades[sym]
-        self._cancel_open(sym)
-        return True
+        if self.stats['closed']%3==0: self.learn.save()
+        del self.trades[sym]; self._cancel_open(sym); return True
 
     async def monitor(self):
         for sym in list(self.trades.keys()):
             try:
-                t  = self.trades[sym]
-                tk = self._ticker(sym)
+                t=self.trades[sym]; tk=self._ticker(sym)
                 if not tk: continue
-                cur = tk['price']
+                cur=tk['price']
+                if cur>t['highest']: t['highest']=cur
 
-                c5, h5, l5, v5, _ = self._klines(sym, '5m', 80)
+                c5,h5,l5,v5,_=self._klines(sym,'5m',80)
                 if c5:
-                    t['ema25'] = ema(c5, 25)
-                    t['ema55'] = ema(c5, AUROLO_EMA_LEN)
+                    if not t.get('debilidad_alertada'):
+                        atr_l=atr_calc(h5,l5,c5,14)
+                        sl=aurolo_signal(c5,h5,l5,v5 or [1]*len(c5),c5,atr_l)
+                        if sl['debilidad']: t['debilidad_alertada']=True; self._tg(f"<b>⚠️ DEBILIDAD {sym}</b>")
+                        if sl['cambio_tend'] and (cur-t['entry'])/t['entry']*100>0.2:
+                            self._close_all(sym,cur,"CAMBIO TENDENCIA"); continue
 
-                if c5 and h5 and l5 and not t.get('debilidad_alertada', False):
-                    atr_live = atr_calc(h5, l5, c5, 14)
-                    sig_live = aurolo_signal(c5, h5, l5, v5 or [1]*len(c5), c5, atr_live)
-                    if sig_live['debilidad']:
-                        t['debilidad_alertada'] = True
-                        self._tg(f"<b>⚠️ DEBILIDAD — {sym}</b>\nConsiderar cierre manual")
-                    # Cambio de tendencia con beneficio → cerrar
-                    if sig_live['cambio_tend'] and (cur - t['entry']) / t['entry'] * 100 > 0.2:
-                        self._close_all(sym, cur, "CAMBIO TENDENCIA"); continue
+                # Trailing exchange
+                if t.get('trailing_placed') and USE_TRAIL:
+                    if cur<=t['sl']: self._close_all(sym,cur,"STOP LOSS"); continue
+                    continue
 
-                if cur > t['highest']: t['highest'] = cur
-
-                # Trailing stop exchange (si se colocó)
-                if t.get('trailing_placed') and USE_TRAILING_EXIT:
-                    if cur <= t['sl']:
-                        self._close_all(sym, cur, "STOP LOSS"); continue
-                    continue  # El exchange gestiona el trailing
-
-                # v6.0: Trailing manual robusto
-                profit_pct = (cur - t['entry']) / t['entry'] * 100
-                if USE_TRAILING_EXIT and profit_pct >= TRAIL_ACTIVATION:
-                    new_trail_sl = cur * (1 - TRAIL_RATE_PCT / 100)
-                    if new_trail_sl > t['trailing_sl']:
-                        old_sl = t['trailing_sl']
-                        t['trailing_sl'] = new_trail_sl
-                        t['sl'] = new_trail_sl
-                        # Actualizar SL en exchange
-                        self._cancel_open(sym)
-                        placed = self._place_sl(sym, t['qty_runner'], new_trail_sl)
-                        log.info(f"  🔧 Trail manual {sym}: ${old_sl:.6f}→${new_trail_sl:.6f} ({'✅' if placed else '❌'})")
+                # Trailing manual — v8.0 FIX 4: coloca el NUEVO SL primero,
+                # luego cancela el viejo → posición nunca queda sin protección
+                prof_pct=(cur-t['entry'])/t['entry']*100
+                if USE_TRAIL and prof_pct>=TRAIL_ACT:
+                    new_sl=cur*(1-TRAIL_RATE/100)
+                    if new_sl>t['trailing_sl']:
+                        old=t['trailing_sl']
+                        # 1) Colocar nuevo SL ANTES de cancelar el anterior
+                        placed=self._place_sl(sym,t['qty_runner'],new_sl)
+                        if placed:
+                            # 2) Solo si el nuevo SL fue aceptado, cancelar el viejo
+                            t['trailing_sl']=new_sl; t['sl']=new_sl
+                            self._cancel_open_except_last(sym)
+                            log.info(f"  🔧 Trail {sym}: ${old:.6f}→${new_sl:.6f} ✅")
+                        else:
+                            log.warning(f"  🔧 Trail {sym}: nuevo SL rechazado, viejo SL intacto")
 
                 # TP1
-                if not t['tp1_hit'] and cur >= t['tp1_price']:
-                    self._close_partial(sym, t['qty_tp1'], cur, f"TP1({int(TP1_PCT)}%)")
-                    t['tp1_hit'] = True
-                    be = t['entry'] * 1.001  # breakeven +0.1%
-                    if be > t['sl']:
-                        t['sl'] = be; t['trailing_sl'] = be
-                        self._cancel_open(sym)
-                        self._place_sl(sym, t['qty_runner'], be)
+                if not t['tp1_hit'] and cur>=t['tp1_price']:
+                    self._close_partial(sym,t['qty_tp1'],cur,f"TP1({int(TP1_PCT)}%)")
+                    t['tp1_hit']=True; be=t['entry']*1.001
+                    if be>t['sl']:
+                        t['sl']=be; t['trailing_sl']=be
+                        self._cancel_open(sym); self._place_sl(sym,t['qty_runner'],be)
                     continue
 
                 # TP2
-                if t['tp1_hit'] and not t['tp2_hit'] and cur >= t['tp2_price']:
-                    self._close_partial(sym, t['qty_tp2'], cur, f"TP2({int(TP2_PCT)}%)")
-                    t['tp2_hit'] = True; continue
+                if t['tp1_hit'] and not t['tp2_hit'] and cur>=t['tp2_price']:
+                    self._close_partial(sym,t['qty_tp2'],cur,f"TP2({int(TP2_PCT)}%)")
+                    t['tp2_hit']=True; continue
 
                 # SL
-                if cur <= t['sl']:
-                    self._close_all(sym, cur, "STOP LOSS")
-
+                if cur<=t['sl']: self._close_all(sym,cur,"STOP LOSS")
             except Exception as e:
                 log.debug(f"monitor {sym}: {e}")
 
-    def _cd_ok(self, sym):
-        ts = self._cooldowns.get(sym)
+    def _cd_ok(self,sym):
+        ts=self._cooldowns.get(sym)
         if not ts: return True
-        resume = ts[0] if isinstance(ts, tuple) else ts
-        if time.time() >= resume: del self._cooldowns[sym]; return True
+        resume=ts[0] if isinstance(ts,tuple) else ts
+        if time.time()>=resume: del self._cooldowns[sym]; return True
         return False
 
     def _daily_reset(self):
-        today = datetime.utcnow().date()
-        if today != self._daily_date:
-            old_trades = self._daily_trades
-            self._daily_pnl    = 0.0
-            self._daily_date   = today
-            self._daily_trades = 0
-            self._cb_active    = False
-            self._cb_until     = None
-            self.learn.streak  = 0
-            self._update_equity()
-            self._equity_start = ACCOUNT_EQUITY
-            log.info(f"📅 Nuevo día — reset diario | Trades ayer: {old_trades}")
+        today=datetime.utcnow().date()
+        if today!=self._daily_date:
+            self.scanner.daily_summary()
+            self._daily_pnl=0.0; self._daily_date=today; self._daily_trades=0
+            self._cb_active=False; self._cb_until=None; self.learn.streak=0
+            self._update_equity(); self._equity_start=ACCOUNT_EQUITY
+            log.info("📅 Nuevo día — reset diario")
+        # v8.0 FIX 3: sincronizar contador en el objeto learn para que save() lo persista
+        self.learn._persisted_daily_trades = self._daily_trades
+        self.learn._persisted_daily_date   = self._daily_date
 
     def _circuit_check(self):
         self._daily_reset()
         if self._cb_active:
-            if self._cb_until and datetime.utcnow() > self._cb_until:
-                self._cb_active = False; self._daily_pnl = 0.0
-                log.info("  🔓 Circuit breaker OFF")
+            if self._cb_until and datetime.utcnow()>self._cb_until:
+                self._cb_active=False; log.info("  🔓 Circuit breaker OFF")
             return self._cb_active
-        if self._equity_start > 0:
-            eq_loss_pct = abs(self._daily_pnl) / self._equity_start * 100
-            if self._daily_pnl < 0 and eq_loss_pct > DAILY_LOSS_CAP_PCT:
-                self._cb_active = True
-                self._cb_until  = datetime.utcnow() + timedelta(hours=CB_HOURS)
-                self._tg(f"<b>🔒 DAILY LOSS CAP</b>\n{eq_loss_pct:.1f}% | Pausa {CB_HOURS}h")
-                return True
-        cb_threshold = ACCOUNT_EQUITY * (CB_PCT / 100)
-        if self._daily_pnl < -cb_threshold:
-            self._cb_active = True
-            self._cb_until  = datetime.utcnow() + timedelta(hours=CB_HOURS)
+        if self._equity_start>0:
+            ep=abs(self._daily_pnl)/self._equity_start*100
+            if self._daily_pnl<0 and ep>DAILY_LOSS_CAP:
+                self._cb_active=True; self._cb_until=datetime.utcnow()+timedelta(hours=CB_HOURS)
+                self._tg(f"<b>🔒 DAILY LOSS CAP</b>\n{ep:.1f}% | Pausa {CB_HOURS}h"); return True
+        if self._daily_pnl<-(ACCOUNT_EQUITY*(CB_PCT/100)):
+            self._cb_active=True; self._cb_until=datetime.utcnow()+timedelta(hours=CB_HOURS)
             self._tg(f"<b>🔒 CIRCUIT BREAKER</b>\n${self._daily_pnl:.3f} | Pausa {CB_HOURS}h")
         return self._cb_active
 
     def _report(self):
-        if datetime.now() - self._last_report < timedelta(hours=2): return
-        self._last_report = datetime.now()
-        total = self.stats['wins'] + self.stats['losses']
-        wr    = self.stats['wins'] / total * 100 if total else 0
-        pos   = ""
-        for sym, t in self.trades.items():
-            tk  = self._ticker(sym); cur = tk['price'] if tk else t['entry']
-            pct = (cur - t['entry']) / t['entry'] * 100
-            pos += f"  {'✅' if pct > 0 else '📌'} {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}%\n"
-        fees_total = self.stats['fees']
+        if datetime.now()-self._last_report<timedelta(hours=2): return
+        self._last_report=datetime.now()
+        total=self.stats['wins']+self.stats['losses']
+        wr=self.stats['wins']/total*100 if total else 0
+        pos=""
+        for sym,t in self.trades.items():
+            tk=self._ticker(sym); cur=tk['price'] if tk else t['entry']
+            pct=(cur-t['entry'])/t['entry']*100
+            sc=t.get('scanner_conf',0)
+            pos+=f"  {'✅' if pct>0 else '📌'} {sym}[{t['aurolo_pts']}/3] {pct:+.2f}% | sc:{sc}%\n"
+        hot=self.scanner.get_hot(SCAN_HOT_MIN,5)
         self._tg(
-            f"<b>📊 Reporte v6.0 PRECISION</b>\n"
-            f"PnL: ${self.stats['pnl']:+.4f} | Fees: ${fees_total:.4f}\n"
-            f"WR: {wr:.0f}% ({total}t) | Hoy: {self._daily_trades}/{MAX_DAILY_TRADES}\n"
+            f"<b>📊 Reporte v7.0</b>\n"
+            f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% ({total}t)\n"
+            f"Hoy: {self._daily_trades}/{MAX_DAILY} | Fees: ${self.stats['fees']:.4f}\n"
             f"Régimen: {self._regime} | Breadth: {int(self._breadth*100)}%\n"
-            f"Filtrados — sesión:{self.stats['filtered_session']} "
-            f"régimen:{self.stats['filtered_regime']} score:{self.stats['filtered_score']}\n"
-            + (pos if pos else "  Sin posiciones\n")
+            f"Score mín: {int(self._score_min())}\n"
+            f"🔥 Hot scanner: {', '.join(hot) if hot else 'ninguno'}\n"
+            +(pos if pos else "  Sin posiciones\n")
         )
-        # Reset contadores de filtros
-        self.stats['filtered_session'] = 0
-        self.stats['filtered_regime']  = 0
-        self.stats['filtered_score']   = 0
 
-    def _tg(self, msg):
+    def _tg(self,msg):
         try:
             if TG_TOKEN and TG_CHAT:
-                requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                    json={'chat_id': TG_CHAT, 'text': msg, 'parse_mode': 'HTML'},
-                    timeout=6
-                )
+                requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              json={'chat_id':TG_CHAT,'text':msg,'parse_mode':'HTML'},timeout=6)
         except: pass
 
+    # ── LOOP PRINCIPAL ────────────────────────────────────────────────────
+
     async def run(self):
-        log.info(f"\n🚀 Bot LONGS v6.0 PRECISION | {len(self.symbols)} símbolos | {SCAN_WORKERS} workers\n")
-        iteration = 0
-        last_sym = last_ltv = last_hedge = last_eq = last_regime = 0
+        log.info(f"\n🚀 Bot COMPLETO v7.0 | {len(self.symbols)} símbolos\n")
+        iteration=0
+        last_sym=last_ltv=last_hedge=last_eq=last_regime=0
 
         while True:
             try:
-                iteration += 1; self._daily_reset()
-                if time.time() - last_sym    > 600:  self._refresh_symbols();    last_sym    = time.time()
-                if time.time() - last_ltv    > 300:  self._check_ltv();          last_ltv    = time.time()
-                if time.time() - last_eq     > 1800: self._update_equity();      last_eq     = time.time()
-                if time.time() - last_regime > 300:  self._update_market_regime(); last_regime = time.time()
-                if time.time() - last_hedge  > 600:
-                    for sym, sides in self._get_exchange_positions().items():
-                        if sides['short'] > 0:
-                            self._order_close_short(sym, sides['short']); time.sleep(0.3)
-                    last_hedge = time.time()
-                if time.time() - self._last_zombie_clean > ZOMBIE_CLEANUP_MIN * 60:
-                    self._nuke_zombie_orders()
+                iteration+=1; self._daily_reset()
+                if time.time()-last_sym    >600:  self._refresh_symbols();  last_sym=time.time()
+                if time.time()-last_ltv    >300:  self._check_ltv();        last_ltv=time.time()
+                if time.time()-last_eq     >1800: self._update_equity();    last_eq=time.time()
+                if time.time()-last_regime >300:  self._update_regime();    last_regime=time.time()
+                if time.time()-last_hedge  >600:
+                    for sym,sides in self._get_positions().items():
+                        if sides['short']>0: self._close_short(sym,sides['short']); time.sleep(0.3)
+                    last_hedge=time.time()
+                if time.time()-self._last_zombie>600: self._nuke_zombie_orders()
 
                 self._update_btc()
-                if self._circuit_check():
-                    await asyncio.sleep(INTERVAL); continue
+                if self._circuit_check(): await asyncio.sleep(INTERVAL); continue
+                if self._paused: log.info("  ⏸️ PAUSADO"); await asyncio.sleep(INTERVAL); continue
 
-                # v6.0: chequeo de sesión activa para el ciclo
-                hora_actual = datetime.utcnow().hour
-                en_sesion, ses_name = session_ok(hora_actual)
+                hora=datetime.utcnow().hour
+                en_ses,ses_name=session_ok(hora)
+                total=self.stats['wins']+self.stats['losses']
+                wr=self.stats['wins']/total*100 if total else 0
+                sm=self._score_min()
 
-                total     = self.stats['wins'] + self.stats['losses']
-                wr        = self.stats['wins'] / total * 100 if total else 0
-                score_min = self._score_min_for_regime()
+                # Pre-sesión alert: 15 min antes de London/NY avisa hot coins
+                if hora==LON_S-1 or hora==NY_S-1:
+                    hot=self.scanner.get_hot(SCAN_HOT_MIN,5)
+                    if hot:
+                        self._tg(f"<b>⏰ Próxima sesión en ~15min</b>\n"
+                                 f"🔥 Monedas calientes:\n"+"\n".join(f"  {s}" for s in hot))
 
                 log.info(f"\n{'='*72}")
-                log.info(
-                    f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
-                    f"Abiertos:{len(self.trades)}/{MAX_TRADES} | "
-                    f"Hoy:{self._daily_trades}/{MAX_DAILY_TRADES} | "
-                    f"PnL:${self.stats['pnl']:+.4f} | WR:{wr:.0f}%"
-                )
-                log.info(
-                    f"  BTC1h:{self._btc_1h:+.2f}% BTC4h:{self._btc_4h:+.2f}% | "
-                    f"Régimen:{self._regime} | Breadth:{int(self._breadth*100)}% | "
-                    f"Score≥{int(score_min)} | Sesión:{ses_name if en_sesion else '⏸️ fuera'}"
-                )
+                log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
+                         f"Abiertos:{len(self.trades)}/{MAX_TRADES} | "
+                         f"Hoy:{self._daily_trades}/{MAX_DAILY} | "
+                         f"PnL:${self.stats['pnl']:+.4f} | WR:{wr:.0f}%")
+                log.info(f"  BTC1h:{self._btc_1h:+.2f}% 4h:{self._btc_4h:+.2f}% | "
+                         f"Régimen:{self._regime} | Breadth:{int(self._breadth*100)}% | "
+                         f"Score≥{int(sm)} | Sesión:{ses_name if en_ses else '⏸ fuera'}")
+
+                # Estado del scanner
+                with self.scanner.hot_lock:
+                    nh=sum(1 for _,c in self.scanner.hot_symbols if c>=SCAN_HOT_MIN)
+                log.info(f"  Scanner: {nh} monedas hot (≥{SCAN_HOT_MIN}%)")
                 log.info(f"{'='*72}\n")
 
                 await self.monitor()
                 self._report()
 
-                if (len(self.trades) < MAX_TRADES and
-                        self._daily_trades < MAX_DAILY_TRADES and
-                        en_sesion):
+                can_trade=(len(self.trades)<MAX_TRADES and
+                           self._daily_trades<MAX_DAILY and
+                           en_ses)
+                if can_trade:
+                    ro,rr=self._regime_ok()
+                    if not ro: log.info(f"  ⏸️ {rr}"); await asyncio.sleep(INTERVAL); continue
 
-                    regime_ok, regime_reason = self._regime_ok()
-                    if not regime_ok:
-                        log.info(f"  ⏸️ {regime_reason}")
-                        await asyncio.sleep(INTERVAL); continue
+                    # v7.0: orden de escaneo prioriza monedas calientes
+                    scan_order=self._get_scan_order()
+                    log.info(f"  🔍 Scan: {len(scan_order)} símbolos (hot primero)...")
 
-                    log.info(f"  🔍 Scan: {len(self.symbols)} símbolos | {SCAN_WORKERS} workers...")
-                    signals = self._analyze_parallel(self.symbols)
+                    signals=self._analyze_parallel(scan_order)
                     log.info(f"  ✅ {len(signals)} señales de alta calidad")
 
-                    for sym, sig in signals:
-                        if len(self.trades) >= MAX_TRADES: break
-                        if self._daily_trades >= MAX_DAILY_TRADES: break
-                        log.info(
-                            f"  💡 {sym} [{sig['aurolo_señal']}] | "
-                            f"Score:{int(sig['score'])}/{int(sig['score_min'])} | "
-                            f"RR:{sig['rr']:.2f}:1 | SL:{sig['sl_pct']:.2f}% | "
-                            f"OFI:{int(sig.get('ofi_ratio',0.5)*100)}% | "
-                            f"MTF:{'✅' if sig.get('trend_15m')==1 else '❌'}"
-                        )
-                        if self.open_trade(sym, sig):
-                            await asyncio.sleep(3)
-                elif not en_sesion:
-                    log.info(f"  ⏸️ Fuera de sesión ({hora_actual}h UTC) — solo monitoreando")
+                    for sym,sig in signals:
+                        if len(self.trades)>=MAX_TRADES: break
+                        if self._daily_trades>=MAX_DAILY: break
+                        sc=sig.get('scanner_conf',0)
+                        sc_tag=f"🔴{sc}%" if sc>=80 else f"🟠{sc}%" if sc>=65 else f"🟡{sc}%" if sc>0 else "—"
+                        log.info(f"  💡 {sym} [{sig['aurolo_señal']}] | "
+                                 f"Score:{int(sig['score'])}/{int(sig['score_min'])} | "
+                                 f"RR:{sig['rr']:.2f}:1 | Scanner:{sc_tag} | "
+                                 f"Size:x{sig.get('size_mult',1.0):.2f}")
+                        if self.open_trade(sym,sig): await asyncio.sleep(3)
+                elif not en_ses:
+                    log.info(f"  ⏸️ Fuera de sesión ({hora}h UTC) — monitoreando")
                 else:
-                    log.info("  ⏸️ Max trades o max diario — monitoreando")
+                    log.info("  ⏸️ Max trades — monitoreando")
 
                 await asyncio.sleep(INTERVAL)
 
-            except KeyboardInterrupt:
-                log.info("⏹️ Detenido"); break
+            except KeyboardInterrupt: log.info("⏹️ Detenido"); break
             except Exception as e:
                 log.error(f"❌ Error #{iteration}: {e}", exc_info=True)
                 await asyncio.sleep(20)
 
         self.learn.save()
 
+    def _check_ltv(self):
+        if not AUTO: return
+        d=api('GET','/openApi/swap/v2/user/balance')
+        if d.get('code')!=0: return
+        try:
+            b=d.get('data',{}); eq=_sf(b.get('equity',b.get('balance',0)))
+            mg=_sf(b.get('usedMargin',b.get('initialMargin',0)))
+            if eq>0 and mg/eq*100>=LTV_WARN:
+                self._tg("<b>⚠️ LTV ALTO — cerrando</b>")
+                for sym in list(self.trades):
+                    tk=self._ticker(sym)
+                    if tk: self._close_all(sym,tk['price'],"LTV EMERGENCIA")
+        except: pass
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 async def main():
-    bot = LongBot()
+    bot=Bot()
     await bot.run()
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("👋 Bot terminado")
+if __name__=="__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt: log.info("👋 Bot terminado")
