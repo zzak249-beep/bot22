@@ -1516,8 +1516,68 @@ class Bot:
             f"<b>PnL: ${net_total:+.4f} | WR: {wr:.0f}%</b>\n"
             f"Scanner conf: {t.get('scanner_conf',0)}%"
         )
+        # WIKI PASO 1 — guardar trade en raw/trades/ para futura wiki
+        self._save_trade_raw(sym, t, exit_price, reason, net_total, mins, win)
         if self.stats['closed']%3==0: self.learn.save()
         del self.trades[sym]; self._cancel_open(sym); return True
+
+    def _save_trade_raw(self, sym, t, exit_price, reason, net_total, mins, win):
+        """
+        WIKI PASO 1: guarda cada trade cerrado como JSON en PERSIST_PATH/raw/trades/
+        Estos archivos son la fuente de verdad inmutable para la futura wiki.
+        En el Paso 2 (cuando tengas ANTHROPIC_API_KEY) Claude los leerá y generará
+        páginas markdown por símbolo, patrón, sesión y régimen.
+        """
+        try:
+            total = self.stats['wins'] + self.stats['losses']
+            wr    = self.stats['wins'] / total * 100 if total else 0
+            record = {
+                # Identificación
+                'ts_utc':        datetime.utcnow().isoformat(),
+                'symbol':        sym,
+                'reason':        reason,
+                'win':           win,
+                # Precios y P&L
+                'entry':         round(t['entry'], 8),
+                'exit':          round(exit_price, 8),
+                'pnl_usdt':      round(net_total, 6),
+                'pnl_parcial':   round(t['pnl_parcial'], 6),
+                'change_pct':    round((exit_price - t['entry']) / t['entry'] * 100, 4),
+                # Duración
+                'duration_min':  mins,
+                # Setup de entrada
+                'score':         int(t['score']),
+                'aurolo_pts':    t.get('aurolo_pts', 0),
+                'entrada_label': t.get('entrada_label', '?'),
+                'scanner_conf':  t.get('scanner_conf', 0),
+                'factors':       t.get('factors', []),
+                'hora_utc':      t.get('hora_utc'),
+                'size_mult':     t.get('size_mult', 1.0),
+                # Contexto de mercado en la entrada
+                'regime':        self._regime,
+                'breadth_pct':   round(self._breadth * 100, 1),
+                'btc_1h':        round(self._btc_1h, 3),
+                'btc_4h':        round(self._btc_4h, 3),
+                # Gestión de la posición
+                'sl_pct':        round(t.get('sl_pct', 0), 3),
+                'tp1_hit':       t.get('tp1_hit', False),
+                'tp2_hit':       t.get('tp2_hit', False),
+                'highest_pct':   round((t['highest'] - t['entry']) / t['entry'] * 100, 4),
+                'trailing_used': t.get('trailing_placed', False),
+                # Estadísticas acumuladas en el momento del cierre
+                'cumulative_wr': round(wr, 1),
+                'cumulative_trades': total,
+            }
+            # Ruta: PERSIST_PATH/raw/trades/YYYY-MM/SYM_timestamp.json
+            month_dir = datetime.utcnow().strftime('%Y-%m')
+            trade_dir = f"{PERSIST_PATH}/raw/trades/{month_dir}"
+            os.makedirs(trade_dir, exist_ok=True)
+            fname = f"{sym.replace('-','_')}_{int(time.time())}.json"
+            fpath = f"{trade_dir}/{fname}"
+            json.dump(record, open(fpath, 'w'), indent=2)
+            log.info(f"  📁 Trade guardado → raw/trades/{month_dir}/{fname}")
+        except Exception as e:
+            log.warning(f"  [WIKI] _save_trade_raw error: {e}")
 
     async def monitor(self):
         for sym in list(self.trades.keys()):
