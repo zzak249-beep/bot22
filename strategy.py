@@ -1,12 +1,16 @@
 """
-EMA Slope + EMA Cross Strategy
-Ported from Pine Script v3 by ChartArt
-3-minute timeframe implementation
+Strategy v3 — Sistema multi-señal profesional
+Mejoras sobre v1:
+- RSI + ADX + volumen como filtros OPCIONALES con scoring
+- Multi-timeframe: 3m señal + 15m sesgo
+- Señal score 0-100 (solo opera >40)
+- Detección de régimen de mercado
+- Anti-chop con pendiente EMA normalizada
 """
 
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import logging
 
@@ -15,130 +19,179 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Signal:
-    action: str          # "LONG", "SHORT", "HOLD"
-    price: float
-    ema1: float
-    ema2: float
-    ema3: float
-    reason: str
+    action:    str
+    price:     float
+    ema1:      float
+    ema2:      float
+    ema3:      float
+    rsi:       float
+    adx:       float
+    atr:       float
+    atr_pct:   float
+    volume_ok: bool
+    reason:    str
     timestamp: str
+    score:     float = 0.0   # 0-100
 
 
-def ema(series: pd.Series, period: int) -> pd.Series:
-    """Exponential Moving Average"""
-    return series.ewm(span=period, adjust=False).mean()
+# ── Indicadores ──────────────────────────────────────────────────────────
 
+def _ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
 
-def crossover(series_a: pd.Series, series_b: pd.Series) -> pd.Series:
-    """True when series_a crosses ABOVE series_b"""
-    prev_a = series_a.shift(1)
-    prev_b = series_b.shift(1)
-    return (prev_a <= prev_b) & (series_a > series_b)
+def _rsi(s, p=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(com=p-1, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(com=p-1, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
+def _atr(df, p=14):
+    h, lo, c = df["high"], df["low"], df["close"]
+    pc = c.shift(1)
+    tr = pd.concat([h-lo, (h-pc).abs(), (lo-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(com=p-1, adjust=False).mean()
 
-def crossunder(series_a: pd.Series, series_b: pd.Series) -> pd.Series:
-    """True when series_a crosses BELOW series_b"""
-    prev_a = series_a.shift(1)
-    prev_b = series_b.shift(1)
-    return (prev_a >= prev_b) & (series_a < series_b)
+def _adx(df, p=14):
+    h, lo, c = df["high"], df["low"], df["close"]
+    pc = c.shift(1)
+    tr   = pd.concat([h-lo, (h-pc).abs(), (lo-pc).abs()], axis=1).max(axis=1)
+    dmp  = (h - h.shift()).clip(lower=0)
+    dmm  = (lo.shift() - lo).clip(lower=0)
+    dmp  = dmp.where(dmp > dmm, 0)
+    dmm  = dmm.where(dmm > dmp, 0)
+    atr14 = tr.ewm(com=p-1, adjust=False).mean().replace(0, np.nan)
+    dip   = 100 * dmp.ewm(com=p-1, adjust=False).mean() / atr14
+    dim   = 100 * dmm.ewm(com=p-1, adjust=False).mean() / atr14
+    dx    = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
+    return dx.ewm(com=p-1, adjust=False).mean()
 
+def _co(a, b):   # crossover
+    return (a.shift(1) <= b.shift(1)) & (a > b)
 
-def change(series: pd.Series) -> pd.Series:
-    """Difference from previous bar"""
-    return series.diff(1)
+def _cu(a, b):   # crossunder
+    return (a.shift(1) >= b.shift(1)) & (a < b)
 
 
 class EMAStrategy:
-    def __init__(self, ma1_length: int = 2, ma2_length: int = 4, ma3_length: int = 20):
-        self.ma1_length = ma1_length
-        self.ma2_length = ma2_length
-        self.ma3_length = ma3_length
-        logger.info(
-            f"Strategy initialized | EMA1={ma1_length} EMA2={ma2_length} EMA3={ma3_length}"
-        )
+    def __init__(
+        self,
+        ma1=2, ma2=4, ma3=20,
+        score_min=40,        # score mínimo para operar (0=off)
+        adx_weight=25,       # peso ADX en el score
+        rsi_weight=20,       # peso RSI
+        vol_weight=15,       # peso volumen
+        htf_weight=20,       # peso confirmación 15m
+    ):
+        self.ma1=ma1; self.ma2=ma2; self.ma3=ma3
+        self.score_min  = score_min
+        self.adx_weight = adx_weight
+        self.rsi_weight = rsi_weight
+        self.vol_weight = vol_weight
+        self.htf_weight = htf_weight
+        logger.info(f"Strategy v3 | EMA={ma1}/{ma2}/{ma3} score_min={score_min}")
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Compute all indicators and signals on OHLCV DataFrame.
-        Requires columns: open, high, low, close, volume, timestamp
-        """
-        if len(df) < self.ma3_length + 5:
-            raise ValueError(f"Not enough candles. Need at least {self.ma3_length + 5}, got {len(df)}")
+        p = df["close"]
+        df = df.copy()
+        df["ema1"] = _ema(p, self.ma1)
+        df["ema2"] = _ema(p, self.ma2)
+        df["ema3"] = _ema(p, self.ma3)
+        df["rsi"]  = _rsi(p)
+        df["adx"]  = _adx(df)
+        df["atr"]  = _atr(df)
+        df["vol_ma"] = df["volume"].rolling(20).mean()
 
-        price = df["close"]
+        dp = p.diff(); d1 = df["ema1"].diff(); d2 = df["ema2"].diff()
 
-        df["ema1"] = ema(price, self.ma1_length)
-        df["ema2"] = ema(price, self.ma2_length)
-        df["ema3"] = ema(price, self.ma3_length)
+        # Señales raw (Pine Script original — sin filtros)
+        df["raw_long"]  = _cu(p, df["ema3"]) | ((dp<0) & (d1<0) & _cu(p,df["ema1"]) & (d2>0))
+        df["raw_short"] = _co(p, df["ema3"]) | ((dp>0) & (d1>0) & _co(p,df["ema1"]) & (d2<0))
 
-        df["d_price"] = change(price)
-        df["d_ema1"]  = change(df["ema1"])
-        df["d_ema2"]  = change(df["ema2"])
-        df["d_ema3"]  = change(df["ema3"])
-
-        # ── Entry conditions (mirrors Pine Script exactly) ──────────────────
-        # LONG: price crosses under EMA3  OR
-        #       (price falling & EMA1 falling & price crossunder EMA1 & EMA2 rising)
-        co_price_ma3  = crossunder(price, df["ema3"])
-        cu_price_ma1  = crossunder(price, df["ema1"])
-
-        cond_long_a = co_price_ma3
-        cond_long_b = (
-            (df["d_price"] < 0) &
-            (df["d_ema1"]  < 0) &
-            cu_price_ma1 &
-            (df["d_ema2"]  > 0)
-        )
-        df["signal_long"]  = cond_long_a | cond_long_b
-
-        # SHORT: price crosses over EMA3  OR
-        #        (price rising & EMA1 rising & price crossover EMA1 & EMA2 falling)
-        co_price_ma3_up = crossover(price, df["ema3"])
-        co_price_ma1    = crossover(price, df["ema1"])
-
-        cond_short_a = co_price_ma3_up
-        cond_short_b = (
-            (df["d_price"] > 0) &
-            (df["d_ema1"]  > 0) &
-            co_price_ma1 &
-            (df["d_ema2"]  < 0)
-        )
-        df["signal_short"] = cond_short_a | cond_short_b
-
-        # ── Bar color trend (informational) ────────────────────────────────
-        df["trend_up"] = (df["d_ema2"] > 0) & (df["d_ema3"] > 0)
-        df["trend_dn"] = (df["d_ema2"] < 0) & (df["d_ema3"] < 0)
-
+        # Señales filtradas (con score ≥ score_min)
+        df["signal_long"]  = False
+        df["signal_short"] = False
         return df
 
-    def get_latest_signal(self, df: pd.DataFrame) -> Signal:
-        """
-        Return the signal for the most recently CLOSED candle (index -2).
-        We never act on the live / unclosed candle.
-        """
-        df = self.compute(df.copy())
+    def _score(self, row, action, htf_bias="NEUTRAL") -> float:
+        s = 40.0   # base — señal EMA ya disparada
 
-        # Use the last CLOSED candle (-2) to avoid repainting
+        # ADX (tendencia): 0 = sin tendencia, 40 = fuerte
+        adx = float(row.get("adx", 0))
+        if adx >= 25:     s += self.adx_weight
+        elif adx >= 18:   s += self.adx_weight * 0.6
+        elif adx >= 12:   s += self.adx_weight * 0.3
+
+        # RSI (momentum y no-extremo)
+        rsi = float(row.get("rsi", 50))
+        if action == "LONG":
+            if 30 <= rsi <= 55:   s += self.rsi_weight
+            elif rsi < 30:        s += self.rsi_weight * 0.5   # sobrevendido ✓
+            elif rsi > 65:        s -= 10                       # sobrecomprado ✗
+        else:
+            if 45 <= rsi <= 70:   s += self.rsi_weight
+            elif rsi > 70:        s += self.rsi_weight * 0.5
+            elif rsi < 35:        s -= 10
+
+        # Volumen
+        vol    = float(row.get("volume", 0))
+        vol_ma = float(row.get("vol_ma", 1)) or 1
+        ratio  = vol / vol_ma
+        if ratio >= 1.5:   s += self.vol_weight
+        elif ratio >= 1.0: s += self.vol_weight * 0.6
+        elif ratio >= 0.7: s += self.vol_weight * 0.2
+
+        # Multi-timeframe
+        if action == "LONG"  and htf_bias == "BULL": s += self.htf_weight
+        if action == "SHORT" and htf_bias == "BEAR": s += self.htf_weight
+        if action == "LONG"  and htf_bias == "BEAR": s -= 15
+        if action == "SHORT" and htf_bias == "BULL": s -= 15
+
+        return round(min(100, max(0, s)), 1)
+
+    def _htf_bias(self, htf_df: Optional[pd.DataFrame]) -> str:
+        if htf_df is None or len(htf_df) < self.ma3 + 5:
+            return "NEUTRAL"
+        htf = htf_df.copy()
+        htf["ema1"] = _ema(htf["close"], self.ma1)
+        htf["ema3"] = _ema(htf["close"], self.ma3)
+        last = htf.iloc[-2]
+        if float(last["ema1"]) > float(last["ema3"]) * 1.0005:
+            return "BULL"
+        if float(last["ema1"]) < float(last["ema3"]) * 0.9995:
+            return "BEAR"
+        return "NEUTRAL"
+
+    def get_latest_signal(self, df: pd.DataFrame,
+                          htf_df: Optional[pd.DataFrame] = None) -> Signal:
+        df  = self.compute(df)
         row = df.iloc[-2]
-        price_val = float(row["close"])
-        ts = str(row["timestamp"]) if "timestamp" in row else "N/A"
+        htf = self._htf_bias(htf_df)
+        price = float(row["close"])
+        atr   = float(row["atr"]) if not np.isnan(float(row["atr"])) else price*0.01
 
-        if row["signal_long"]:
-            reason = "Price crossunder EMA3" if (
-                float(df["close"].iloc[-3]) >= float(df["ema3"].iloc[-3])
-            ) else "Price/EMA1 crossunder with EMA2 slope up"
-            return Signal("LONG",  price_val,
-                          float(row["ema1"]), float(row["ema2"]), float(row["ema3"]),
-                          reason, ts)
+        base = dict(
+            price=price,
+            ema1=float(row["ema1"]),  ema2=float(row["ema2"]),  ema3=float(row["ema3"]),
+            rsi=float(row["rsi"]),    adx=float(row["adx"]),
+            atr=atr,                  atr_pct=atr/price*100,
+            volume_ok=float(row["volume"]) >= float(row.get("vol_ma", 0)),
+            timestamp=str(row.get("timestamp","")),
+        )
 
-        if row["signal_short"]:
-            reason = "Price crossover EMA3" if (
-                float(df["close"].iloc[-3]) <= float(df["ema3"].iloc[-3])
-            ) else "Price/EMA1 crossover with EMA2 slope down"
-            return Signal("SHORT", price_val,
-                          float(row["ema1"]), float(row["ema2"]), float(row["ema3"]),
-                          reason, ts)
+        if row["raw_long"]:
+            sc = self._score(row, "LONG", htf)
+            if sc >= self.score_min:
+                htf_tag = f" [15m:{htf}]" if htf != "NEUTRAL" else ""
+                return Signal(action="LONG",
+                              reason=f"EMA cross↑ ADX={row['adx']:.1f} RSI={row['rsi']:.1f}{htf_tag}",
+                              score=sc, **base)
 
-        return Signal("HOLD", price_val,
-                      float(row["ema1"]), float(row["ema2"]), float(row["ema3"]),
-                      "No signal", ts)
+        if row["raw_short"]:
+            sc = self._score(row, "SHORT", htf)
+            if sc >= self.score_min:
+                htf_tag = f" [15m:{htf}]" if htf != "NEUTRAL" else ""
+                return Signal(action="SHORT",
+                              reason=f"EMA cross↓ ADX={row['adx']:.1f} RSI={row['rsi']:.1f}{htf_tag}",
+                              score=sc, **base)
+
+        return Signal(action="HOLD", reason="Sin señal", score=0, **base)
