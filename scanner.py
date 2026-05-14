@@ -1,5 +1,8 @@
 """
-Scanner v5 — usa dicts normalizados del cliente corregido
+Scanner v6 — TODOS los pares disponibles en BingX
+- Obtiene la lista completa dinámicamente desde la API
+- Filtra por volumen mínimo
+- Escanea en paralelo con 20 hilos
 """
 import logging, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,20 +11,10 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 import pandas as pd
-import numpy as np
 from bingx_client import BingXClient
 from strategy import EMAStrategy
 
 logger = logging.getLogger(__name__)
-
-WATCHLIST = [
-    "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
-    "DOGE-USDT","ADA-USDT","AVAX-USDT","LINK-USDT","DOT-USDT",
-    "MATIC-USDT","LTC-USDT","BCH-USDT","UNI-USDT","ATOM-USDT",
-    "APT-USDT","OP-USDT","ARB-USDT","SUI-USDT","INJ-USDT",
-    "TIA-USDT","WLD-USDT","PEPE-USDT","SHIB-USDT","TON-USDT",
-    "WIF-USDT","JUP-USDT","RENDER-USDT","FET-USDT","NEAR-USDT",
-]
 
 
 @dataclass
@@ -34,20 +27,18 @@ class SymbolScore:
 
 
 def _to_df(klines: list) -> Optional[pd.DataFrame]:
-    """Convierte lista de dicts normalizados a DataFrame"""
     if not klines or len(klines) < 30:
         return None
     df = pd.DataFrame(klines)
-    # klines ya vienen como dicts con keys: timestamp, open, high, low, close, volume
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
 
 
 class MultiSymbolScanner:
     def __init__(self, client: BingXClient, interval="3m", htf_interval="15m",
-                 top_n=1, min_volume=1_000_000, score_min=30, workers=10):
+                 top_n=1, min_volume=500_000, score_min=30, workers=20):
         self.client       = client
         self.interval     = interval
         self.htf_interval = htf_interval
@@ -58,6 +49,40 @@ class MultiSymbolScanner:
         self.strategy     = EMAStrategy(score_min=score_min)
         self._cache: List[SymbolScore] = []
         self._cache_ts: float = 0
+        self._symbols: List[str] = []
+        self._symbols_ts: float = 0
+
+    # ── Lista dinámica de todos los pares ─────────────────────────────────
+    def _get_all_symbols(self) -> List[str]:
+        """Obtiene TODOS los pares de futuros perpetuos de BingX"""
+        now = time.time()
+        if self._symbols and (now - self._symbols_ts) < 3600:  # refresca cada hora
+            return self._symbols
+        try:
+            data = self.client._get("/openApi/swap/v2/quote/contracts")
+            all_syms = [c["symbol"] for c in data.get("data", [])
+                        if c.get("symbol","").endswith("-USDT")]
+            self._symbols    = sorted(all_syms)
+            self._symbols_ts = now
+            logger.info(f"Pares disponibles en BingX: {len(self._symbols)}")
+            return self._symbols
+        except Exception as e:
+            logger.warning(f"No se pudo obtener lista de pares: {e}")
+            # Fallback ampliado
+            return [
+                "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
+                "DOGE-USDT","ADA-USDT","AVAX-USDT","LINK-USDT","DOT-USDT",
+                "MATIC-USDT","LTC-USDT","BCH-USDT","UNI-USDT","ATOM-USDT",
+                "APT-USDT","OP-USDT","ARB-USDT","SUI-USDT","INJ-USDT",
+                "TIA-USDT","WLD-USDT","PEPE-USDT","SHIB-USDT","TON-USDT",
+                "WIF-USDT","JUP-USDT","RENDER-USDT","FET-USDT","NEAR-USDT",
+                "SEI-USDT","BLUR-USDT","GMX-USDT","AAVE-USDT","MKR-USDT",
+                "SNX-USDT","CRV-USDT","1INCH-USDT","ENS-USDT","LDO-USDT",
+                "MANTA-USDT","ALT-USDT","PYTH-USDT","STRK-USDT","DYM-USDT",
+                "ZRO-USDT","LISTA-USDT","ETHFI-USDT","REZ-USDT","BB-USDT",
+                "OMNI-USDT","NOT-USDT","IO-USDT","ZK-USDT","BLAST-USDT",
+                "DOGS-USDT","HMSTR-USDT","CATI-USDT","MOVE-USDT","ME-USDT",
+            ]
 
     def _hour_bonus(self) -> float:
         h = datetime.now(timezone.utc).hour
@@ -76,15 +101,14 @@ class MultiSymbolScanner:
             try:
                 vol24h = float(self.client.get_ticker(symbol).get("quoteVolume", 0))
             except:
-                vol24h = float(df["volume"].tail(480).sum() * df["close"].iloc[-1])
+                vol24h = float(df["volume"].sum() * df["close"].iloc[-1])
 
             if vol24h < self.min_vol:
                 return None
 
-            htf_klines = self.client.get_klines(symbol, self.htf_interval, 60)
-            htf_df     = _to_df(htf_klines)
+            htf_df = _to_df(self.client.get_klines(symbol, self.htf_interval, 60))
+            sig    = self.strategy.get_latest_signal(df, htf_df)
 
-            sig = self.strategy.get_latest_signal(df, htf_df)
             if sig.action == "HOLD":
                 return None
 
@@ -92,17 +116,17 @@ class MultiSymbolScanner:
             vol_spike = float(df["volume"].iloc[-2]) / max(vol_ma, 1)
 
             composite = (
-                sig.score                    * 0.5 +
-                min(30, sig.atr_pct * 10)   * 0.3 +
-                min(20, (vol_spike-1) * 10) * 0.2
+                sig.score                   * 0.5 +
+                min(30, sig.atr_pct * 10)  * 0.3 +
+                min(20, (vol_spike-1)*10)  * 0.2
             ) * self._hour_bonus()
 
             return SymbolScore(
-                symbol=symbol, score=round(composite, 1),
+                symbol=symbol, score=round(composite,1),
                 signal=sig.action, price=sig.price,
                 ema1=sig.ema1, ema2=sig.ema2, ema3=sig.ema3,
                 rsi=sig.rsi, adx=sig.adx, atr_pct=sig.atr_pct,
-                volume24h=vol24h, vol_spike=round(vol_spike, 2),
+                volume24h=vol24h, vol_spike=round(vol_spike,2),
                 reason=sig.reason, sig_score=sig.score,
             )
         except Exception as e:
@@ -114,12 +138,13 @@ class MultiSymbolScanner:
         if not force and self._cache and (now - self._cache_ts) < 55:
             return self._cache
 
-        t0 = time.time()
-        logger.info(f"Escaneando {len(WATCHLIST)} pares ({self.workers} hilos)...")
-        results = []
+        symbols = self._get_all_symbols()
+        t0      = time.time()
+        logger.info(f"Escaneando {len(symbols)} pares ({self.workers} hilos)...")
 
+        results = []
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            futs = {ex.submit(self._score_symbol, s): s for s in WATCHLIST}
+            futs = {ex.submit(self._score_symbol, s): s for s in symbols}
             for fut in as_completed(futs):
                 r = fut.result()
                 if r:
@@ -128,8 +153,8 @@ class MultiSymbolScanner:
         results.sort(key=lambda x: x.score, reverse=True)
         elapsed = time.time() - t0
         logger.info(
-            f"Scan: {elapsed:.1f}s | revisados={len(WATCHLIST)} | "
-            f"con_señal={len(results)} | top={[s.symbol for s in results[:self.top_n]]}"
+            f"Scan: {elapsed:.1f}s | revisados={len(symbols)} | "
+            f"con_señal={len(results)} | top={[s.symbol for s in results[:3]]}"
         )
         self._cache    = results
         self._cache_ts = now
@@ -141,9 +166,9 @@ class MultiSymbolScanner:
 
     def format_report(self, results: List[SymbolScore]) -> str:
         if not results:
-            return "🔍 Scan 30 pares — sin señales activas ahora."
-        lines = [f"📊 <b>{len(results)} señal(es) encontrada(s)</b>\n"]
-        for i, s in enumerate(results, 1):
+            return "🔍 Sin señales activas ahora."
+        lines = [f"📊 <b>{len(results)} señal(es) — top 5</b>\n"]
+        for i, s in enumerate(results[:5], 1):
             e = "🟢" if s.signal == "LONG" else "🔴"
             lines.append(
                 f"{i}. {e} <b>{s.symbol}</b>  Score:<b>{s.score}</b>\n"
