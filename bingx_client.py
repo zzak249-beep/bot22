@@ -125,6 +125,17 @@ class BingXClient:
             if c["symbol"]==symbol: return c
         raise ValueError(f"Symbol {symbol} not found")
 
+    def get_max_position(self,symbol,leverage=5):
+        """Retorna el valor máximo de posición permitido en USDT para este símbolo"""
+        try:
+            info=self.get_symbol_info(symbol)
+            # BingX devuelve maxPositionValue o similar
+            max_val=info.get("maxPositionValue",info.get("maxOrderValue",None))
+            if max_val: return float(max_val)
+            # Si no está en contracts, intentar con leverage brackets
+            return None
+        except: return None
+
     def get_all_symbols(self):
         data=self._req("GET","/openApi/swap/v2/quote/contracts",{})
         return [c["symbol"] for c in data.get("data",[]) if "-" in c.get("symbol","")]

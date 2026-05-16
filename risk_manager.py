@@ -54,7 +54,7 @@ class RiskManager:
         if s>=4:  return 1.15
         return 1.0
 
-    def compute(self,balance,price,side,atr,score=50,qty_step=0.001,price_precision=4):
+    def compute(self,balance,price,side,atr,score=50,qty_step=0.001,price_precision=4,max_notional=None):
         if self.peak is None: self.peak=balance
         self.peak=max(self.peak,balance)
         if (self.peak-balance)/max(self.peak,1)>=self.max_dd:
@@ -62,6 +62,10 @@ class RiskManager:
         sl_dist=atr*self.sl_mult; sl_pct=sl_dist/price
         risk=balance*self.risk_pct*self._factor()
         notional=(risk*self.leverage)/max(sl_pct,0.0003)
+        # Cap por límite del exchange para este símbolo
+        if max_notional and notional > max_notional:
+            logger.info(f"Notional {notional:.1f} > max {max_notional} — reduciendo")
+            notional = max_notional
         if notional<self.min_notional:
             logger.warning(f"Notional {notional:.1f}<{self.min_notional}"); return None
         qty=float(int((notional/price)/qty_step)*qty_step)
