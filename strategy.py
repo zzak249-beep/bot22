@@ -1,114 +1,189 @@
 """
-Strategy FINAL — EMA Reversal (probado: WR 40%, PF 1.68)
-SL=1.5xATR | TP1=1.5xATR (50%) | TP2=2.5xATR (50%)
-Filtros: RSI + ADX + Volumen + HTF 15m + HTF 1h
+EMA Strategy — cruces EMA1/EMA2 con filtro HTF EMA3
+Indicadores: EMA, RSI, ADX, ATR
 """
-import pandas as pd, numpy as np
+import logging
 from dataclasses import dataclass
 from typing import Optional
-import logging
+
+import numpy as np
+import pandas as pd
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Signal:
-    action: str; price: float
-    ema1: float; ema2: float; ema3: float
-    rsi: float; adx: float; atr: float; atr_pct: float
-    volume_ok: bool; reason: str; timestamp: str; score: float = 0.0
+    action:     str       # LONG | SHORT | HOLD
+    price:      float
+    ema1:       float
+    ema2:       float
+    ema3:       float
+    rsi:        float
+    adx:        float
+    atr:        float
+    atr_pct:    float
+    volume_ok:  bool
+    reason:     str
+    timestamp:  str
+    score:      float
 
-def _ema(s,p):   return s.ewm(span=p,adjust=False).mean()
-def _co(a,b):    return (a.shift(1)<=b.shift(1))&(a>b)
-def _cu(a,b):    return (a.shift(1)>=b.shift(1))&(a<b)
-def _rsi(s,p=14):
-    d=s.diff(); g=d.clip(lower=0).ewm(com=p-1,adjust=False).mean()
-    l=(-d.clip(upper=0)).ewm(com=p-1,adjust=False).mean()
-    return 100-100/(1+g/l.replace(0,np.nan))
-def _atr(df,p=14):
-    h,lo,c=df.high,df.low,df.close; pc=c.shift(1)
-    return pd.concat([h-lo,(h-pc).abs(),(lo-pc).abs()],axis=1).max(axis=1).ewm(com=p-1,adjust=False).mean()
-def _adx(df,p=14):
-    h,lo,c=df.high,df.low,df.close; pc=c.shift(1)
-    tr=pd.concat([h-lo,(h-pc).abs(),(lo-pc).abs()],axis=1).max(axis=1)
-    dmp=(h-h.shift()).clip(lower=0); dmm=(lo.shift()-lo).clip(lower=0)
-    dmp=dmp.where(dmp>dmm,0); dmm=dmm.where(dmm>dmp,0)
-    a14=tr.ewm(com=p-1,adjust=False).mean().replace(0,np.nan)
-    dip=100*dmp.ewm(com=p-1,adjust=False).mean()/a14
-    dim=100*dmm.ewm(com=p-1,adjust=False).mean()/a14
-    return (100*(dip-dim).abs()/(dip+dim).replace(0,np.nan)).ewm(com=p-1,adjust=False).mean()
+
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_l = loss.ewm(com=period - 1, adjust=False).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_high = high.shift(1)
+    prev_low  = low.shift(1)
+    prev_close = close.shift(1)
+
+    up_move   = high - prev_high
+    down_move = prev_low - low
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_s  = tr.ewm(com=period - 1, adjust=False).mean()
+    plus_s = pd.Series(plus_dm,  index=df.index).ewm(com=period - 1, adjust=False).mean()
+    minus_s= pd.Series(minus_dm, index=df.index).ewm(com=period - 1, adjust=False).mean()
+
+    dip  = 100 * plus_s  / atr_s.replace(0, np.nan)
+    dim  = 100 * minus_s / atr_s.replace(0, np.nan)
+    dx   = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
+    return dx.ewm(com=period - 1, adjust=False).mean()
+
 
 class EMAStrategy:
-    def __init__(self, ma1=2, ma2=4, ma3=20, score_min=35):
-        self.ma1=ma1; self.ma2=ma2; self.ma3=ma3; self.score_min=score_min
-        logger.info(f"Strategy FINAL | EMA{ma1}/{ma2}/{ma3} score_min={score_min}")
+    def __init__(self, ema1_len=2, ema2_len=4, ema3_len=20, score_min=30.0,
+                 rsi_period=14, adx_period=14, atr_period=14):
+        self.ema1_len   = ema1_len
+        self.ema2_len   = ema2_len
+        self.ema3_len   = ema3_len
+        self.score_min  = score_min
+        self.rsi_period = rsi_period
+        self.adx_period = adx_period
+        self.atr_period = atr_period
 
-    def compute(self, df):
-        df=df.copy(); p=df.close
-        df["ema1"]=_ema(p,self.ma1); df["ema2"]=_ema(p,self.ma2); df["ema3"]=_ema(p,self.ma3)
-        df["rsi"]=_rsi(p); df["adx"]=_adx(df); df["atr"]=_atr(df)
-        df["vol_ma"]=df.volume.rolling(20).mean(); df["rsi_d"]=df.rsi.diff(2)
-        dp=p.diff(); d1=df.ema1.diff(); d2=df.ema2.diff()
-        df["raw_long"]  = _cu(p,df.ema3)|((dp<0)&(d1<0)&_cu(p,df.ema1)&(d2>0))
-        df["raw_short"] = _co(p,df.ema3)|((dp>0)&(d1>0)&_co(p,df.ema1)&(d2<0))
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Añade columnas de indicadores al DataFrame."""
+        df = df.copy()
+        df["ema1"] = _ema(df["close"], self.ema1_len)
+        df["ema2"] = _ema(df["close"], self.ema2_len)
+        df["ema3"] = _ema(df["close"], self.ema3_len)
+        df["rsi"]  = _rsi(df["close"], self.rsi_period)
+        df["adx"]  = _adx(df, self.adx_period)
+        df["atr"]  = _atr(df, self.atr_period)
         return df
 
-    def _score(self, row, action, htf="NEUTRAL", h1="NEUTRAL"):
-        s=40.0
-        adx=float(row.get("adx",0) or 0)
-        if adx>=25: s+=20
-        elif adx>=18: s+=12
-        elif adx>=12: s+=5
-        rsi=float(row.get("rsi",50) or 50); rd=float(row.get("rsi_d",0) or 0)
-        if action=="LONG":
-            if 25<=rsi<=60: s+=18
-            elif rsi<25: s+=10
-            elif rsi>70: s-=15
-            if rd>1: s+=8
+    def get_latest_signal(self, df: pd.DataFrame,
+                          htf_df: Optional[pd.DataFrame] = None) -> Signal:
+        df = self.compute(df)
+        i  = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        price   = float(i["close"])
+        ema1    = float(i["ema1"])
+        ema2    = float(i["ema2"])
+        ema3    = float(i["ema3"])
+        rsi     = float(i["rsi"])
+        adx     = float(i["adx"])
+        atr     = float(i["atr"])
+        atr_pct = (atr / price * 100) if price > 0 else 0
+
+        # Cruce EMA1/EMA2
+        cross_up   = (prev["ema1"] <= prev["ema2"]) and (ema1 > ema2)
+        cross_down = (prev["ema1"] >= prev["ema2"]) and (ema1 < ema2)
+
+        # HTF bias
+        htf_bull = htf_bear = False
+        if htf_df is not None and len(htf_df) >= self.ema3_len:
+            htf_ema1 = float(_ema(htf_df["close"], self.ema1_len).iloc[-1])
+            htf_ema2 = float(_ema(htf_df["close"], self.ema2_len).iloc[-1])
+            htf_ema3 = float(_ema(htf_df["close"], self.ema3_len).iloc[-1])
+            htf_price = float(htf_df["close"].iloc[-1])
+            htf_bull = htf_price > htf_ema3 and htf_ema1 > htf_ema2
+            htf_bear = htf_price < htf_ema3 and htf_ema1 < htf_ema2
+
+        # Scoring
+        score   = 0.0
+        reasons = []
+
+        if cross_up:
+            score += 35; reasons.append("EMA cruce↑")
+        elif ema1 > ema2:
+            score += 15; reasons.append("EMA alcista")
+
+        if cross_down:
+            score += 35; reasons.append("EMA cruce↓")
+        elif ema1 < ema2:
+            score += 15; reasons.append("EMA bajista")
+
+        if price > ema3:
+            score += 10; reasons.append("P>EMA3")
+        elif price < ema3:
+            score += 10; reasons.append("P<EMA3")
+
+        if 40 < rsi < 65:
+            score += 15; reasons.append(f"RSI{rsi:.0f}")
+        if adx > 20:
+            score += 10; reasons.append(f"ADX{adx:.0f}")
+
+        if htf_bull and ema1 > ema2:
+            score += 15; reasons.append("HTF🟢")
+        elif htf_bear and ema1 < ema2:
+            score += 15; reasons.append("HTF🔴")
+
+        # Dirección
+        if ema1 > ema2 and price > ema3:
+            action = "LONG"
+        elif ema1 < ema2 and price < ema3:
+            action = "SHORT"
         else:
-            if 40<=rsi<=75: s+=18
-            elif rsi>75: s+=10
-            elif rsi<30: s-=15
-            if rd<-1: s+=8
-        vol=float(row.get("volume",0) or 0); vm=float(row.get("vol_ma",1) or 1)
-        r=vol/max(vm,1)
-        if r>=2.0: s+=15
-        elif r>=1.5: s+=10
-        elif r>=1.0: s+=5
-        if action=="LONG"  and htf=="BULL": s+=12
-        if action=="SHORT" and htf=="BEAR": s+=12
-        if action=="LONG"  and htf=="BEAR": s-=8
-        if action=="SHORT" and htf=="BULL": s-=8
-        if action=="LONG"  and h1=="BULL":  s+=8
-        if action=="SHORT" and h1=="BEAR":  s+=8
-        if action=="LONG"  and h1=="BEAR":  s-=5
-        if action=="SHORT" and h1=="BULL":  s-=5
-        return round(min(100,max(0,s)),1)
+            action = "HOLD"
 
-    def _bias(self, df):
-        if df is None or len(df)<self.ma3+5: return "NEUTRAL"
-        try:
-            e1=_ema(df.close,self.ma1).iloc[-2]; e3=_ema(df.close,self.ma3).iloc[-2]
-            if e1>e3*1.0003: return "BULL"
-            if e1<e3*0.9997: return "BEAR"
-        except: pass
-        return "NEUTRAL"
+        if score < self.score_min:
+            action = "HOLD"
 
-    def get_latest_signal(self, df, htf_df=None, h1_df=None):
-        df=self.compute(df); row=df.iloc[-2]
-        htf=self._bias(htf_df); h1=self._bias(h1_df)
-        price=float(row.close)
-        atr=float(row.atr) if not pd.isna(row.atr) else price*0.005
-        base=dict(price=price,ema1=float(row.ema1),ema2=float(row.ema2),ema3=float(row.ema3),
-                  rsi=float(row.rsi) if not pd.isna(row.rsi) else 50,
-                  adx=float(row.adx) if not pd.isna(row.adx) else 0,
-                  atr=atr,atr_pct=atr/price*100,
-                  volume_ok=float(row.volume)>=float(row.get("vol_ma",0)),
-                  timestamp=str(row.get("timestamp","")))
-        for action,key in [("LONG","raw_long"),("SHORT","raw_short")]:
-            if not row[key]: continue
-            sc=self._score(row,action,htf,h1)
-            if sc<self.score_min: continue
-            htf_t=f" 15m:{htf}" if htf!="NEUTRAL" else ""
-            h1_t =f" 1h:{h1}"  if h1!="NEUTRAL"  else ""
-            return Signal(action=action,score=sc,
-                         reason=f"EMA cross {'↑' if action=='LONG' else '↓'} RSI={base['rsi']:.0f} ADX={base['adx']:.0f}{htf_t}{h1_t}",**base)
-        return Signal(action="HOLD",reason="Sin señal",score=0,**base)
+        return Signal(
+            action    = action,
+            price     = price,
+            ema1      = ema1,
+            ema2      = ema2,
+            ema3      = ema3,
+            rsi       = rsi,
+            adx       = adx,
+            atr       = atr,
+            atr_pct   = atr_pct,
+            volume_ok = True,
+            reason    = " | ".join(reasons) if reasons else "Sin señal",
+            timestamp = str(i["timestamp"]),
+            score     = round(score, 1),
+        )

@@ -1,9 +1,7 @@
 """
 EMA Bot v5 — Diagnóstico completo + ejecución robusta
-Cada paso notifica a Telegram para saber exactamente qué pasa
 """
-
-import logging, os, sys, time, threading
+import logging, os, sys, time
 from typing import Optional
 
 import pandas as pd
@@ -86,17 +84,12 @@ class EMABot:
         logger.info("=== EMA Bot v5 ===")
         mode = "PAPER" if DEMO_MODE else "LIVE"
         logger.info(f"Modo: {mode} | Leverage: {LEVERAGE}x | Score min: {SCORE_MIN}")
-
-        # Test de conectividad
         self._test_connection()
-
         if not self.active_symbol:
             best = self.scanner.best_symbol()
             self.active_symbol = best.symbol if best else "BTC-USDT"
-
         self._init_symbol(self.active_symbol)
         self._detect_position()
-
         bal = self._balance()
         self.tg.send_startup(self.active_symbol, INTERVAL, LEVERAGE, DEMO_MODE)
         self.tg._send(
@@ -110,7 +103,6 @@ class EMABot:
         )
 
     def _test_connection(self):
-        """Verifica que la API funciona antes de arrancar"""
         try:
             bal = self.bingx.get_balance()
             logger.info(f"✅ BingX conectado | balance={bal}")
@@ -125,11 +117,9 @@ class EMABot:
             logger.info(f"Symbol {symbol} | qty_step={self._qty_step}")
         except Exception as e:
             logger.warning(f"Symbol info {symbol}: {e}")
-
         for side in ("LONG", "SHORT"):
             try:    self.bingx.set_leverage(symbol, LEVERAGE, side)
             except Exception as e: logger.debug(f"Leverage {side}: {e}")
-
         try:    self.bingx.set_margin_mode(symbol, "ISOLATED")
         except Exception as e: logger.debug(f"MarginMode: {e}")
 
@@ -169,44 +159,35 @@ class EMABot:
     # ── Open ───────────────────────────────────────────────────────────────
     def _open(self, symbol: str, sig: Signal, balance: float):
         logger.info(f"--- INTENTANDO ABRIR {sig.action} {symbol} ---")
-
-        # 1. Verificar balance
         if balance <= 0:
             msg = f"Balance cero o negativo: ${balance}"
-            logger.error(msg)
-            self.tg.send_error("balance", msg)
-            return
+            logger.error(msg); self.tg.send_error("balance", msg); return
 
-        # 2. Calcular parámetros de riesgo
-        logger.info(f"Risk params: balance={balance:.2f} price={sig.price} atr={sig.atr:.4f}")
+        logger.info(f"Risk params: balance={balance:.2f} price={sig.price} atr={sig.atr:.6f}")
         params: Optional[TradeParams] = self.risk_mgr.compute(
             balance=balance, price=sig.price, side=sig.action,
             atr=sig.atr, qty_step=self._qty_step, price_precision=self._price_prec,
         )
-
         if params is None:
-            # Explicar por qué falló
             sl_dist  = sig.atr * ATR_SL_MULT
-            sl_pct   = sl_dist / sig.price
-            notional = (balance * RISK_PCT/100 * LEVERAGE) / sl_pct
+            sl_pct   = sl_dist / sig.price if sig.price > 0 else 0
+            notional = (balance * RISK_PCT/100 * LEVERAGE) / max(sl_pct, 0.0001)
             msg = (
                 f"Risk manager rechazó el trade\n"
                 f"Balance: ${balance:.2f}\n"
                 f"Riesgo: ${balance*RISK_PCT/100:.2f}\n"
                 f"Notional calculado: ${notional:.2f}\n"
                 f"Mínimo requerido: $5\n"
-                f"ATR: {sig.atr:.4f} ({sig.atr_pct:.2f}%)\n"
-                f"SL dist: {sl_pct*100:.2f}%"
+                f"ATR: {sig.atr:.6f} ({sig.atr_pct:.2f}%)\n"
+                f"SL dist: {sl_pct*100:.3f}%"
             )
             logger.error(f"Risk manager None: {msg}")
             self.tg.send_error("risk_manager", msg)
             return
 
         logger.info(f"Params OK: qty={params.quantity} sl={params.sl_price} tp1={params.tp1_price} tp2={params.tp2_price}")
-
         buy_sell = "BUY" if sig.action == "LONG" else "SELL"
 
-        # 3. Notificar señal
         self.tg.send_signal(
             symbol=symbol, action=sig.action, price=sig.price,
             ema1=sig.ema1, ema2=sig.ema2, ema3=sig.ema3,
@@ -216,30 +197,26 @@ class EMABot:
             tp1=params.tp1_price, tp2=params.tp2_price,
         )
 
-        # 4. Ejecutar orden
         try:
             logger.info(f"Cancelando órdenes abiertas en {symbol}...")
             try:    self.bingx.cancel_all_orders(symbol)
             except: pass
 
             logger.info(f"Colocando orden MARKET {buy_sell} {sig.action} {params.quantity} {symbol}...")
-            order = self.bingx.place_market_order(
-                symbol, buy_sell, sig.action, params.quantity
-            )
+            order = self.bingx.place_market_order(symbol, buy_sell, sig.action, params.quantity)
             logger.info(f"Orden colocada: {order}")
-            order_id = str(order.get("orderId", order.get("data", {}).get("order", {}).get("orderId", "OK")))
+            order_id = str(order.get("orderId",
+                order.get("data", {}).get("order", {}).get("orderId", "OK")))
 
-            # 5. SL
             try:
                 sl_side = "SELL" if sig.action == "LONG" else "BUY"
                 self.bingx.place_stop_loss(symbol, sl_side, sig.action,
                                            params.sl_price, params.quantity)
                 logger.info(f"SL colocado @ {params.sl_price}")
             except Exception as e:
-                logger.warning(f"SL error (posición abierta sin SL): {e}")
+                logger.warning(f"SL error: {e}")
                 self.tg.send_error("SL", str(e))
 
-            # 6. TP1 + TP2
             try:
                 tp_side = "SELL" if sig.action == "LONG" else "BUY"
                 self.bingx.place_take_profit(symbol, tp_side, sig.action,
@@ -250,7 +227,6 @@ class EMABot:
             except Exception as e:
                 logger.warning(f"TP error: {e}")
 
-            # 7. Actualizar estado
             self.position_side  = sig.action
             self.entry_price    = sig.price
             self.position_qty   = params.quantity
@@ -304,7 +280,8 @@ class EMABot:
                    (self.position_side == "SHORT" and price <= self.current_tp1))
             if hit:
                 self.tp1_hit = True
-                self.current_sl = self.risk_mgr.breakeven_sl(
+                # ✅ FIX: nombre correcto del método
+                self.current_sl = self.risk_mgr.breakeven(
                     self.position_side, self.entry_price, price,
                     self.current_sl or self.entry_price, self.r_distance or 0
                 )
@@ -313,10 +290,11 @@ class EMABot:
                 self.tg.send_tp_hit(self.active_symbol, self.position_side,
                                     1, price, pnl_tp1, self.position_qty2 or 0)
         if self.current_atr and self.r_distance:
-            self.current_sl = self.risk_mgr.trailing_sl(
+            # ✅ FIX: nombre correcto del método
+            self.current_sl = self.risk_mgr.trailing(
                 self.position_side, price, self.current_sl or 0,
-                self.current_atr, activate_r=1.5,
-                entry=self.entry_price or 0, r=self.r_distance,
+                self.current_atr, entry=self.entry_price or 0,
+                r=self.r_distance, mult=1.5,
             )
 
     # ── Comandos Telegram ──────────────────────────────────────────────────
@@ -367,38 +345,28 @@ class EMABot:
     def tick(self):
         self.candles_seen += 1
         self._commands()
-
         if self.paused:
-            logger.info("Pausado")
-            return
+            logger.info("Pausado"); return
 
-        # ── Sin posición: escanear y abrir ─────────────────────────────
         if not self.position_side:
             logger.info("Sin posición — escaneando...")
             results = self.scanner.scan()
-
             if not results:
-                logger.info("Sin señales activas en los 30 pares")
+                logger.info("Sin señales activas")
                 if self.candles_seen % 3 == 0:
                     self.tg._send("🔍 Scan: sin señales activas ahora. Esperando próxima vela...")
                 return
 
             best = results[0]
-            logger.info(
-                f"SEÑAL ENCONTRADA: {best.symbol} {best.signal} "
-                f"score={best.score} sig_score={best.sig_score}"
-            )
-
+            logger.info(f"SEÑAL: {best.symbol} {best.signal} score={best.score}")
             self.tg._send(self.scanner.format_report(results[:3]))
             self._init_symbol(best.symbol)
-
             balance = self._balance()
             if balance <= 1:
                 self.tg.send_error("balance_insuficiente",
                     f"Balance muy bajo: ${balance:.2f}\nMínimo recomendado: $10 USDT")
                 return
 
-            # Construir Signal desde SymbolScore
             sig = Signal(
                 action    = best.signal,
                 price     = best.price,
@@ -414,25 +382,17 @@ class EMABot:
                 timestamp = best.symbol,
                 score     = best.sig_score,
             )
-
             self._open(best.symbol, sig, balance)
             return
 
-        # ── Con posición: gestionar ─────────────────────────────────────
         symbol = self.active_symbol
         try:
             df     = self._df(symbol)
             htf_df = self._df(symbol, HTF_INTERVAL, 60)
             sig    = self.strategy.get_latest_signal(df, htf_df)
             price  = float(df["close"].iloc[-1])
-
-            logger.info(
-                f"[{symbol}] precio={price:.4f} "
-                f"posición={self.position_side} señal={sig.action}"
-            )
-
+            logger.info(f"[{symbol}] precio={price:.4f} posición={self.position_side} señal={sig.action}")
             self._manage_position(price)
-
             flip = ((sig.action == "LONG"  and self.position_side == "SHORT") or
                     (sig.action == "SHORT" and self.position_side == "LONG"))
             if flip:
@@ -441,12 +401,10 @@ class EMABot:
                 time.sleep(0.5)
                 balance = self._balance()
                 self._open(symbol, sig, balance)
-
         except Exception as e:
             logger.error(f"Tick error {symbol}: {e}", exc_info=True)
             self.tg.send_error(f"tick:{symbol}", str(e))
 
-        # Heartbeat
         if self.candles_seen % HEARTBEAT_EVERY == 0:
             try:
                 df2 = self._df(symbol)
@@ -456,7 +414,7 @@ class EMABot:
                     self.position_side or "FLAT",
                     float(c["ema3"].iloc[-1]),
                     self._balance(), self.candles_seen,
-                    self.risk_mgr.tracker.total_pnl,
+                    self.risk_mgr.tracker.pnl,   # ✅ FIX: era .total_pnl
                 )
             except: pass
 
@@ -465,7 +423,6 @@ class EMABot:
         self.setup()
         secs = _secs(INTERVAL)
         logger.info(f"🚀 Loop activo | {INTERVAL}")
-
         while True:
             try:
                 now  = time.time()
@@ -474,8 +431,7 @@ class EMABot:
                 time.sleep(wait)
                 self.tick()
             except (KeyboardInterrupt, SystemExit):
-                logger.info("Bot detenido")
-                break
+                logger.info("Bot detenido"); break
             except Exception as e:
                 logger.error(f"Loop: {e}", exc_info=True)
                 self.tg.send_error("loop", str(e))
