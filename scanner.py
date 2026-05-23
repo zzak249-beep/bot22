@@ -1,156 +1,188 @@
 """
-Scanner — busca las mejores señales entre múltiples pares
+scanner.py — Scanner paralelo con contexto de mercado completo
+
+Ventaja: obtiene funding rate + order book imbalance de los mejores
+candidatos antes de decidir, eliminando entradas en mercado caro/saturado.
 """
+from __future__ import annotations
+import asyncio
 import logging
 import time
-from dataclasses import dataclass
-from typing import List, Optional
+from datetime import datetime, timezone
 
-import pandas as pd
+import numpy as np
 
-from strategy import EMAStrategy
+from bingx_client import BingXClient
+from strategy import EdgeStrategy, Candle, Signal, MarketContext
+from config import cfg
 
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SymbolScore:
-    symbol:    str
-    signal:    str      # LONG | SHORT
-    price:     float
-    ema1:      float
-    ema2:      float
-    ema3:      float
-    rsi:       float
-    adx:       float
-    atr_pct:   float
-    atr:       float
-    reason:    str
-    score:     float    # puntuación del scanner (volumen, ADX…)
-    sig_score: float    # puntuación de la señal strategy
+log = logging.getLogger("scanner")
 
 
-# Universo por defecto si USE_WHITELIST está desactivado
-DEFAULT_SYMBOLS = [
-    "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
-    "DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","LINK-USDT",
-    "MATIC-USDT","UNI-USDT","ATOM-USDT","LTC-USDT","ARB-USDT",
-    "OP-USDT","INJ-USDT","SUI-USDT","AAVE-USDT","PEPE-USDT",
-]
+def _to_candles(raw: list[dict]) -> list[Candle]:
+    return [Candle(**c) for c in raw]
 
 
-class MultiSymbolScanner:
-    def __init__(self, bingx_client, interval: str, htf_interval: str,
-                 top_n: int = 3, min_volume: float = 1_000_000,
-                 score_min: float = 30.0):
-        self.bingx        = bingx_client
-        self.interval     = interval
-        self.htf_interval = htf_interval
-        self.top_n        = top_n
-        self.min_volume   = min_volume
-        self.score_min    = score_min
-        self.strategy     = EMAStrategy()
-        self._cache: List[SymbolScore] = []
-        self._cache_ts: float = 0
-        self._cache_ttl: float = 60.0   # segundos
+# Whitelist de alta liquidez — los únicos donde el edge funciona
+WHITELIST_HQ = {
+    "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
+    "ADA-USDT","DOGE-USDT","AVAX-USDT","LINK-USDT","DOT-USDT",
+    "UNI-USDT","ATOM-USDT","NEAR-USDT","APT-USDT","ARB-USDT",
+    "OP-USDT","SUI-USDT","INJ-USDT","TIA-USDT","JUP-USDT",
+    "WIF-USDT","PEPE-USDT","BONK-USDT","LTC-USDT","BCH-USDT",
+    "FIL-USDT","AAVE-USDT","CRV-USDT","ONDO-USDT","ENA-USDT",
+}
 
-    def _get_symbols(self) -> List[str]:
+
+class Scanner:
+    def __init__(self, client: BingXClient):
+        self.client   = client
+        self.strategy = EdgeStrategy(cfg)
+        self._cooldown: dict[str, int]   = {}
+        self._daily:    dict[str, int]   = {}
+        self._scan_n:   int              = 0
+
+    # ── Símbolos ──────────────────────────────────────────────
+
+    async def get_symbols(self) -> list[str]:
+        if cfg.SYMBOLS:
+            return cfg.SYMBOLS
         try:
-            return self.bingx.get_all_symbols()
+            all_syms = await self.client.get_symbols()
+            if cfg.LIQUIDITY_MODE == "high_only":
+                return [s for s in all_syms if s in WHITELIST_HQ]
+            # Modo ampliado: filtrar stablecoins y micro-caps
+            exclude = {"USDC","BUSD","TUSD","DAI","FDUSD","USDP",
+                       "USDT","USTC","LUNA","LUNC","UST"}
+            return [s for s in all_syms
+                    if not any(s.startswith(e) for e in exclude)]
         except Exception as e:
-            logger.warning(f"get_all_symbols: {e} — usando DEFAULT_SYMBOLS")
-            return DEFAULT_SYMBOLS
+            log.error("get_symbols: %s", e)
+            return list(WHITELIST_HQ)
 
-    def _get_df(self, symbol: str, interval: str, limit: int = 150) -> Optional[pd.DataFrame]:
+    # ── Filtros de acceso ─────────────────────────────────────
+
+    def _cooldown_ok(self, symbol: str, bar_idx: int) -> bool:
+        return (bar_idx - self._cooldown.get(symbol, -999)) >= cfg.COOLDOWN_BARS
+
+    def _daily_ok(self, symbol: str) -> bool:
+        today = datetime.now(timezone.utc).date().isoformat()
+        return self._daily.get(f"{symbol}:{today}", 0) < cfg.MAX_SIGNALS_DAY
+
+    def _record(self, symbol: str, bar_idx: int):
+        today = datetime.now(timezone.utc).date().isoformat()
+        key   = f"{symbol}:{today}"
+        self._daily[key]    = self._daily.get(key, 0) + 1
+        self._cooldown[symbol] = bar_idx
+
+    # ── Liquidez mínima ───────────────────────────────────────
+
+    def _liquid(self, candles: list[Candle]) -> bool:
+        if len(candles) < 20:
+            return False
+        vols = [c.volume * c.close for c in candles[-30:]]
+        return float(np.mean(vols)) >= cfg.MIN_VOL_USDT
+
+    # ── Contexto de mercado (funding + OB imbalance) ──────────
+
+    async def _market_context(self, symbol: str) -> MarketContext:
         try:
-            raw = self.bingx.get_klines(symbol, interval, limit=limit)
-            if not raw or len(raw) < 30:
-                return None
-            df = pd.DataFrame(raw)
-            df = df.rename(columns={"timestamp": "timestamp"})
-            df = df.astype({c: "float64" for c in ["open","high","low","close","volume"]})
-            df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms", utc=True)
-            return df.sort_values("timestamp").reset_index(drop=True)
+            funding, ob_imb = await asyncio.gather(
+                self.client.get_funding_rate(symbol),
+                self.client.get_orderbook_imbalance(symbol, limit=10),
+            )
+            # OB imbalance → volume imbalance proxy
+            vim = ob_imb / (ob_imb + 1) if ob_imb > 0 else 0.5
+            return MarketContext(
+                funding_rate      = funding,
+                volume_imbalance  = vim,
+            )
+        except Exception:
+            return MarketContext()
+
+    # ── Scan de un símbolo ────────────────────────────────────
+
+    async def _scan_one(self, symbol: str) -> tuple[str, Signal | None]:
+        try:
+            # Descargar 3 timeframes en paralelo
+            raw3m, raw15m, raw1h = await asyncio.gather(
+                self.client.get_klines(symbol, "3m",  200),
+                self.client.get_klines(symbol, "15m", 60),
+                self.client.get_klines(symbol, "1h",  220),
+            )
+
+            if len(raw3m) < 60 or len(raw15m) < 15:
+                return symbol, None
+
+            c3m  = _to_candles(raw3m)
+            c15m = _to_candles(raw15m)
+            c1h  = _to_candles(raw1h) if raw1h else []
+
+            if not self._liquid(c3m):
+                return symbol, None
+            if not self._cooldown_ok(symbol, len(c3m)):
+                return symbol, None
+            if not self._daily_ok(symbol):
+                return symbol, None
+
+            # Contexto de mercado
+            ctx = await self._market_context(symbol)
+
+            sig = self.strategy.evaluate(symbol, c3m, c15m, c1h, ctx)
+            if sig:
+                self._record(symbol, len(c3m))
+            return symbol, sig
+
         except Exception as e:
-            logger.debug(f"klines {symbol}: {e}")
-            return None
+            log.debug("scan_one %s: %s", symbol, e)
+            return symbol, None
 
-    def _score_symbol(self, symbol: str) -> Optional[SymbolScore]:
-        df = self._get_df(symbol, self.interval)
-        if df is None:
-            return None
+    # ── Scan completo ─────────────────────────────────────────
 
-        # Filtro de volumen
-        vol = float((df["close"] * df["volume"]).tail(96).sum())
-        if vol < self.min_volume:
-            return None
+    async def run(self, symbols: list[str] | None = None) -> list[Signal]:
+        self._scan_n += 1
+        t0  = time.time()
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        log.info("▶ Scan #%d — %s UTC", self._scan_n, now)
 
-        htf_df = self._get_df(symbol, self.htf_interval, limit=60)
-        sig    = self.strategy.get_latest_signal(df, htf_df)
+        if symbols is None:
+            symbols = await self.get_symbols()
 
-        if sig.action == "HOLD":
-            return None
-        if sig.score < self.score_min:
-            return None
+        if not symbols:
+            log.warning("Sin símbolos.")
+            return []
 
-        # Puntuación scanner (adicional al score de la señal)
-        scanner_score = sig.score
-        if sig.adx > 25:
-            scanner_score += 5
-        if vol > self.min_volume * 3:
-            scanner_score += 5
+        signals: list[Signal] = []
+        batch_size = 8
 
-        return SymbolScore(
-            symbol    = symbol,
-            signal    = sig.action,
-            price     = sig.price,
-            ema1      = sig.ema1,
-            ema2      = sig.ema2,
-            ema3      = sig.ema3,
-            rsi       = sig.rsi,
-            adx       = sig.adx,
-            atr_pct   = sig.atr_pct,
-            atr       = sig.atr,
-            reason    = sig.reason,
-            score     = round(scanner_score, 1),
-            sig_score = sig.score,
+        # Diagnóstico por categoría
+        diag = {"fetch_err":0, "liquidity":0, "no_sig":0, "signals":0}
+
+        for i in range(0, len(symbols), batch_size):
+            batch   = symbols[i:i + batch_size]
+            results = await asyncio.gather(
+                *[self._scan_one(s) for s in batch],
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Exception):
+                    diag["fetch_err"] += 1
+                    continue
+                _, sig = r
+                if sig:
+                    signals.append(sig)
+                    diag["signals"] += 1
+                else:
+                    diag["no_sig"] += 1
+            await asyncio.sleep(0.4)
+
+        elapsed = time.time() - t0
+        log.info(
+            "✔ Scan #%d — %.1fs | %d símbolos | %d señal(es) | "
+            "fetch_err=%d no_sig=%d",
+            self._scan_n, elapsed, len(symbols),
+            diag["signals"], diag["fetch_err"], diag["no_sig"],
         )
 
-    def scan(self, force: bool = False) -> List[SymbolScore]:
-        now = time.time()
-        if not force and self._cache and (now - self._cache_ts) < self._cache_ttl:
-            return self._cache
-
-        symbols = self._get_symbols()
-        results: List[SymbolScore] = []
-
-        for sym in symbols:
-            try:
-                r = self._score_symbol(sym)
-                if r:
-                    results.append(r)
-            except Exception as e:
-                logger.debug(f"scan {sym}: {e}")
-
-        results.sort(key=lambda x: x.score, reverse=True)
-        self._cache    = results
-        self._cache_ts = now
-        logger.info(f"Scan completo: {len(results)} señales de {len(symbols)} pares")
-        return results
-
-    def best_symbol(self) -> Optional[SymbolScore]:
-        results = self.scan()
-        return results[0] if results else None
-
-    def format_report(self, results: List[SymbolScore]) -> str:
-        if not results:
-            return "🔍 Sin señales activas"
-        lines = [f"🔍 <b>Top {len(results)} señales</b>\n"]
-        for i, r in enumerate(results, 1):
-            emoji = "🟢" if r.signal == "LONG" else "🔴"
-            lines.append(
-                f"<b>#{i}</b> {emoji} <code>{r.symbol}</code> — Score: <code>{r.score}</code>\n"
-                f"  Precio: <code>{r.price:.6f}</code> | RSI: <code>{r.rsi:.0f}</code> | ADX: <code>{r.adx:.0f}</code>\n"
-                f"  ATR: <code>{r.atr_pct:.2f}%</code> | {r.reason}"
-            )
-        return "\n".join(lines)
+        # Ordenar por score descendente
+        return sorted(signals, key=lambda s: s.score, reverse=True)

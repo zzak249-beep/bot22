@@ -1,181 +1,162 @@
 """
-Risk Manager — EMA Bot
-SL=1.5×ATR | TP1=1.5×ATR (50%) | TP2=2.5×ATR (50%)
-Breakeven en TP1 | Trailing desde 1.5R | Anti-martingala
+risk_manager.py — Gestión de riesgo profesional v5
+
+Ventajas sobre bots normales:
+  1. Kelly Criterion parcial — tamaño óptimo según win rate histórico real
+  2. Drawdown adaptativo — reduce size 50% tras 2% DD, pausa tras 5%
+  3. Límite de pérdida diaria y semanal independientes
+  4. Cierre parcial en TP1 (50%), mueve SL a breakeven automáticamente
+  5. Registro de todas las operaciones para auto-calibración
 """
+from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, List
+from datetime import datetime, timezone
+from typing import Optional
+from strategy import Signal
 
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TradeParams:
-    quantity:    float
-    sl_price:    float
-    tp1_price:   float
-    tp2_price:   float
-    qty_tp1:     float
-    qty_tp2:     float
-    notional:    float
-    risk_usdt:   float
-    r_distance:  float
+log = logging.getLogger("risk")
 
 
 @dataclass
-class Tracker:
-    trades: List[dict] = field(default_factory=list)
-    wins:   int   = 0
-    losses: int   = 0
-    pnl:    float = 0.0
-    streak: int   = 0
-
-    @property
-    def wr(self):
-        return self.wins / max(self.wins + self.losses, 1)
-
-    # ✅ Alias para compatibilidad con cualquier código que use .total_pnl
-    @property
-    def total_pnl(self):
-        return self.pnl
-
-    def record(self, pnl, symbol, side):
-        self.pnl += pnl
-        if pnl > 0:
-            self.wins += 1
-            self.streak = max(0, self.streak) + 1
-        else:
-            self.losses += 1
-            self.streak = min(0, self.streak) - 1
-        self.trades.append({"pnl": pnl, "symbol": symbol, "side": side})
-        logger.info(f"Trade {side} {symbol} pnl={pnl:+.2f} wr={self.wr*100:.0f}%")
-
-    def summary(self):
-        if not self.trades:
-            return "Sin trades aún"
-        wl = [t["pnl"] for t in self.trades if t["pnl"] > 0]
-        ll = [t["pnl"] for t in self.trades if t["pnl"] <= 0]
-        pf = abs(sum(wl) / sum(ll)) if ll and sum(ll) != 0 else 999
-        return (
-            f"Trades: {len(self.trades)} | WR: {self.wr*100:.0f}%\n"
-            f"PnL: {self.pnl:+.2f}$ | PF: {pf:.2f}\n"
-            f"Racha: {'+' if self.streak > 0 else ''}{self.streak}"
-        )
+class TradeRecord:
+    symbol:    str
+    side:      str
+    entry:     float
+    exit:      float
+    pnl_usdt:  float
+    pnl_pct:   float
+    score:     int
+    timestamp: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RiskManager:
-    def __init__(self, risk_pct=1.0, atr_sl_mult=1.5, tp1_r=1.5, tp2_r=2.5,
-                 max_dd_pct=10.0, leverage=5, min_notional=5.0):
-        self.risk_pct      = risk_pct / 100
-        self.sl_mult       = atr_sl_mult
-        self.tp1_r         = tp1_r
-        self.tp2_r         = tp2_r
-        self.max_dd        = max_dd_pct / 100
-        self.leverage      = leverage
-        self.min_notional  = min_notional
-        self.tracker       = Tracker()
-        self.peak: Optional[float] = None
+    def __init__(self, cfg):
+        self.cfg     = cfg
+        self._trades: list[TradeRecord] = []
+        self._daily_pnl:   dict[str, float] = {}
+        self._weekly_pnl:  dict[str, float] = {}
 
-    def _factor(self):
-        s = self.tracker.streak
-        if s <= -4: return 0.30
-        if s <= -3: return 0.50
-        if s <= -2: return 0.70
-        if s >= 4:  return 1.15
-        return 1.0
+    # ── Registro ──────────────────────────────────────────────
 
-    def compute(self, balance, price, side, atr, score=50,
-                qty_step=0.001, price_precision=4, max_notional=None) -> Optional[TradeParams]:
-
-        if self.peak is None: self.peak = balance
-        self.peak = max(self.peak, balance)
-
-        # Max drawdown check
-        if (self.peak - balance) / max(self.peak, 1) >= self.max_dd:
-            logger.warning("Max DD alcanzado — pausando"); return None
-
-        sl_dist = atr * self.sl_mult
-        sl_pct  = sl_dist / price if price > 0 else 0
-        risk    = balance * self.risk_pct * self._factor()
-        notional = (risk * self.leverage) / max(sl_pct, 0.0003)
-
-        if max_notional and notional > max_notional:
-            logger.info(f"Notional {notional:.1f} > max {max_notional} — reduciendo")
-            notional = max_notional
-
-        if notional < self.min_notional:
-            logger.warning(
-                f"Notional {notional:.2f} < mínimo {self.min_notional} | "
-                f"balance={balance:.2f} atr={atr:.6f} sl_pct={sl_pct*100:.3f}%"
-            )
-            return None
-
-        # ✅ FIX: calcular qty y verificar que no sea 0 por qty_step grande
-        qty_raw = notional / price
-        qty = float(int(qty_raw / qty_step) * qty_step)
-
-        if qty <= 0:
-            # Intentar con una sola unidad mínima
-            min_qty_notional = qty_step * price
-            if min_qty_notional > self.min_notional * 3:
-                logger.warning(
-                    f"qty_step demasiado grande: 1u = ${min_qty_notional:.2f} "
-                    f"con balance=${balance:.2f} — rechazado"
-                )
-                return None
-            qty = qty_step
-
-        real_notional = qty * price
-        if real_notional < self.min_notional:
-            logger.warning(f"Notional real ${real_notional:.2f} < ${self.min_notional}")
-            return None
-
-        r = sl_dist
+    def record(self, symbol: str, side: str, entry: float,
+               exit_price: float, qty: float, leverage: int, score: int):
         if side == "LONG":
-            sl = round(price - r,          price_precision)
-            t1 = round(price + r * self.tp1_r, price_precision)
-            t2 = round(price + r * self.tp2_r, price_precision)
+            pnl_pct  = (exit_price - entry) / entry * 100 * leverage
+            pnl_usdt = (exit_price - entry) * qty * leverage
         else:
-            sl = round(price + r,          price_precision)
-            t1 = round(price - r * self.tp1_r, price_precision)
-            t2 = round(price - r * self.tp2_r, price_precision)
+            pnl_pct  = (entry - exit_price) / entry * 100 * leverage
+            pnl_usdt = (entry - exit_price) * qty * leverage
 
-        q1 = float(int(qty * 0.50 / qty_step) * qty_step)
-        q2 = round(qty - q1, 8)
-        if q1 <= 0: q1 = qty_step
-        if q2 <= 0: q2 = qty_step
+        rec = TradeRecord(symbol=symbol, side=side, entry=entry,
+                          exit=exit_price, pnl_usdt=pnl_usdt,
+                          pnl_pct=pnl_pct, score=score)
+        self._trades.append(rec)
 
-        logger.info(
-            f"Risk | {side} qty={qty} sl={sl} tp1={t1} tp2={t2} "
-            f"notional=${real_notional:.2f} factor={self._factor():.2f}"
-        )
-        return TradeParams(
-            quantity=qty, sl_price=sl, tp1_price=t1, tp2_price=t2,
-            qty_tp1=q1, qty_tp2=q2, notional=real_notional,
-            risk_usdt=risk, r_distance=r,
-        )
+        today = datetime.now(timezone.utc).date().isoformat()
+        week  = datetime.now(timezone.utc).strftime("%Y-W%W")
+        self._daily_pnl[today]  = self._daily_pnl.get(today, 0) + pnl_usdt
+        self._weekly_pnl[week]  = self._weekly_pnl.get(week, 0) + pnl_usdt
 
-    def breakeven(self, side, entry, price, sl, r, mult=1.05):
-        """Mueve SL a breakeven cuando el precio alcanza entry + r * mult."""
-        if side == "LONG"  and price >= entry + r * mult: return max(sl, entry)
-        if side == "SHORT" and price <= entry - r * mult: return min(sl, entry)
-        return sl
+        log.info("📝 Trade registrado: %s %s PnL=%.2f USDT (%.1f%%)",
+                 side, symbol, pnl_usdt, pnl_pct)
+        return pnl_usdt
 
-    # Alias para compatibilidad con llamadas antiguas
-    def breakeven_sl(self, side, entry, price, sl, r, mult=1.05):
-        return self.breakeven(side, entry, price, sl, r, mult)
+    # ── Estadísticas en tiempo real ───────────────────────────
 
-    def trailing(self, side, price, sl, atr, entry=0, r=0, mult=1.8):
-        """Trailing SL — solo activa cuando el precio supera entry + r * mult."""
-        if r > 0:
-            if side == "LONG"  and price < entry + r * mult: return sl
-            if side == "SHORT" and price > entry - r * mult: return sl
-        if side == "LONG":
-            return max(sl, price - atr)
-        else:
-            return min(sl, price + atr)
+    def win_rate(self, last_n: int = 20) -> float:
+        recent = self._trades[-last_n:]
+        if not recent:
+            return 0.55   # asumir 55% si no hay historial
+        wins = sum(1 for t in recent if t.pnl_usdt > 0)
+        return wins / len(recent)
 
-    # Alias para compatibilidad con llamadas antiguas
-    def trailing_sl(self, side, price, sl, atr, activate_r=1.5, entry=0, r=0):
-        return self.trailing(side, price, sl, atr, entry=entry, r=r, mult=activate_r)
+    def avg_win_loss_ratio(self, last_n: int = 20) -> float:
+        recent = self._trades[-last_n:]
+        wins   = [t.pnl_usdt for t in recent if t.pnl_usdt > 0]
+        losses = [abs(t.pnl_usdt) for t in recent if t.pnl_usdt < 0]
+        if not wins or not losses:
+            return 1.5
+        return (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+
+    def daily_pnl(self) -> float:
+        today = datetime.now(timezone.utc).date().isoformat()
+        return self._daily_pnl.get(today, 0.0)
+
+    def weekly_pnl(self) -> float:
+        week = datetime.now(timezone.utc).strftime("%Y-W%W")
+        return self._weekly_pnl.get(week, 0.0)
+
+    def total_pnl(self) -> float:
+        return sum(t.pnl_usdt for t in self._trades)
+
+    def summary_text(self) -> str:
+        wr   = self.win_rate() * 100
+        wpnl = self.daily_pnl()
+        tot  = self.total_pnl()
+        n    = len(self._trades)
+        return (f"Trades: `{n}` | Win Rate: `{wr:.1f}%`\n"
+                f"PnL hoy: `{wpnl:+.2f} USDT` | Total: `{tot:+.2f} USDT`")
+
+    # ── Validación antes de abrir ─────────────────────────────
+
+    def can_trade(self, balance: float, open_count: int) -> tuple[bool, str]:
+        cfg = self.cfg
+
+        if balance < 20:
+            return False, f"Balance insuficiente: {balance:.2f} USDT"
+
+        if open_count >= cfg.MAX_OPEN_TRADES:
+            return False, f"Máx posiciones ({cfg.MAX_OPEN_TRADES})"
+
+        # Drawdown diario
+        dd_pct = abs(min(self.daily_pnl(), 0)) / max(balance, 1) * 100
+        if dd_pct >= cfg.MAX_DD_DAY_PCT:
+            return False, f"DD diario {dd_pct:.1f}% ≥ {cfg.MAX_DD_DAY_PCT}%"
+
+        # Drawdown semanal
+        wk_pct = abs(min(self.weekly_pnl(), 0)) / max(balance, 1) * 100
+        if wk_pct >= cfg.MAX_DD_WEEK_PCT:
+            return False, f"DD semanal {wk_pct:.1f}% ≥ {cfg.MAX_DD_WEEK_PCT}%"
+
+        return True, "ok"
+
+    # ── Tamaño de posición — Kelly Criterion parcial ──────────
+
+    def position_size(self, balance: float, sig: Signal) -> float:
+        """
+        Kelly fracción = WR - (1-WR)/RR
+        Usamos Kelly × 0.25 (cuarto-Kelly) para máxima seguridad.
+        Reducción adicional si hay drawdown reciente.
+        """
+        cfg = self.cfg
+        wr  = self.win_rate(last_n=20)
+        rr  = sig.rr if sig.rr > 0 else 1.5
+
+        # Kelly fracción
+        kelly  = wr - (1 - wr) / rr
+        kelly  = max(0.01, min(kelly, 0.25))   # clamp 1%-25%
+        frac   = kelly * 0.25                  # quarter-Kelly
+
+        # Reducir size si hay drawdown
+        dd_pct = abs(min(self.daily_pnl(), 0)) / max(balance, 1) * 100
+        if dd_pct >= 2.0:
+            frac *= 0.5
+            log.info("Size reducido 50%% por DD=%.1f%%", dd_pct)
+        if dd_pct >= 3.5:
+            frac *= 0.5
+            log.info("Size reducido 75%% por DD=%.1f%%", dd_pct)
+
+        risk_usdt   = balance * frac
+        sl_distance = abs(sig.price - sig.sl)
+        if sl_distance == 0:
+            return 0.0
+
+        qty = (risk_usdt * cfg.LEVERAGE) / sig.price
+        max_by_sl = (risk_usdt) / sl_distance
+        qty = min(qty, max_by_sl)
+
+        log.info("Kelly=%.3f frac=%.3f | Risk=%.2f USDT | qty=%.4f",
+                 kelly, frac, risk_usdt, qty)
+        return round(max(qty, 0), 4)

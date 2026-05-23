@@ -1,446 +1,251 @@
 """
-EMA Bot v5 — Diagnóstico completo + ejecución robusta
+main.py — Edge Bot v5 — Punto de entrada
+
+Loop:
+  cada 3 minutos:
+    1. Procesar comandos Telegram
+    2. Monitorear posiciones abiertas (SL/TP/trail)
+    3. Si hay cupo: escanear mercado y abrir mejores señales
+    4. Heartbeat / resumen diario cada hora
 """
-import logging, os, sys, time
-from typing import Optional
+import asyncio
+import logging
+import signal
+import sys
+import time
+from datetime import datetime, timezone
 
-import pandas as pd
-from dotenv import load_dotenv
-
-from bingx_client    import BingXClient
-from strategy        import EMAStrategy, Signal
-from risk_manager    import RiskManager, TradeParams
+from config import cfg
+from bingx_client import BingXClient
+from scanner import Scanner
+from strategy import Signal
+from risk_manager import RiskManager
+from position_manager import PositionManager
 from telegram_client import TelegramClient
-from scanner         import MultiSymbolScanner
-
-load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout),
-              logging.FileHandler("bot.log", encoding="utf-8")],
+    level   = logging.INFO,
+    format  = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt = "%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("main")
-
-# ── Config ────────────────────────────────────────────────────────────────
-BINGX_API_KEY    = os.environ["BINGX_API_KEY"]
-BINGX_API_SECRET = os.environ["BINGX_API_SECRET"]
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-SYMBOL          = os.getenv("SYMBOL",           "")
-INTERVAL        = os.getenv("INTERVAL",         "3m")
-HTF_INTERVAL    = os.getenv("HTF_INTERVAL",     "15m")
-LEVERAGE        = int(os.getenv("LEVERAGE",     "5"))
-DEMO_MODE       = os.getenv("DEMO_MODE",        "false").lower() == "true"
-
-EMA1_LEN        = int(os.getenv("EMA1_LEN",     "2"))
-EMA2_LEN        = int(os.getenv("EMA2_LEN",     "4"))
-EMA3_LEN        = int(os.getenv("EMA3_LEN",     "20"))
-SCORE_MIN       = float(os.getenv("SCORE_MIN",  "30"))
-
-RISK_PCT        = float(os.getenv("RISK_PCT",   "1.0"))
-ATR_SL_MULT     = float(os.getenv("ATR_SL_MULT","1.5"))
-MAX_DD_PCT      = float(os.getenv("MAX_DD_PCT", "10.0"))
-SCANNER_TOP_N   = int(os.getenv("SCANNER_TOP_N","1"))
-MIN_VOLUME      = float(os.getenv("MIN_VOLUME", "1000000"))
-HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY","20"))
+log = logging.getLogger("main")
 
 
-class EMABot:
+class EdgeBot:
+
     def __init__(self):
-        self.bingx    = BingXClient(BINGX_API_KEY, BINGX_API_SECRET, demo=DEMO_MODE)
-        self.tg       = TelegramClient(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
-        self.strategy = EMAStrategy(EMA1_LEN, EMA2_LEN, EMA3_LEN, score_min=SCORE_MIN)
-        self.risk_mgr = RiskManager(
-            risk_pct=RISK_PCT, atr_sl_mult=ATR_SL_MULT,
-            max_dd_pct=MAX_DD_PCT, leverage=LEVERAGE,
-        )
-        self.scanner = MultiSymbolScanner(
-            self.bingx, INTERVAL, HTF_INTERVAL,
-            top_n=SCANNER_TOP_N, min_volume=MIN_VOLUME, score_min=SCORE_MIN,
-        )
+        self.client   = BingXClient(cfg.BINGX_API_KEY, cfg.BINGX_API_SECRET,
+                                    cfg.BINGX_BASE_URL)
+        self.tg       = TelegramClient(cfg.TELEGRAM_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        self.risk     = RiskManager(cfg)
+        self.pos_mgr  = PositionManager(self.client, self.tg, self.risk)
+        self.scanner  = Scanner(self.client)
 
-        self.active_symbol: Optional[str]   = SYMBOL if SYMBOL else None
-        self.position_side: Optional[str]   = None
-        self.entry_price:   Optional[float] = None
-        self.position_qty:  Optional[float] = None
-        self.position_qty2: Optional[float] = None
-        self.current_sl:    Optional[float] = None
-        self.current_tp1:   Optional[float] = None
-        self.current_tp2:   Optional[float] = None
-        self.r_distance:    Optional[float] = None
-        self.current_atr:   Optional[float] = None
-        self.tp1_hit:       bool = False
-        self.paused:        bool = False
-        self.candles_seen:  int  = 0
-        self.tg_offset:     int  = 0
-        self._qty_step      = 0.001
-        self._price_prec    = 4
+        self._paused:        bool  = False
+        self._scan_count:    int   = 0
+        self._last_heartbeat: float = 0
+        self._last_summary_day: str = ""
+        self._stop:          bool  = False
 
-    # ── Setup ──────────────────────────────────────────────────────────────
-    def setup(self):
-        logger.info("=== EMA Bot v5 ===")
-        mode = "PAPER" if DEMO_MODE else "LIVE"
-        logger.info(f"Modo: {mode} | Leverage: {LEVERAGE}x | Score min: {SCORE_MIN}")
-        self._test_connection()
-        if not self.active_symbol:
-            best = self.scanner.best_symbol()
-            self.active_symbol = best.symbol if best else "BTC-USDT"
-        self._init_symbol(self.active_symbol)
-        self._detect_position()
-        bal = self._balance()
-        self.tg.send_startup(self.active_symbol, INTERVAL, LEVERAGE, DEMO_MODE)
-        self.tg._send(
-            f"⚙️ <b>Config cargada</b>\n\n"
-            f"Balance: <code>${bal:,.2f} USDT</code>\n"
-            f"Score mínimo: <code>{SCORE_MIN}</code>\n"
-            f"Volumen mínimo: <code>${MIN_VOLUME/1e6:.1f}M</code>\n"
-            f"SL: <code>ATR × {ATR_SL_MULT}</code>\n"
-            f"Riesgo por trade: <code>{RISK_PCT}%</code>\n"
-            f"Modo: <code>{'PAPER 🟡' if DEMO_MODE else 'LIVE 🟢'}</code>"
-        )
+    # ── Arranque ──────────────────────────────────────────────
 
-    def _test_connection(self):
-        try:
-            bal = self.bingx.get_balance()
-            logger.info(f"✅ BingX conectado | balance={bal}")
-        except Exception as e:
-            self.tg.send_error("conexión BingX", str(e))
-            logger.error(f"❌ BingX connection failed: {e}")
+    async def setup(self):
+        log.info("══════════════════════════════════════════")
+        log.info("  Edge Bot v5 — BingX Futures")
+        log.info("  Modo: %s", "DRY RUN" if cfg.DRY_RUN else "REAL 🟢")
+        log.info("  Leverage: %dx | Score min: %d | RR min: 1.5",
+                 cfg.LEVERAGE, cfg.SCORE_MIN)
+        log.info("══════════════════════════════════════════")
 
-    def _init_symbol(self, symbol: str):
-        try:
-            info = self.bingx.get_symbol_info(symbol)
-            self._qty_step = float(info.get("tradeMinQuantity", "0.001"))
-            logger.info(f"Symbol {symbol} | qty_step={self._qty_step}")
-        except Exception as e:
-            logger.warning(f"Symbol info {symbol}: {e}")
-        for side in ("LONG", "SHORT"):
-            try:    self.bingx.set_leverage(symbol, LEVERAGE, side)
-            except Exception as e: logger.debug(f"Leverage {side}: {e}")
-        try:    self.bingx.set_margin_mode(symbol, "ISOLATED")
-        except Exception as e: logger.debug(f"MarginMode: {e}")
-
-    def _detect_position(self):
-        try:
-            for pos in self.bingx.get_positions(self.active_symbol or ""):
-                amt = float(pos.get("positionAmt", 0))
-                if abs(amt) > 0:
-                    self.position_side = pos.get("positionSide")
-                    self.entry_price   = float(pos.get("avgPrice", 0))
-                    self.position_qty  = abs(amt)
-                    logger.info(f"Posición existente: {self.position_side} {self.position_qty}")
-        except Exception as e:
-            logger.debug(f"Detect position: {e}")
-
-    # ── Datos ──────────────────────────────────────────────────────────────
-    def _df(self, symbol: str, interval: str = None, limit: int = 150) -> pd.DataFrame:
-        raw = self.bingx.get_klines(symbol, interval or INTERVAL, limit=limit)
-        if not raw:
-            raise ValueError(f"Sin datos {symbol}")
-        df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
-        df = df.astype({"timestamp":"int64","open":"float64","high":"float64",
-                        "low":"float64","close":"float64","volume":"float64"})
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        return df.sort_values("timestamp").reset_index(drop=True)
-
-    def _balance(self) -> float:
-        try:
-            b = self.bingx.get_balance()
-            v = float(b.get("availableMargin", b.get("balance", b.get("equity", 0))))
-            logger.info(f"Balance disponible: ${v:.2f}")
-            return v
-        except Exception as e:
-            logger.error(f"Balance error: {e}")
-            return 0.0
-
-    # ── Open ───────────────────────────────────────────────────────────────
-    def _open(self, symbol: str, sig: Signal, balance: float):
-        logger.info(f"--- INTENTANDO ABRIR {sig.action} {symbol} ---")
-        if balance <= 0:
-            msg = f"Balance cero o negativo: ${balance}"
-            logger.error(msg); self.tg.send_error("balance", msg); return
-
-        logger.info(f"Risk params: balance={balance:.2f} price={sig.price} atr={sig.atr:.6f}")
-        params: Optional[TradeParams] = self.risk_mgr.compute(
-            balance=balance, price=sig.price, side=sig.action,
-            atr=sig.atr, qty_step=self._qty_step, price_precision=self._price_prec,
-        )
-        if params is None:
-            sl_dist  = sig.atr * ATR_SL_MULT
-            sl_pct   = sl_dist / sig.price if sig.price > 0 else 0
-            notional = (balance * RISK_PCT/100 * LEVERAGE) / max(sl_pct, 0.0001)
-            msg = (
-                f"Risk manager rechazó el trade\n"
-                f"Balance: ${balance:.2f}\n"
-                f"Riesgo: ${balance*RISK_PCT/100:.2f}\n"
-                f"Notional calculado: ${notional:.2f}\n"
-                f"Mínimo requerido: $5\n"
-                f"ATR: {sig.atr:.6f} ({sig.atr_pct:.2f}%)\n"
-                f"SL dist: {sl_pct*100:.3f}%"
-            )
-            logger.error(f"Risk manager None: {msg}")
-            self.tg.send_error("risk_manager", msg)
-            return
-
-        logger.info(f"Params OK: qty={params.quantity} sl={params.sl_price} tp1={params.tp1_price} tp2={params.tp2_price}")
-        buy_sell = "BUY" if sig.action == "LONG" else "SELL"
-
-        self.tg.send_signal(
-            symbol=symbol, action=sig.action, price=sig.price,
-            ema1=sig.ema1, ema2=sig.ema2, ema3=sig.ema3,
-            rsi=sig.rsi, adx=sig.adx, atr_pct=sig.atr_pct,
-            reason=sig.reason, qty=params.quantity, leverage=LEVERAGE,
-            score=sig.score, sl_price=params.sl_price,
-            tp1=params.tp1_price, tp2=params.tp2_price,
-        )
-
-        try:
-            logger.info(f"Cancelando órdenes abiertas en {symbol}...")
-            try:    self.bingx.cancel_all_orders(symbol)
-            except: pass
-
-            logger.info(f"Colocando orden MARKET {buy_sell} {sig.action} {params.quantity} {symbol}...")
-            order = self.bingx.place_market_order(symbol, buy_sell, sig.action, params.quantity)
-            logger.info(f"Orden colocada: {order}")
-            order_id = str(order.get("orderId",
-                order.get("data", {}).get("order", {}).get("orderId", "OK")))
-
-            try:
-                sl_side = "SELL" if sig.action == "LONG" else "BUY"
-                self.bingx.place_stop_loss(symbol, sl_side, sig.action,
-                                           params.sl_price, params.quantity)
-                logger.info(f"SL colocado @ {params.sl_price}")
-            except Exception as e:
-                logger.warning(f"SL error: {e}")
-                self.tg.send_error("SL", str(e))
-
-            try:
-                tp_side = "SELL" if sig.action == "LONG" else "BUY"
-                self.bingx.place_take_profit(symbol, tp_side, sig.action,
-                                             params.tp1_price, params.qty_tp1)
-                self.bingx.place_take_profit(symbol, tp_side, sig.action,
-                                             params.tp2_price, params.qty_tp2)
-                logger.info(f"TP1={params.tp1_price} TP2={params.tp2_price}")
-            except Exception as e:
-                logger.warning(f"TP error: {e}")
-
-            self.position_side  = sig.action
-            self.entry_price    = sig.price
-            self.position_qty   = params.quantity
-            self.position_qty2  = params.qty_tp2
-            self.current_sl     = params.sl_price
-            self.current_tp1    = params.tp1_price
-            self.current_tp2    = params.tp2_price
-            self.r_distance     = params.r_distance
-            self.current_atr    = sig.atr
-            self.active_symbol  = symbol
-            self.tp1_hit        = False
-
-            self.tg.send_order_filled(symbol, sig.action, sig.price, order_id, params.quantity)
-            logger.info(f"✅ POSICIÓN ABIERTA: {sig.action} {symbol} @ {sig.price} qty={params.quantity}")
-
-        except Exception as e:
-            logger.error(f"❌ Error ejecutando orden: {e}", exc_info=True)
-            self.tg.send_error(f"order_execution {symbol}", str(e))
-
-    # ── Close ──────────────────────────────────────────────────────────────
-    def _close(self, symbol: str, price: float, reason: str = ""):
-        if not self.position_side or not self.position_qty:
-            return
-        qty = self.position_qty2 if (self.tp1_hit and self.position_qty2) else self.position_qty
-        try:
-            try:    self.bingx.cancel_all_orders(symbol)
-            except: pass
-            self.bingx.close_position(symbol, self.position_side, qty)
-            pnl = 0.0
-            if self.entry_price:
-                pnl = ((price - self.entry_price) if self.position_side == "LONG"
-                       else (self.entry_price - price)) * qty * LEVERAGE
-            self.tg.send_close(symbol, self.position_side,
-                               self.entry_price or 0, price, pnl, qty, reason)
-            self.risk_mgr.tracker.record(pnl, symbol, self.position_side)
-            logger.info(f"Cerrado {self.position_side} {symbol} pnl={pnl:+.2f}")
-            self.position_side = self.entry_price = self.position_qty = None
-            self.position_qty2 = self.current_sl  = self.current_tp1  = None
-            self.current_tp2   = self.r_distance  = self.current_atr  = None
-            self.tp1_hit = False
-        except Exception as e:
-            logger.error(f"Close error: {e}")
-            self.tg.send_error("close", str(e))
-
-    # ── Gestión posición abierta ────────────────────────────────────────────
-    def _manage_position(self, price: float):
-        if not self.position_side or not self.entry_price:
-            return
-        if not self.tp1_hit and self.current_tp1:
-            hit = ((self.position_side == "LONG"  and price >= self.current_tp1) or
-                   (self.position_side == "SHORT" and price <= self.current_tp1))
-            if hit:
-                self.tp1_hit = True
-                # ✅ FIX: nombre correcto del método
-                self.current_sl = self.risk_mgr.breakeven(
-                    self.position_side, self.entry_price, price,
-                    self.current_sl or self.entry_price, self.r_distance or 0
-                )
-                pnl_tp1 = abs(self.current_tp1 - self.entry_price) * \
-                          (self.position_qty or 0) * 0.5 * LEVERAGE
-                self.tg.send_tp_hit(self.active_symbol, self.position_side,
-                                    1, price, pnl_tp1, self.position_qty2 or 0)
-        if self.current_atr and self.r_distance:
-            # ✅ FIX: nombre correcto del método
-            self.current_sl = self.risk_mgr.trailing(
-                self.position_side, price, self.current_sl or 0,
-                self.current_atr, entry=self.entry_price or 0,
-                r=self.r_distance, mult=1.5,
+        # Verificar API
+        ok, msg = await self.client.test_connection()
+        if ok:
+            log.info("✅ BingX OK: %s", msg)
+        else:
+            log.error("❌ BingX falló: %s", msg)
+            await self.tg.error(
+                f"API BingX no responde:\n{msg}\n\n"
+                f"Verifica BINGX_API_KEY y BINGX_API_SECRET en Railway."
             )
 
-    # ── Comandos Telegram ──────────────────────────────────────────────────
-    def _commands(self):
-        try:
-            for upd in self.tg.get_updates(self.tg_offset):
-                self.tg_offset = upd["update_id"] + 1
-                msg = upd.get("message", {}).get("text", "").lower().strip()
-                cid = str(upd.get("message", {}).get("chat", {}).get("id", ""))
-                if cid != TELEGRAM_CHAT_ID:
-                    continue
-                if msg == "/status":
-                    bal = self._balance()
-                    self.tg._send(
-                        f"ℹ️ <b>Estado</b>\n\n"
-                        f"Par: <code>{self.active_symbol}</code>\n"
-                        f"Posición: <code>{self.position_side or 'Sin posición'}</code>\n"
-                        f"Entrada: <code>{self.entry_price or '—'}</code>\n"
-                        f"Pausado: <code>{'Sí' if self.paused else 'No'}</code>\n"
-                        f"Balance: <code>${bal:,.2f}</code>\n"
-                        f"Velas: <code>{self.candles_seen}</code>"
-                    )
-                elif msg == "/balance":
-                    self.tg.send_balance(self._balance())
-                elif msg == "/trades":
-                    self.tg.send_stats(self.risk_mgr.tracker.summary())
-                elif msg == "/pausa":
-                    self.paused = True; self.tg.send_paused()
-                elif msg == "/reanudar":
-                    self.paused = False; self.tg.send_resumed()
-                elif msg == "/scan":
-                    r = self.scanner.scan(force=True)
-                    self.tg._send(self.scanner.format_report(r[:5]))
-                elif msg == "/stop":
-                    self.tg._send("⛔ Deteniendo...")
-                    if self.active_symbol and self.position_side:
-                        try:
-                            p = float(self.bingx.get_ticker(self.active_symbol).get("lastPrice", 0))
-                            self._close(self.active_symbol, p, "Stop manual")
-                        except: pass
-                    raise SystemExit("Stop Telegram")
-        except SystemExit:
-            raise
-        except Exception as e:
-            logger.debug(f"Commands: {e}")
+        balance  = await self.client.get_balance()
+        pos      = await self.client.get_positions()
+        symbols  = await self.scanner.get_symbols()
 
-    # ── Tick ───────────────────────────────────────────────────────────────
-    def tick(self):
-        self.candles_seen += 1
-        self._commands()
-        if self.paused:
-            logger.info("Pausado"); return
+        log.info("Balance: %.2f USDT | Posiciones: %d | Símbolos: %d",
+                 balance, len(pos), len(symbols))
 
-        if not self.position_side:
-            logger.info("Sin posición — escaneando...")
-            results = self.scanner.scan()
-            if not results:
-                logger.info("Sin señales activas")
-                if self.candles_seen % 3 == 0:
-                    self.tg._send("🔍 Scan: sin señales activas ahora. Esperando próxima vela...")
-                return
+        if balance > 0:
+            await self.tg.auth_ok(balance, len(pos))
+        await self.tg.startup(cfg.DRY_RUN, len(symbols), balance)
 
-            best = results[0]
-            logger.info(f"SEÑAL: {best.symbol} {best.signal} score={best.score}")
-            self.tg._send(self.scanner.format_report(results[:3]))
-            self._init_symbol(best.symbol)
-            balance = self._balance()
-            if balance <= 1:
-                self.tg.send_error("balance_insuficiente",
-                    f"Balance muy bajo: ${balance:.2f}\nMínimo recomendado: $10 USDT")
-                return
+    # ── Comandos Telegram ─────────────────────────────────────
 
-            sig = Signal(
-                action    = best.signal,
-                price     = best.price,
-                ema1      = best.ema1,
-                ema2      = best.ema2,
-                ema3      = best.ema3,
-                rsi       = best.rsi,
-                adx       = best.adx,
-                atr       = best.atr_pct * best.price / 100,
-                atr_pct   = best.atr_pct,
-                volume_ok = True,
-                reason    = best.reason,
-                timestamp = best.symbol,
-                score     = best.sig_score,
-            )
-            self._open(best.symbol, sig, balance)
+    async def _process_commands(self):
+        updates = await self.tg.get_updates()
+        for upd in updates:
+            msg  = upd.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            cid  = str(msg.get("chat", {}).get("id", ""))
+            if cid != cfg.TELEGRAM_CHAT_ID:
+                continue
+
+            if text == "/status":
+                bal = await self.client.get_balance()
+                await self.tg.status(
+                    bal, self.pos_mgr.count(),
+                    self.risk.summary_text(), self._scan_count)
+
+            elif text == "/balance":
+                bal = await self.client.get_balance()
+                await self.tg._send(f"💰 Balance: `{bal:.2f} USDT`")
+
+            elif text == "/trades":
+                await self.tg._send(
+                    f"📊 *Historial*\n{self.risk.summary_text()}")
+
+            elif text == "/pausa":
+                self._paused = True
+                await self.tg.paused()
+
+            elif text == "/reanudar":
+                self._paused = False
+                await self.tg.resumed()
+
+            elif text == "/scan":
+                await self.tg._send("🔍 Escaneando ahora...")
+                sigs = await self.scanner.run()
+                if sigs:
+                    lines = [f"*Top señales ahora:*"]
+                    for s in sigs[:5]:
+                        e = "🟢" if s.side == "LONG" else "🔴"
+                        lines.append(
+                            f"{e} `{s.symbol}` {s.side} | "
+                            f"Score `{s.score}` | RR `1:{s.rr:.2f}`\n"
+                            f"   Entrada `{s.price:.6g}` | SL `{s.sl:.6g}` | TP1 `{s.tp1:.6g}`"
+                        )
+                    await self.tg._send("\n".join(lines))
+                else:
+                    await self.tg._send("🔍 Sin señales ahora.")
+
+            elif text == "/stop":
+                await self.tg._send("⛔ Deteniendo bot...")
+                self._stop = True
+
+    # ── Heartbeat / resumen diario ────────────────────────────
+
+    async def _maybe_heartbeat(self, balance: float):
+        now = time.time()
+        if now - self._last_heartbeat >= 3600:
+            self._last_heartbeat = now
+            wr  = self.risk.win_rate() * 100
+            pnl = self.risk.daily_pnl()
+            await self.tg.heartbeat(
+                balance, self.pos_mgr.count(),
+                wr, pnl, self._scan_count)
+
+    async def _maybe_daily_summary(self, balance: float):
+        today = datetime.now(timezone.utc).date().isoformat()
+        hour  = datetime.now(timezone.utc).hour
+        if hour == 0 and self._last_summary_day != today:
+            self._last_summary_day = today
+            await self.tg.daily_summary(self.risk.summary_text())
+
+    # ── Tick principal ────────────────────────────────────────
+
+    async def tick(self):
+        self._scan_count += 1
+
+        # 1. Comandos Telegram
+        await self._process_commands()
+        if self._stop:
             return
 
-        symbol = self.active_symbol
-        try:
-            df     = self._df(symbol)
-            htf_df = self._df(symbol, HTF_INTERVAL, 60)
-            sig    = self.strategy.get_latest_signal(df, htf_df)
-            price  = float(df["close"].iloc[-1])
-            logger.info(f"[{symbol}] precio={price:.4f} posición={self.position_side} señal={sig.action}")
-            self._manage_position(price)
-            flip = ((sig.action == "LONG"  and self.position_side == "SHORT") or
-                    (sig.action == "SHORT" and self.position_side == "LONG"))
-            if flip:
-                logger.info(f"Señal invertida: cerrando {self.position_side} → abriendo {sig.action}")
-                self._close(symbol, price, f"Flip a {sig.action}")
-                time.sleep(0.5)
-                balance = self._balance()
-                self._open(symbol, sig, balance)
-        except Exception as e:
-            logger.error(f"Tick error {symbol}: {e}", exc_info=True)
-            self.tg.send_error(f"tick:{symbol}", str(e))
+        # 2. Monitorear posiciones SIEMPRE (aunque pausado)
+        closed = await self.pos_mgr.monitor_all()
+        if closed:
+            log.info("🔒 %d posición(es) cerrada(s)", closed)
 
-        if self.candles_seen % HEARTBEAT_EVERY == 0:
-            try:
-                df2 = self._df(symbol)
-                c   = self.strategy.compute(df2)
-                self.tg.send_heartbeat(
-                    symbol, float(df2["close"].iloc[-1]),
-                    self.position_side or "FLAT",
-                    float(c["ema3"].iloc[-1]),
-                    self._balance(), self.candles_seen,
-                    self.risk_mgr.tracker.pnl,   # ✅ FIX: era .total_pnl
-                )
-            except: pass
+        # 3. Balance y heartbeat
+        balance = await self.client.get_balance()
+        await self._maybe_heartbeat(balance)
+        await self._maybe_daily_summary(balance)
 
-    # ── Loop ───────────────────────────────────────────────────────────────
-    def run(self):
-        self.setup()
-        secs = _secs(INTERVAL)
-        logger.info(f"🚀 Loop activo | {INTERVAL}")
-        while True:
+        if self._paused:
+            log.info("⏸ Bot pausado — esperando /reanudar")
+            return
+
+        # 4. Verificar si podemos abrir más posiciones
+        open_count = self.pos_mgr.count()
+        can, reason = self.risk.can_trade(balance, open_count)
+        if not can:
+            log.info("❌ No operar: %s", reason)
+            return
+
+        # 5. Escanear mercado
+        signals = await self.scanner.run()
+        if not signals:
+            log.info("Sin señales esta vela.")
+            return
+
+        # 6. Tomar la mejor señal y abrir
+        best = signals[0]
+        log.info("🎯 Mejor señal: %s %s score=%d RR=%.2f",
+                 best.side, best.symbol, best.score, best.rr)
+
+        # Calcular qty con Kelly
+        qty = self.risk.position_size(balance, best)
+        if qty <= 0:
+            log.warning("qty=0 para %s — balance insuficiente", best.symbol)
+            return
+
+        if cfg.DRY_RUN:
+            log.info("DRY_RUN — señal simulada: %s %s @ %.6g",
+                     best.side, best.symbol, best.price)
+            await self.tg.order_opened(best, qty, "DRY_RUN")
+            return
+
+        # Abrir posición real
+        opened = await self.pos_mgr.open(best, qty)
+        if opened:
+            log.info("✅ Posición abierta: %s %s qty=%.4f",
+                     best.side, best.symbol, qty)
+
+    # ── Loop principal ────────────────────────────────────────
+
+    async def run(self):
+        await self.setup()
+
+        stop_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+
+        log.info("🚀 Bot en marcha. Próxima vela en %ds.", cfg.SCAN_INTERVAL)
+        await self.tg._send(
+            f"🚀 *Bot corriendo*\n"
+            f"Intervalo: `{cfg.SCAN_INTERVAL}s` | "
+            f"Símbolos: `{len(await self.scanner.get_symbols())}`\n"
+            f"Comandos: `/status` `/balance` `/trades` `/scan` `/pausa` `/stop`"
+        )
+
+        while not stop_event.is_set() and not self._stop:
             try:
-                now  = time.time()
-                wait = max(0, (int(now / secs) + 1) * secs + 2 - now)
-                logger.info(f"⏳ Próxima vela en {wait:.0f}s")
-                time.sleep(wait)
-                self.tick()
-            except (KeyboardInterrupt, SystemExit):
-                logger.info("Bot detenido"); break
+                await self.tick()
             except Exception as e:
-                logger.error(f"Loop: {e}", exc_info=True)
-                self.tg.send_error("loop", str(e))
-                time.sleep(20)
+                log.exception("Error en tick: %s", e)
+                await self.tg.error(f"Error inesperado: {str(e)[:200]}")
 
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=cfg.SCAN_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
 
-def _secs(iv: str) -> int:
-    return int(iv[:-1]) * {"m":60,"h":3600,"d":86400}.get(iv[-1], 60)
+        await self.client.close()
+        log.info("Bot detenido correctamente.")
 
 
 if __name__ == "__main__":
-    EMABot().run()
+    asyncio.run(EdgeBot().run())
