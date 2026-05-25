@@ -1,162 +1,111 @@
 """
-telegram_client.py — Notificaciones Telegram v5
-
-Mensajes ricos con todos los niveles para trade manual y automático.
-Comandos: /status /balance /trades /pausa /reanudar /scan /stop
+Telegram Client v4 — incluye stats de performance en mensajes
 """
-from __future__ import annotations
-import logging
-import aiohttp
-from strategy import Signal
+import aiohttp, logging
+from datetime import datetime
 
-log = logging.getLogger("telegram")
-BASE = "https://api.telegram.org/bot{token}/{method}"
-
+log = logging.getLogger("Telegram")
+API = "https://api.telegram.org/bot{token}/{method}"
 
 class TelegramClient:
-    def __init__(self, token: str, chat_id: str):
+    def __init__(self, token, chat_id):
         self.token   = token
         self.chat_id = chat_id
-        self._offset  = 0
+        self._session = None
 
-    async def _send(self, text: str):
-        if not self.token or not self.chat_id:
-            return
-        url = BASE.format(token=self.token, method="sendMessage")
+    async def _sess(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10))
+        return self._session
+
+    async def send_message(self, text, parse_mode="Markdown"):
+        url  = API.format(token=self.token, method="sendMessage")
+        sess = await self._sess()
         try:
-            async with aiohttp.ClientSession() as s:
-                await s.post(url, json={
-                    "chat_id":                  self.chat_id,
-                    "text":                     text[:4000],
-                    "parse_mode":               "Markdown",
-                    "disable_web_page_preview": True,
-                })
+            async with sess.post(url, json={
+                "chat_id": self.chat_id, "text": text,
+                "parse_mode": parse_mode}) as r:
+                if r.status != 200:
+                    log.error(f"TG {r.status}: {await r.text()}")
         except Exception as e:
-            log.error("Telegram: %s", e)
+            log.error(f"TG send: {e}")
 
-    async def get_updates(self) -> list[dict]:
-        url = BASE.format(token=self.token, method="getUpdates")
-        try:
-            async with aiohttp.ClientSession() as s:
-                r = await s.get(url, params={"offset": self._offset,
-                                              "timeout": 1})
-                data = await r.json()
-            updates = data.get("result", [])
-            if updates:
-                self._offset = updates[-1]["update_id"] + 1
-            return updates
-        except Exception:
-            return []
+    async def send_entry(self, symbol, sig, price, size, order_id):
+        d    = sig["direction"]; tier = sig["tier"]; conv = sig["conviction"]
+        ns   = sig.get("norm_score",0); dr = sig.get("decay_ratio",0)
+        sl   = sig["sl"]; tp = sig.get("tp")
+        t_e  = {"SUP":"⭐","FUEL":"🔥","STD":"📍"}.get(tier,"")
+        d_e  = "🟢" if d=="LONG" else "🔴"
+        bars = "█"*conv + "░"*(10-conv)
+        rr   = abs((tp-price)/(price-sl)) if tp and sl and (price-sl)!=0 else 0
+        vol_e = {"LOW":"⚪","NORMAL":"🟢","HIGH":"🔴"}.get(sig.get("vol_regime",""),"")
 
-    # ── Mensajes ──────────────────────────────────────────────
+        msg = (
+            f"{d_e} *{t_e} {d} [{tier}]* — `{symbol}`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"💰 Entrada  : `{price:.4f}`\n"
+            f"🛡 Stop-Loss: `{sl:.4f}`\n"
+            f"🎯 Take-Prof: `{tp:.4f if tp else '—'}`\n"
+            f"📐 R/R      : `{rr:.2f}×`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"🧠 Score : `{round(ns*100)}/100` (umbral 63)\n"
+            f"📉 Decay : `{round(dr*100)}%` del pico IC (umbral 65%)\n"
+            f"🏆 Conv  : `[{bars}] {conv}/10`\n"
+            f"📊 Vol   : {vol_e} `{sig.get('vol_regime','?')}`\n"
+            f"📈 Trend : `{'SÍ' if sig.get('trending') else 'NO'}`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"  HTF `{'✅' if sig.get('htf_bull' if d=='LONG' else 'htf_bear') else '❌'}`"
+            f"  VWAP `{'✅' if (sig.get('above_vwap') if d=='LONG' else not sig.get('above_vwap')) else '❌'}`"
+            f"  CVD `{'✅' if (sig.get('cvd_rising') if d=='LONG' else not sig.get('cvd_rising')) else '❌'}`\n"
+            f"  TL `{'✅' if sig.get('tl_break_long' if d=='LONG' else 'tl_break_short') else '—'}`"
+            f"  FVG `{'✅' if sig.get('in_bull_fvg' if d=='LONG' else 'in_bear_fvg') else '—'}`"
+            f"  OB `{'✅' if sig.get('in_bull_ob' if d=='LONG' else 'in_bear_ob') else '—'}`\n"
+            f"  SQ `{'✅' if sig.get('sq_bull' if d=='LONG' else 'sq_bear') else '—'}`"
+            f"  DP `{'✅' if sig.get('dp_buy' if d=='LONG' else 'dp_sell') else '—'}`"
+            f"  Asym `{'✅' if sig.get('asym_bull' if d=='LONG' else 'asym_bear') else '❌'}`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"🆔 `{order_id}`  ⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+        )
+        await self.send_message(msg)
 
-    async def startup(self, dry_run: bool, symbols: int, balance: float):
-        mode = "🟡 PAPER (simulación)" if dry_run else "🟢 REAL"
-        await self._send(
-            f"🤖 *Edge Bot v5 — Iniciado*\n\n"
-            f"Modo: `{mode}`\n"
-            f"Balance: `{balance:.2f} USDT`\n"
-            f"Símbolos: `{symbols}`\n\n"
-            f"Estrategia: EMA8/21/55 + ADX + FVG + Volume Imbalance + Funding\n"
-            f"Score mínimo: `{60}/100`\n"
-            f"RR mínimo: `1.5`\n\n"
-            f"Comandos:\n"
-            f"`/status` `/balance` `/trades` `/pausa` `/reanudar` `/stop`"
+    async def send_close(self, symbol, side, entry, exit_p, pnl_pct, reason):
+        e = "💹" if pnl_pct>=0 else "💸"
+        s = "+" if pnl_pct>=0 else ""
+        await self.send_message(
+            f"{e} *CIERRE {side}* — `{symbol}`\n"
+            f"Entrada: `{entry:.4f}` → Salida: `{exit_p:.4f}`\n"
+            f"PnL: `{s}{pnl_pct:.2f}%` | {reason}\n"
+            f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
         )
 
-    async def order_opened(self, sig: Signal, qty: float, order_id: str):
-        emoji  = "🟢" if sig.side == "LONG" else "🔴"
-        dir_es = "LARGO ↑" if sig.side == "LONG" else "CORTO ↓"
-        sl_pct  = abs(sig.price - sig.sl)  / sig.price * 100
-        tp1_pct = abs(sig.tp1  - sig.price) / sig.price * 100
-        tp2_pct = abs(sig.tp2  - sig.price) / sig.price * 100
-        tp3_pct = abs(sig.tp3  - sig.price) / sig.price * 100
+    async def send_status(self, balance, positions, global_stats=None):
+        pos_lines = ""
+        for sym, p in positions.items():
+            pos_lines += f"  • `{sym}` {p['side']} entry=`{p['entry']:.4f}` conv=`{p['conv']}/10`\n"
+        if not pos_lines: pos_lines = "  _Sin posiciones_\n"
 
-        await self._send(
-            f"{emoji} *{sig.side} — {sig.symbol}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 *{dir_es}* | Régimen: `{sig.regime}`\n"
-            f"💲 Entrada:  `{sig.price:.6g}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛑 SL:   `{sig.sl:.6g}`  _(-{sl_pct:.2f}%)_\n"
-            f"🎯 TP1:  `{sig.tp1:.6g}` _(+{tp1_pct:.2f}%)_ — 50%\n"
-            f"🎯 TP2:  `{sig.tp2:.6g}` _(+{tp2_pct:.2f}%)_ — 25%\n"
-            f"🎯 TP3:  `{sig.tp3:.6g}` _(+{tp3_pct:.2f}%)_ — 25%\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚖️  R/R: `1:{sig.rr:.2f}` | ⭐ Score: `{sig.score}/100`\n"
-            f"📋 `{sig.reason}`\n"
-            f"📦 Cantidad: `{qty:.4f}` contratos\n"
-            f"🆔 `{order_id}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👆 _Puedes replicar manualmente en BingX_"
+        gs_block = ""
+        if global_stats and global_stats.get("total_trades",0)>0:
+            gs = global_stats
+            gs_block = (
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"📈 *Performance global*\n"
+                f"Trades: `{gs['total_trades']}` | WR: `{gs['win_rate']:.0%}` | "
+                f"PF: `{gs['profit_factor']:.2f}` | avg: `{gs['avg_pnl']:.2f}%`\n"
+                f"⛔ Suspendidos: `{', '.join(gs['suspended']) or 'ninguno'}`\n"
+            )
+        await self.send_message(
+            f"📊 *Reporte Horario QF×JP v4*\n"
+            f"💵 Balance: `{balance:.2f} USDT`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"*Posiciones:*\n{pos_lines}"
+            f"{gs_block}"
+            f"⏱ {datetime.utcnow().strftime('%H:%M UTC')}"
         )
 
-    async def tp_hit(self, symbol: str, side: str, tp_n: int,
-                     price: float, pnl: float, qty_left: float):
-        emoji = "💰" if pnl > 0 else "💸"
-        await self._send(
-            f"{emoji} *TP{tp_n} Alcanzado — {symbol}*\n"
-            f"Precio: `{price:.6g}` | PnL parcial: `{pnl:+.2f} USDT`\n"
-            f"Posición restante: `{qty_left:.4f}`\n"
-            f"_SL movido a breakeven — trailing activado_"
-        )
-
-    async def position_closed(self, symbol: str, side: str,
-                               entry: float, exit_p: float,
-                               pnl: float, reason: str):
-        emoji = "💰" if pnl >= 0 else "💸"
-        label = "GANANCIA" if pnl >= 0 else "PÉRDIDA"
-        pct   = (exit_p - entry) / entry * 100 if entry > 0 else 0
-        if side == "SHORT":
-            pct = -pct
-        await self._send(
-            f"{emoji} *Cerrado — {label}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"`{symbol}` | `{side}`\n"
-            f"Entrada: `{entry:.6g}` → Salida: `{exit_p:.6g}`\n"
-            f"Mov: `{pct:+.2f}%` | PnL: `{pnl:+.2f} USDT`\n"
-            f"Razón: `{reason}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-
-    async def heartbeat(self, balance: float, open_pos: int,
-                        wr: float, pnl_day: float, scan_n: int):
-        wr_emoji = "📈" if wr >= 55 else "📉"
-        await self._send(
-            f"💓 *Heartbeat*\n"
-            f"Balance: `{balance:.2f} USDT`\n"
-            f"Posiciones: `{open_pos}` | Scan #`{scan_n}`\n"
-            f"{wr_emoji} Win Rate: `{wr:.0f}%` | PnL hoy: `{pnl_day:+.2f} USDT`"
-        )
-
-    async def accuracy_report(self, report: str):
-        await self._send(report)
-
-    async def daily_summary(self, text: str):
-        await self._send(f"📊 *Resumen diario*\n{text}")
-
-    async def status(self, balance: float, pos_count: int,
-                     risk_summary: str, scan_n: int):
-        await self._send(
-            f"ℹ️ *Estado del Bot*\n\n"
-            f"Balance: `{balance:.2f} USDT`\n"
-            f"Posiciones: `{pos_count}`\n"
-            f"Scans: `{scan_n}`\n\n"
-            f"{risk_summary}"
-        )
-
-    async def paused(self):
-        await self._send("⏸ *Bot pausado* — `/reanudar` para continuar")
-
-    async def resumed(self):
-        await self._send("▶️ *Bot reanudado*")
-
-    async def error(self, msg: str):
-        await self._send(f"⚠️ *Error*\n`{msg[:400]}`")
-
-    async def auth_ok(self, balance: float, pos: int):
-        await self._send(
-            f"🔑 *API BingX verificada* ✅\n"
-            f"Balance futuros: `{balance:.2f} USDT`\n"
-            f"Posiciones abiertas: `{pos}`"
+    async def send_error(self, error):
+        await self.send_message(
+            f"⚠️ *Error*\n```\n{error[:300]}\n```\n"
+            f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
         )
