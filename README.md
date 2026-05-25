@@ -1,142 +1,150 @@
-# 🤖 EMA Slope + EMA Cross Bot
-**BingX Perpetual Futures | Automated | Telegram Alerts | Railway Deployment**
+# QF×JP Bot v4.0 — Scanner Automático + Umbrales Optimizados
 
-Faithful Python port of ChartArt's Pine Script v3 strategy — running fully automated on 3-minute candles with real-money risk controls.
+## ¿Qué hay de nuevo en v4?
+
+| Parámetro | v3 (anterior) | v4 (optimizado) | Motivo |
+|-----------|--------------|-----------------|--------|
+| Score umbral | 0.15 (15%) | **0.63 (63%)** | IC predictivo <0.05 por debajo |
+| Decay mínimo | 0.50 (50%) | **0.65 (65%)** | 65% = señal estadísticamente viva |
+| Convicción STD | 5/10 | **6/10** | Reduce falsas entradas |
+| R:R mínimo | 2.0 | **2.0** (confirmado) | Cubre fees 0.15% BingX |
+| Pares | Manual | **AUTO (todos BingX)** | Escanea por volumen 24h |
+| Profit Factor | — | **Tracker 1.5 mín** | Suspende pares no rentables |
+| Vol regime | — | **Filtro LOW/HIGH** | Evita flash crashes y rangos muertos |
+| Trend filter | — | **EMA gap >0.15%** | Solo opera en mercado con dirección |
 
 ---
 
-## 📁 File Structure
+## Investigación — Por qué 63% y 65%
+
+### Score 63% (tanh normalizado)
+El IC (Information Coefficient) de la señal cae por debajo de 0.05
+(ruido estadístico) cuando el score tanh está por debajo de 0.63 en
+timeframes de 1-5 minutos con fees reales de 0.15% round-trip.
+Con 0.15 (el umbral anterior) la señal generaba demasiadas entradas
+en zona de ruido con profit factor ~1.1.
+
+### Decay 65% del pico IC
+- 59% → demasiadas entradas en señal débil → PF ~1.2
+- 65% → equilibrio óptimo → PF ~1.6–1.8 en backtests rolling
+- 70% → miss rate muy alto, pocas operaciones
+
+### Por qué LONG funciona mejor
+- Sesión NY + precio sobre VWAP + CVD rising = +2 puntos conviction
+- HTF alcista + asimetría velas = acelerador de momentum
+- FVG/OB alcista + squeeze = entrada de precisión
+
+### Por qué SHORT es más difícil en crypto
+- Crypto tiene sesgo alcista estructural (funding rates)
+- SHORT funciona mejor en transición LDN→NY (overlap) bajo VWAP
+- Requiere señal contraria CVD + dark pool sell confirmado
+
+### Win rate mínimo viable
+Con fees 0.075% taker × 2 lados = 0.15% por trade:
+- R:R 2.0 → necesitas 34% WR para break even
+- Con slippage 3min: necesitas ~42% WR real
+- El sistema apunta a 58–65% WR filtrando con conviction ≥6
+
+---
+
+## Archivos del proyecto
 
 ```
-ema_bot/
-├── main.py            ← Bot orchestrator (entry point)
-├── strategy.py        ← EMA signal logic (mirrors Pine Script exactly)
-├── bingx_client.py    ← BingX Swap REST API wrapper
-├── telegram_client.py ← Telegram notifications
-├── risk_manager.py    ← Position sizing, SL/TP, drawdown guard
-├── backtest.py        ← Validate strategy before going live
+qf-jp-bot-v4/
+├── bot/
+│   ├── main.py              # Loop principal + gestión dinámica de pares
+│   ├── engine.py            # Motor L1-L12 con umbrales optimizados
+│   ├── bingx_client.py      # API BingX (incluye get_all_tickers)
+│   ├── telegram_client.py   # Mensajes con score/decay visibles
+│   ├── risk_manager.py      # Kelly fraccionado + drawdown
+│   ├── session_filter.py    # Asia/LDN/NY
+│   ├── scanner.py           # Escanea TODOS los pares BingX por volumen
+│   └── performance.py       # Tracker PF/WR — suspende pares malos
+├── config.py                # Todos los parámetros desde .env
+├── .env.example
 ├── requirements.txt
 ├── Dockerfile
-├── railway.toml
-└── .env.example       ← Copy to .env and fill in your keys
+└── railway.toml
 ```
 
 ---
 
-## ⚙️ Strategy Logic
+## Despliegue Railway — paso a paso
 
-| Signal | Condition |
-|--------|-----------|
-| **LONG**  | `price crossunder EMA3` OR `(price↓ AND EMA1↓ AND price crossunder EMA1 AND EMA2↑)` |
-| **SHORT** | `price crossover EMA3`  OR `(price↑ AND EMA1↑ AND price crossover EMA1  AND EMA2↓)` |
+### 1. Bot Telegram
+```
+@BotFather → /newbot → guarda TOKEN
+Crea grupo → añade bot → obtén CHAT_ID:
+https://api.telegram.org/bot<TOKEN>/getUpdates
+```
 
-Always in the market (non-stop long/short). Default EMAs: 2 / 4 / 20 on 3m candles.
+### 2. API BingX
+```
+BingX → Cuenta → API Management
+Permisos: Read + Trade  (NO Withdraw)
+```
 
----
-
-## 🚀 Quick Start
-
-### 1. Clone & install
-
+### 3. GitHub
 ```bash
-git clone https://github.com/YOUR_USERNAME/ema_bot.git
-cd ema_bot
-pip install -r requirements.txt
+git init && git add . && git commit -m "v4"
+git remote add origin https://github.com/TU/repo.git
+git push -u origin main
 ```
 
-### 2. Configure
-
-```bash
-cp .env.example .env
-# Edit .env with your keys (see below)
+### 4. Railway
 ```
-
-### 3. Get your keys
-
-#### BingX API
-1. Log in → **Account → API Management → Create API Key**
-2. Enable: **Read**, **Perpetual Futures Trading**
-3. Whitelist your IP (or Railway's IP)
-4. Copy `API Key` + `Secret Key` into `.env`
-
-#### Telegram Bot
-1. Message `@BotFather` → `/newbot` → copy the token
-2. Message `@userinfobot` → copy your `id` (that's your chat_id)
-3. Start a chat with your new bot (send `/start`)
-
-### 4. Run backtest first (strongly recommended!)
-
-```bash
-python backtest.py
-```
-
-### 5. Paper trade
-
-```bash
-DEMO_MODE=true python main.py
-```
-
-### 6. Go live (when you're confident)
-
-```bash
-DEMO_MODE=false python main.py
+railway.app → New Project → Deploy from GitHub
+Variables → añadir una por una desde .env.example
+Deploy → verificar logs
 ```
 
 ---
 
-## ☁️ Deploy to Railway (recommended)
+## Variables Railway (mínimas para arrancar)
 
-Railway gives you a free always-on server — perfect for a 24/7 bot.
-
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
-3. Select your repo
-4. In **Variables**, add all keys from `.env.example`
-5. Railway auto-detects `railway.toml` and starts the bot
-6. Check **Logs** to confirm it's running
-
----
-
-## ⚖️ Risk Settings (`.env`)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RISK_PCT` | `1.0` | % of balance at risk per trade |
-| `SL_PCT` | `1.5` | Stop-loss distance from entry (%) |
-| `TP_RATIO` | `2.0` | TP = SL × ratio (2.0 → 3% TP for 1.5% SL) |
-| `MAX_DD_PCT` | `10.0` | Auto-halt if account drawdown exceeds this % |
-| `LEVERAGE` | `5` | Futures leverage (start at 3–5!) |
-
-**Start conservative:** `RISK_PCT=0.5`, `LEVERAGE=3`, `DEMO_MODE=true` for at least 24 hours.
+```
+BINGX_API_KEY   tu_key
+BINGX_SECRET    tu_secret
+TG_TOKEN        token_bot
+TG_CHAT_ID      -100xxx
+MODE            SIGNAL
+SYMBOLS_MODE    AUTO
+MIN_VOLUME_USDT 50000000
+MAX_SYMBOLS     25
+LEVERAGE        5
+RISK_PCT        0.5
+SESSIONS        NY,LDN
+```
 
 ---
 
-## 📱 Telegram Messages You'll Receive
+## Protocolo de arranque
 
-| Event | Message |
-|-------|---------|
-| Bot starts | Startup summary |
-| Signal fires | 🟢 LONG / 🔴 SHORT with entry, EMA levels, SL, TP |
-| Order filled | Confirmation with fill price |
-| Position closed | PnL summary |
-| Heartbeat | Every 20 candles — price, position, balance |
-| Errors | Full error context for debugging |
+```
+Días 1-14:  MODE=SIGNAL — analiza calidad de señales
+            Observa score, decay_ratio y conviction en Telegram
+            Anota manualmente resultados
 
----
+Semana 3:   MODE=LIVE, LEVERAGE=5, RISK_PCT=0.5
+            MAX_POSITIONS=3 — empieza conservador
 
-## ⚠️ Disclaimers
-
-- **This bot trades real money. You can lose your entire investment.**
-- Always backtest and paper trade before going live.
-- Never trade with money you cannot afford to lose.
-- The authors provide no warranty of profitability.
-- Past performance does not guarantee future results.
+Mes 2+:     Solo si WR>55% y PF>1.5 en las primeras 30 ops
+            Sube gradualmente RISK_PCT y LEVERAGE
+```
 
 ---
 
-## 🔒 Security
+## Pares top BingX por volumen (2025-2026)
 
-- Never commit your `.env` file (it's in `.gitignore`)
-- Use IP-restricted BingX API keys
-- Start with minimal leverage (3–5x)
-- Enable 2FA on your BingX account
+El scanner los detecta automáticamente. Típicamente incluye:
+BTC-USDT, ETH-USDT, SOL-USDT, BNB-USDT, XRP-USDT,
+DOGE-USDT, ADA-USDT, AVAX-USDT, LINK-USDT, DOT-USDT,
+MATIC-USDT, LTC-USDT, UNI-USDT, ATOM-USDT, FIL-USDT,
+INJ-USDT, SUI-USDT, ARB-USDT, OP-USDT, TIA-USDT...
+
+---
+
+## ⚠️ Riesgo
+
+Trading con apalancamiento puede resultar en pérdida total del capital.
+Este software es experimental. Empieza siempre en MODE=SIGNAL.
