@@ -6,8 +6,8 @@ import asyncio
 import logging
 from typing import Optional
 
-from .bingx_client import BingXClient
-from .engine import StrategyEngine
+from src.bingx_client import BingXClient
+from src.engine import StrategyEngine
 
 log = logging.getLogger("qfjp.scanner")
 
