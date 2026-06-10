@@ -1,1 +1,1 @@
-# QF×JP Bot v3.0
+"""QF×JP v3.5 PREDATOR — Multi-Symbol Scanner Bot"""
