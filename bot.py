@@ -9,13 +9,13 @@ import os
 import signal as _signal
 import sys
 
-from src.config import settings
-from src.bingx_client import BingXClient
-from src.telegram_client import TelegramClient
-from src.engine import StrategyEngine
-from src.scanner import MultiSymbolScanner
-from src.risk_manager import RiskManager
-from src.state import BotState
+from config import settings
+from bingx_client import BingXClient
+from telegram_client import TelegramClient
+from engine import StrategyEngine
+from scanner import MultiSymbolScanner
+from risk_manager import RiskManager
+from state import BotState
 
 # ── Logging ────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
