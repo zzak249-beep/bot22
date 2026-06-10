@@ -1,150 +1,153 @@
-# QF×JP Bot v4.0 — Scanner Automático + Umbrales Optimizados
+# QF×JP v3.5 PREDATOR — Multi-Symbol Scanner Bot
 
-## ¿Qué hay de nuevo en v4?
-
-| Parámetro | v3 (anterior) | v4 (optimizado) | Motivo |
-|-----------|--------------|-----------------|--------|
-| Score umbral | 0.15 (15%) | **0.63 (63%)** | IC predictivo <0.05 por debajo |
-| Decay mínimo | 0.50 (50%) | **0.65 (65%)** | 65% = señal estadísticamente viva |
-| Convicción STD | 5/10 | **6/10** | Reduce falsas entradas |
-| R:R mínimo | 2.0 | **2.0** (confirmado) | Cubre fees 0.15% BingX |
-| Pares | Manual | **AUTO (todos BingX)** | Escanea por volumen 24h |
-| Profit Factor | — | **Tracker 1.5 mín** | Suspende pares no rentables |
-| Vol regime | — | **Filtro LOW/HIGH** | Evita flash crashes y rangos muertos |
-| Trend filter | — | **EMA gap >0.15%** | Solo opera en mercado con dirección |
-
----
-
-## Investigación — Por qué 63% y 65%
-
-### Score 63% (tanh normalizado)
-El IC (Information Coefficient) de la señal cae por debajo de 0.05
-(ruido estadístico) cuando el score tanh está por debajo de 0.63 en
-timeframes de 1-5 minutos con fees reales de 0.15% round-trip.
-Con 0.15 (el umbral anterior) la señal generaba demasiadas entradas
-en zona de ruido con profit factor ~1.1.
-
-### Decay 65% del pico IC
-- 59% → demasiadas entradas en señal débil → PF ~1.2
-- 65% → equilibrio óptimo → PF ~1.6–1.8 en backtests rolling
-- 70% → miss rate muy alto, pocas operaciones
-
-### Por qué LONG funciona mejor
-- Sesión NY + precio sobre VWAP + CVD rising = +2 puntos conviction
-- HTF alcista + asimetría velas = acelerador de momentum
-- FVG/OB alcista + squeeze = entrada de precisión
-
-### Por qué SHORT es más difícil en crypto
-- Crypto tiene sesgo alcista estructural (funding rates)
-- SHORT funciona mejor en transición LDN→NY (overlap) bajo VWAP
-- Requiere señal contraria CVD + dark pool sell confirmado
-
-### Win rate mínimo viable
-Con fees 0.075% taker × 2 lados = 0.15% por trade:
-- R:R 2.0 → necesitas 34% WR para break even
-- Con slippage 3min: necesitas ~42% WR real
-- El sistema apunta a 58–65% WR filtrando con conviction ≥6
-
----
-
-## Archivos del proyecto
+Bot autónomo que escanea **todos los perpetuos de BingX**, detecta
+rupturas de trendline + score compuesto y abre trades automáticamente.
+**No necesita TradingView** — calcula todo desde la API de BingX.
 
 ```
-qf-jp-bot-v4/
-├── bot/
-│   ├── main.py              # Loop principal + gestión dinámica de pares
-│   ├── engine.py            # Motor L1-L12 con umbrales optimizados
-│   ├── bingx_client.py      # API BingX (incluye get_all_tickers)
-│   ├── telegram_client.py   # Mensajes con score/decay visibles
-│   ├── risk_manager.py      # Kelly fraccionado + drawdown
-│   ├── session_filter.py    # Asia/LDN/NY
-│   ├── scanner.py           # Escanea TODOS los pares BingX por volumen
-│   └── performance.py       # Tracker PF/WR — suspende pares malos
-├── config.py                # Todos los parámetros desde .env
+BingX OHLCV API → Engine QF×JP → TL Ruptura + Score → Orden BingX + Telegram
+```
+
+---
+
+## 📁 Estructura
+
+```
+qfjp-scanner/
+├── src/
+│   ├── bot.py            # Loop principal + orquestación
+│   ├── config.py         # Toda la config via env vars
+│   ├── engine.py         # Estrategia QF×JP v3.5 completa en Python
+│   ├── scanner.py        # Escáner multi-símbolo concurrente
+│   ├── bingx_client.py   # API BingX: candles + órdenes
+│   ├── telegram_client.py
+│   ├── risk_manager.py   # Filtros + sizing
+│   └── state.py          # Estado: trades abiertos, circuit breaker
 ├── .env.example
 ├── requirements.txt
-├── Dockerfile
+├── Procfile
 └── railway.toml
 ```
 
 ---
 
-## Despliegue Railway — paso a paso
+## 🚀 Inicio rápido (local)
 
-### 1. Bot Telegram
-```
-@BotFather → /newbot → guarda TOKEN
-Crea grupo → añade bot → obtén CHAT_ID:
-https://api.telegram.org/bot<TOKEN>/getUpdates
-```
-
-### 2. API BingX
-```
-BingX → Cuenta → API Management
-Permisos: Read + Trade  (NO Withdraw)
-```
-
-### 3. GitHub
 ```bash
-git init && git add . && git commit -m "v4"
-git remote add origin https://github.com/TU/repo.git
-git push -u origin main
-```
-
-### 4. Railway
-```
-railway.app → New Project → Deploy from GitHub
-Variables → añadir una por una desde .env.example
-Deploy → verificar logs
+git clone https://github.com/TU_USUARIO/qfjp-scanner
+cd qfjp-scanner
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env      # rellena con tus claves
+python -m src.bot
 ```
 
 ---
 
-## Variables Railway (mínimas para arrancar)
+## ☁️ Deploy en Railway (recomendado)
 
+1. Sube el repo a GitHub.
+2. [Railway](https://railway.app) → **New Project → GitHub repo**.
+3. En **Variables**, añade cada variable de `.env.example` con tus valores reales.
+4. Railway ejecuta `python -m src.bot` automáticamente vía `railway.toml`.
+5. En **Logs** verás el escáner en marcha en segundos.
+
+> Railway tiene plan gratuito con 500h/mes — suficiente para un worker continuo.
+
+---
+
+## 📊 Lógica de señal — trigger principal: TL RUPTURA
+
+El bot replica el panel **QF×JP v3.5** del Pine Script:
+
+| Condición            | Descripción                                      |
+|----------------------|--------------------------------------------------|
+| **TL RUPTURA LONG**  | Precio rompe al alza una trendline bajista       |
+| **TL RUPTURA SHORT** | Precio rompe a la baja una trendline alcista     |
+| Score compuesto ≥ umbral | Suma ponderada de 9 factores (CVD, MFI, VDI…)|
+| HTF alineado         | ≥2 de 3 timeframes (15m/1h/4h) en la misma dirección |
+| Sesión activa        | LDN / NY / OVL (no OFF)                          |
+
+**Tiers:**
+- `STD`  → Score ≥ 55 + TL break
+- `FUEL` → Score ≥ 68 + TL break + CVD/Sweep/CHoCH/VDI
+- `SUP`  → Score ≥ 80 + todo lo anterior + Dark Pool / divergencias
+
+Por defecto `MIN_TIER=FUEL` — solo opera señales de alta convicción.
+
+---
+
+## 🔔 Mensajes Telegram
+
+**Señal de entrada:**
 ```
-BINGX_API_KEY   tu_key
-BINGX_SECRET    tu_secret
-TG_TOKEN        token_bot
-TG_CHAT_ID      -100xxx
-MODE            SIGNAL
-SYMBOLS_MODE    AUTO
-MIN_VOLUME_USDT 50000000
-MAX_SYMBOLS     25
-LEVERAGE        5
-RISK_PCT        0.5
-SESSIONS        NY,LDN
+⭐⭐ QF×JP v3.5 — 🟢 LONG FUEL
+Par: BTC-USDT
+Score L:72/100  S:41/100
+ADX: 28.4 (TEND↑)  CVD:0.73
+RSI: 38  MFI:32  Sesión:NY
+HTF L:3/3  S:0/3  Conv L:11  S:4
+Entrada: 67842.50
+SL: 67510.30
+TP1: 68355.20  TP2: 69108.60
+R:R: 1.5  Tamaño:0.15 u
+Contexto: 📈 TL RUPTURA  ⚡VDI  💧SWP
+ID: 1748291029301
+```
+
+**Resumen de scan cada 10 ciclos:**
+```
+🔍 Scan QF×JP — 80 pares — 3 señal(es)
+
+🟢 BTC-USDT          FUEL L: 72 S: 41 🔥TL
+🔴 ETH-USDT          FUEL L: 38 S: 71 🔥TL
+🟢 SOL-USDT          STD  L: 58 S: 44
 ```
 
 ---
 
-## Protocolo de arranque
+## ⚙️ Variables clave
 
-```
-Días 1-14:  MODE=SIGNAL — analiza calidad de señales
-            Observa score, decay_ratio y conviction en Telegram
-            Anota manualmente resultados
-
-Semana 3:   MODE=LIVE, LEVERAGE=5, RISK_PCT=0.5
-            MAX_POSITIONS=3 — empieza conservador
-
-Mes 2+:     Solo si WR>55% y PF>1.5 en las primeras 30 ops
-            Sube gradualmente RISK_PCT y LEVERAGE
-```
-
----
-
-## Pares top BingX por volumen (2025-2026)
-
-El scanner los detecta automáticamente. Típicamente incluye:
-BTC-USDT, ETH-USDT, SOL-USDT, BNB-USDT, XRP-USDT,
-DOGE-USDT, ADA-USDT, AVAX-USDT, LINK-USDT, DOT-USDT,
-MATIC-USDT, LTC-USDT, UNI-USDT, ATOM-USDT, FIL-USDT,
-INJ-USDT, SUI-USDT, ARB-USDT, OP-USDT, TIA-USDT...
+| Variable           | Default  | Descripción                              |
+|--------------------|----------|------------------------------------------|
+| `BINGX_API_KEY`    | —        | API key de BingX (Perpetuals)            |
+| `BINGX_SECRET_KEY` | —        | Secret key de BingX                      |
+| `TELEGRAM_TOKEN`   | —        | Token del bot (@BotFather)               |
+| `TELEGRAM_CHAT_ID` | —        | ID del canal/grupo (negativo = grupo)    |
+| `TIMEFRAME`        | `3m`     | Temporalidad de velas                    |
+| `SCAN_INTERVAL`    | `60`     | Segundos entre escaneos                  |
+| `MAX_SYMBOLS`      | `80`     | Máx pares a escanear                     |
+| `MIN_VOLUME_USDT`  | `500000` | Volumen 24h mínimo para incluir par      |
+| `CAPITAL`          | `1000`   | USDT a usar                              |
+| `RISK_PCT`         | `1.0`    | % riesgo por trade                       |
+| `LEVERAGE`         | `10`     | Apalancamiento                           |
+| `MIN_TIER`         | `FUEL`   | Tier mínimo para ejecutar               |
+| `REQUIRE_TL_BREAK` | `true`   | Exigir ruptura trendline                 |
+| `MAX_OPEN_TRADES`  | `5`      | Posiciones simultáneas máximo            |
 
 ---
 
-## ⚠️ Riesgo
+## 🛡️ Gestión de riesgo
 
-Trading con apalancamiento puede resultar en pérdida total del capital.
-Este software es experimental. Empieza siempre en MODE=SIGNAL.
+- **Circuit breaker**: para el bot si la pérdida diaria supera $50 (edita en `state.py`)
+- **Max open trades**: nunca abre más de N posiciones simultáneas
+- **Max daily trades**: hard stop diario
+- **Sin duplicados**: no abre dos trades en el mismo par
+- **R:R check**: rechaza señales con R:R < 1.0
+- **Sesión filter**: solo opera en LDN / NY / OVL por defecto
+
+---
+
+## 🔧 Permisos BingX necesarios
+
+En BingX → API Management, activa:
+- ✅ **Read**
+- ✅ **Perpetuals trading**
+- ❌ Withdrawals (NO necesario)
+
+---
+
+## ⚠️ Aviso
+
+Este bot opera con dinero real. Prueba primero en paper trading reduciendo
+`CAPITAL` a un valor mínimo y revisando los logs antes de aumentar el tamaño.
