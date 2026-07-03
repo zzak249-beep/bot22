@@ -1,60 +1,66 @@
 """
-Risk Manager — validates signals, computes position sizes.
+risk_manager.py — volob-standalone.
+Persistencia desde el día 1 — no como parche posterior. Sin esto,
+cada redeploy resetea MAX_DAILY_TRADES y DAILY_LOSS_PCT a cero.
 """
 import logging
+from datetime import datetime, timezone, date
 
-log = logging.getLogger("qfjp.risk")
+import state
 
-TIER_RANK = {"NONE": -1, "PRE": 0, "STD": 1, "FUEL": 2, "SUP": 3}
+log = logging.getLogger("risk_mgr")
 
 
 class RiskManager:
-    def __init__(self, settings):
-        self.settings           = settings
-        self.last_reject_reason = ""
-        self.last_qty           = 0.0
+    def __init__(self, cfg):
+        self.cfg = cfg
+        saved_pnl, saved_trades, saved_eq, saved_day = state.get_day_state()
+        self._day_pnl      = saved_pnl if saved_pnl is not None else 0.0
+        self._day_trades   = saved_trades if saved_trades is not None else 0
+        self._day_start_eq = saved_eq
+        self._today        = date.fromisoformat(saved_day) if saved_day else None
+        if saved_day:
+            log.info(f"RiskManager: día restaurado desde state.py — "
+                     f"day_pnl={self._day_pnl:+.2f}  trades={self._day_trades}  "
+                     f"day_start_eq={self._day_start_eq}")
 
-    def can_trade(self, state, signal: dict) -> bool:
-        tier     = signal.get("tier", "NONE")
-        min_tier = self.settings.MIN_TIER
+    def _reset(self, equity: float):
+        today = datetime.now(tz=timezone.utc).date()
+        if today != self._today:
+            self._today        = today
+            self._day_pnl      = 0.0
+            self._day_trades   = 0
+            self._day_start_eq = equity
+            state.save_day_state(self._day_pnl, self._day_trades,
+                                 self._day_start_eq, self._today.isoformat())
+            log.info(f"New day — equity: {equity:.2f} USDT")
 
-        if tier == "NONE":
-            self.last_reject_reason = "No signal"
-            return False
+    def _today_str(self) -> str:
+        if self._today:
+            return self._today.isoformat()
+        return datetime.now(tz=timezone.utc).date().isoformat()
 
-        if TIER_RANK.get(tier, -1) < TIER_RANK.get(min_tier, 1):
-            self.last_reject_reason = f"Tier {tier} below minimum {min_tier}"
-            return False
+    def can_trade(self, equity: float) -> tuple:
+        """Returns (allowed: bool, reason: str)."""
+        self._reset(equity)
+        if self._day_trades >= self.cfg.MAX_DAILY_TRADES:
+            return False, f"Daily trades limit: {self._day_trades}"
+        if self._day_start_eq and self._day_start_eq > 0:
+            loss_pct = (-self._day_pnl / self._day_start_eq) * 100.0
+            if loss_pct >= self.cfg.DAILY_LOSS_PCT:
+                return False, f"Daily loss {loss_pct:.1f}% >= {self.cfg.DAILY_LOSS_PCT}%"
+        return True, "ok"
 
-        if tier == "PRE" and not self.settings.TRADE_PRE_SIGNALS:
-            self.last_reject_reason = "PRE signals disabled"
-            return False
+    def record_trade(self, pnl_usdt: float):
+        self._day_pnl    += pnl_usdt
+        self._day_trades += 1
+        state.save_day_state(self._day_pnl, self._day_trades,
+                             self._day_start_eq, self._today_str())
+        log.info(f"Trade recorded pnl={pnl_usdt:+.2f} day_pnl={self._day_pnl:+.2f} trades={self._day_trades}")
 
-        if state.open_trades >= self.settings.MAX_OPEN_TRADES:
-            self.last_reject_reason = f"Max open trades ({self.settings.MAX_OPEN_TRADES}) reached"
-            return False
+    def new_day(self, equity: float):
+        self._reset(equity)
 
-        if state.daily_trades >= self.settings.MAX_DAILY_TRADES:
-            self.last_reject_reason = f"Max daily trades ({self.settings.MAX_DAILY_TRADES}) reached"
-            return False
-
-        if state.circuit_broken:
-            self.last_reject_reason = "Circuit breaker active"
-            return False
-
-        # Avoid duplicate symbol trade
-        sym = signal.get("symbol", "")
-        if sym in state.open_symbols:
-            self.last_reject_reason = f"Already in trade for {sym}"
-            return False
-
-        self.last_reject_reason = ""
-        return True
-
-    def compute_qty(self, price: float, contract_value: float) -> float:
-        capital  = self.settings.CAPITAL
-        risk_pct = self.settings.RISK_PCT / 100.0
-        leverage = self.settings.LEVERAGE
-        notional = capital * risk_pct * leverage
-        qty = notional / (price * max(contract_value, 0.001))
-        return max(0.01, round(qty, 2))
+    @property
+    def day_pnl(self) -> float:
+        return self._day_pnl

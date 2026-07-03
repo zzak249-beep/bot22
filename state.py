@@ -1,63 +1,154 @@
 """
-BotState — tracks open trades, daily limits, circuit breaker.
+Persistent bot state — survives Railway restarts.
+Stores: entry_time, tp1_hit, trail_stop, day_pnl/day_trades per symbol/side.
+
+Construido con las lecciones ya aprendidas en el resto del fleet, no
+desde cero de verdad: get_tracked_positions() y el day-state estaban
+desde el día 1, no como parche posterior.
 """
+import json
 import logging
-from datetime import date
+import os
+import time
 
-log = logging.getLogger("qfjp.state")
+log = logging.getLogger("state")
+
+_STATE_FILE = os.getenv("STATE_FILE", "/data/bot_state.json")
 
 
-class BotState:
-    def __init__(self):
-        self.open_trades:    int   = 0
-        self.open_symbols:   set   = set()
-        self.daily_trades:   int   = 0
-        self.daily_pnl:      float = 0.0
-        self.circuit_broken: bool  = False
-        self._today:         date  = date.today()
-        self._status_counter: int  = 0
+# ── Internal I/O ──────────────────────────────────────────────
 
-    def _rollover(self):
-        today = date.today()
-        if today != self._today:
-            log.info("📅 Day rollover — resetting daily counters")
-            self.daily_trades   = 0
-            self.daily_pnl      = 0.0
-            self.circuit_broken = False
-            self._today         = today
+def _load() -> dict:
+    try:
+        with open(_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    def record_trade(self, signal: dict, order: dict):
-        self._rollover()
-        self.open_trades  += 1
-        self.daily_trades += 1
-        sym = signal.get("symbol", "")
-        if sym:
-            self.open_symbols.add(sym)
-        log.info(f"Trade recorded {sym}. Open:{self.open_trades} Daily:{self.daily_trades}")
 
-    def close_trade(self, symbol: str, pnl: float = 0.0):
-        self._rollover()
-        self.open_trades = max(0, self.open_trades - 1)
-        self.open_symbols.discard(symbol)
-        self.daily_pnl  += pnl
-        log.info(f"Trade closed {symbol}. PnL:{pnl:.2f} DailyPnL:{self.daily_pnl:.2f}")
-        if self.daily_pnl < -50:
-            self.circuit_broken = True
-            log.warning("⚡ Circuit breaker triggered — daily loss > $50")
+def _save(data: dict):
+    try:
+        os.makedirs(os.path.dirname(_STATE_FILE) or ".", exist_ok=True)
+        with open(_STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.error(f"state write error: {e}")
 
-    def should_send_status(self, every: int = 20) -> bool:
-        self._status_counter += 1
-        if self._status_counter >= every:
-            self._status_counter = 0
-            return True
+
+def _key(symbol: str, side: str, field: str) -> str:
+    return f"{symbol}_{side}_{field}"
+
+
+# ── Entry time ────────────────────────────────────────────────
+
+def save_entry(symbol: str, side: str, ts: float = None):
+    d = _load()
+    d[_key(symbol, side, "entry_ts")] = ts or time.time()
+    _save(d)
+    log.debug(f"state.save_entry {symbol} {side}")
+
+
+def get_entry_ts(symbol: str, side: str) -> float | None:
+    v = _load().get(_key(symbol, side, "entry_ts"))
+    return float(v) if v is not None else None
+
+
+def is_max_hold_expired(symbol: str, side: str, max_minutes: int) -> bool:
+    ts = get_entry_ts(symbol, side)
+    if ts is None:
         return False
+    elapsed = (time.time() - ts) / 60.0
+    if elapsed >= max_minutes:
+        log.info(f"MAX_HOLD expired {symbol} {side} | elapsed={elapsed:.0f}m limit={max_minutes}m")
+        return True
+    return False
 
-    @property
-    def summary(self) -> str:
-        self._rollover()
-        return (
-            f"Open: {self.open_trades} | Daily: {self.daily_trades} | "
-            f"PnL día: ${self.daily_pnl:.2f} | "
-            f"Símbolos: {', '.join(self.open_symbols) or '—'} | "
-            f"CB: {'🔴ON' if self.circuit_broken else '🟢OFF'}"
-        )
+
+# ── Tracked positions (this bot's own) ──────────────────────────
+
+def get_tracked_positions() -> list:
+    """
+    Returns [(symbol, side), ...] para cada posición con entry_ts propio.
+    Usado en vez de client.get_positions() (toda la cuenta) — aunque este
+    bot esté pensado para cuenta propia, escopar a lo propio no cuesta
+    nada y evita reintroducir el bug que ya vimos en 4 bots distintos.
+    """
+    d = _load()
+    out = []
+    for k in d:
+        if k.endswith("_entry_ts"):
+            base = k[: -len("_entry_ts")]
+            if "_" not in base:
+                continue
+            symbol, side = base.rsplit("_", 1)
+            out.append((symbol, side))
+    return out
+
+
+# ── Trail stop ────────────────────────────────────────────────
+
+def save_trail(symbol: str, side: str, stop: float):
+    d = _load()
+    d[_key(symbol, side, "trail")] = stop
+    _save(d)
+
+
+def get_trail(symbol: str, side: str) -> float | None:
+    v = _load().get(_key(symbol, side, "trail"))
+    return float(v) if v is not None else None
+
+
+# ── TP1 / breakeven flags ────────────────────────────────────
+
+def set_tp1_hit(symbol: str, side: str, hit: bool = True):
+    d = _load()
+    d[_key(symbol, side, "tp1_hit")] = hit
+    _save(d)
+
+
+def is_tp1_hit(symbol: str, side: str) -> bool:
+    return bool(_load().get(_key(symbol, side, "tp1_hit"), False))
+
+
+def set_be_moved(symbol: str, side: str, moved: bool = True):
+    d = _load()
+    d[_key(symbol, side, "be_moved")] = moved
+    _save(d)
+
+
+def is_be_moved(symbol: str, side: str) -> bool:
+    return bool(_load().get(_key(symbol, side, "be_moved"), False))
+
+
+# ── Clear all state for a position ───────────────────────────
+
+def clear(symbol: str, side: str):
+    d = _load()
+    prefix = f"{symbol}_{side}_"
+    keys_to_del = [k for k in d if k.startswith(prefix)]
+    for k in keys_to_del:
+        del d[k]
+    _save(d)
+    log.debug(f"state.clear {symbol} {side} ({len(keys_to_del)} keys removed)")
+
+
+# ── Daily PnL/trades state (bot-wide) ────────────────────────
+
+def save_day_state(day_pnl: float, day_trades: int, day_start_eq: float, day: str):
+    d = _load()
+    d["_day_pnl"]      = day_pnl
+    d["_day_trades"]   = day_trades
+    d["_day_start_eq"] = day_start_eq
+    d["_day"]          = day
+    _save(d)
+
+
+def get_day_state() -> tuple:
+    d = _load()
+    return d.get("_day_pnl"), d.get("_day_trades"), d.get("_day_start_eq"), d.get("_day")
+
+
+# ── Debug dump ────────────────────────────────────────────────
+
+def dump() -> dict:
+    return _load()

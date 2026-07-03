@@ -1,86 +1,89 @@
 """
-QF×JP v3.5 PREDATOR — Multi-Symbol Scanner Config
-All values from environment variables.
+volob-standalone — Volume Order Block Bot
+Bot nuevo, aislado — pensado para cuenta/API key propia, no comparte
+infraestructura ni cuenta de BingX con el resto del fleet.
+
+Estrategia: order blocks ponderados por volumen — implementación propia
+(ver strategy_vol_ob.py), no traducción de ningún script de terceros.
+Sin backtesting, sin track record — empieza con tamaño mínimo.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
+import os
 
 
-class Settings(BaseSettings):
-    # ── BingX ─────────────────────────────────────────────────────────────
-    BINGX_API_KEY:    str = Field(..., description="BingX API Key")
-    BINGX_SECRET_KEY: str = Field(..., description="BingX Secret Key")
-    BINGX_BASE_URL:   str = "https://open-api.bingx.com"
+def _bool(k, d="false"):
+    return os.getenv(k, d).strip().split("#")[0].strip().lower() in ("1", "true", "yes")
 
-    # ── Telegram ──────────────────────────────────────────────────────────
-    TELEGRAM_TOKEN:   str = Field(...)
-    TELEGRAM_CHAT_ID: str = Field(...)
+def _float(k, d):
+    try:
+        return float(os.getenv(k, str(d)).strip().split("#")[0].strip())
+    except Exception:
+        return d
 
-    # ── Scanner settings ──────────────────────────────────────────────────
-    TIMEFRAME:          str = "3m"    # candle interval: 1m 3m 5m 15m 1h
-    SCAN_INTERVAL:      int = 60      # seconds between full scans
-    MAX_SYMBOLS:        int = 80      # max perpetual pairs to scan (top by volume)
-    CONCURRENT_SCANS:   int = 10      # parallel symbol evaluations
-    MIN_VOLUME_USDT:    float = 500000  # min 24h volume to include symbol
+def _int(k, d):
+    try:
+        return int(os.getenv(k, str(d)).strip().split("#")[0].strip())
+    except Exception:
+        return d
 
-    # ── Capital & Risk ────────────────────────────────────────────────────
-    CAPITAL:          float = 1000.0
-    RISK_PCT:         float = 1.0     # % capital risk per trade
-    LEVERAGE:         int   = 10
-    TP1_MULT:         float = 1.5     # ATR multiplier TP1
-    TP2_MULT:         float = 3.0     # ATR multiplier TP2
-    SL_MULT:          float = 1.0     # ATR multiplier SL
-    MAX_OPEN_TRADES:  int   = 5       # max simultaneous positions
-    MAX_DAILY_TRADES: int   = 20
+def _str(k, d=""):
+    return os.getenv(k, d).strip().split("#")[0].strip() or d
 
-    # ── Signal filters ────────────────────────────────────────────────────
-    # Main trigger: trendline breakout (required)
-    REQUIRE_TL_BREAK:   bool = True    # must have TL ruptura
-    # Score thresholds
-    SC_THR_STD:   int = 55
-    SC_THR_FUEL:  int = 68
-    SC_THR_SUP:   int = 80
-    SC_THR_PRE:   int = 48
-    MIN_TIER:     str = "STD"   # STD | FUEL | SUP
-    # HTF alignment minimum (0-4 timeframes)
-    HTF_MIN:      int = 2
-
-    # ── Strategy parameters ───────────────────────────────────────────────
-    ATR_LEN:   int   = 10
-    MOM_LEN:   int   = 20
-    REV_LEN:   int   = 8
-    VOL_LEN:   int   = 14
-    ADX_LEN:   int   = 14
-    ADX_TREND: int   = 25
-    ADX_LAT:   int   = 20
-    CVD_LEN:   int   = 20
-    CVD_ROLL:  int   = 50
-    RSI_LEN:   int   = 14
-    MFI_LEN:   int   = 14
-    MFI_OB:    int   = 80
-    MFI_OS:    int   = 20
-    VDI_LEN:   int   = 3
-    VDI_THR:   float = 1.5
-    SQ_LEN:    int   = 20
-    SQ_BBM:    float = 2.0
-    SQ_KCM:    float = 1.5
-    # Trendline pivot params
-    TL_PIVOT_L: int   = 5    # pivot left bars
-    TL_PIVOT_R: int   = 3    # pivot right bars
-    TL_LOOKBACK:int   = 30   # max bars to search for 2nd pivot
-    TL_BUFFER:  float = 0.15 # ATR buffer for breakout
-
-    # ── HTF timeframes ────────────────────────────────────────────────────
-    HTF_15M: str = "15m"
-    HTF_1H:  str = "1h"
-    HTF_4H:  str = "4h"
-
-    # ── Session filter (UTC) ──────────────────────────────────────────────
-    ONLY_ACTIVE_SESSION: bool = True  # skip signals in OFF session
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+def _list(k, d=""):
+    v = _str(k, d)
+    return [x.strip() for x in v.split(",") if x.strip()] if v else []
 
 
-settings = Settings()
+# ── Identity ─────────────────────────────────────────────────
+BOT_NAME   = _str("BOT_NAME", "volob-standalone")
+API_KEY    = _str("BINGX_API_KEY")
+SECRET_KEY = _str("BINGX_SECRET_KEY")
+BASE_URL   = "https://open-api.bingx.com"
+TELEGRAM_TOKEN = _str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
+
+# ── Universo de trading ──────────────────────────────────────
+TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 150)
+MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 500_000)
+BLACKLIST = set(_list("BLACKLIST",
+    "ESPORTS,STABLEUSDT,EURUSD,SILVER,SILVERXAG,OILWTI,OILBRENT,PAXG,CUSDT,SYN,GOLD,GOLDXAU,XAU,GASOLINE"))
+DIRECTION = _str("DIRECTION", "BOTH")   # LONG | SHORT | BOTH
+
+# ── Timeframe / loop ─────────────────────────────────────────
+TIMEFRAME           = _str("TIMEFRAME", "5m")
+SCAN_INTERVAL        = _int("SCAN_INTERVAL", 60)
+TRAILING_CHECK_SEC   = _int("TRAILING_CHECK_SEC", 30)
+
+# ── Capital y riesgo ─────────────────────────────────────────
+# FIX aplicado desde el principio (lección de renewed-love): gate de
+# margen antes de abrir, no solo cap de notional — ver main.py.
+CAPITAL             = _float("CAPITAL", 100.0)
+LEVERAGE             = _int("LEVERAGE", 5)
+RISK_PCT             = _float("RISK_PCT", 1.0)
+FIXED_NOTIONAL_USDT  = _float("FIXED_NOTIONAL_USDT", 15.0)
+MIN_NOTIONAL_USDT    = _float("MIN_NOTIONAL_USDT", 10.0)
+MAX_NOTIONAL_USDT    = _float("MAX_NOTIONAL_USDT", 40.0)
+MAX_OPEN_TRADES      = _int("MAX_OPEN_TRADES", 3)
+MAX_DAILY_TRADES     = _int("MAX_DAILY_TRADES", 15)
+DAILY_LOSS_PCT       = _float("DAILY_LOSS_PCT", 4.0)
+MIN_MARGIN_USDT      = _float("MIN_MARGIN_USDT", 1.0)
+
+# ── TP / SL / Trail ──────────────────────────────────────────
+SL_ATR_MULT         = _float("SL_ATR_MULT", 1.5)
+TRAIL_DISTANCE_ATR  = _float("TRAIL_DISTANCE_ATR", 1.5)
+MAX_HOLD_MINUTES    = _int("MAX_HOLD_MINUTES", 180)
+
+# ── Volume Order Block — parámetros de la estrategia ─────────
+# Ver strategy_vol_ob.py para la lógica. Sin backtesting: puntos de
+# partida razonados, no valores optimizados.
+VOB_PIVOT_LEN     = _int("VOB_PIVOT_LEN", 7)
+VOB_ATR_LEN       = _int("VOB_ATR_LEN", 14)
+VOB_ATR_MULT      = _float("VOB_ATR_MULT", 3.5)
+VOB_MIN_VOL_RATIO = _float("VOB_MIN_VOL_RATIO", 0.55)
+VOB_RR            = _float("VOB_RR", 2.0)
+
+# ── Infra ────────────────────────────────────────────────────
+PORT       = _int("PORT", 8080)
+# FIX aplicado desde el principio (lección de renewed-love): default
+# ya apunta a /data — confirma igualmente que el Volume está montado
+# de verdad en Railway antes de asumir que esto persiste.
+STATE_FILE = _str("STATE_FILE", "/data/bot_state.json")
