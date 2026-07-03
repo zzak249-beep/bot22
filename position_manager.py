@@ -196,11 +196,13 @@ class PositionManager:
 
         try:
             self.client.place_stop_market(symbol, side, sl_price, qty)
+            log.info(f"SL colocado {symbol}  sl={sl_price:.6g}")
         except Exception as e:
             log.error(f"place_sl {symbol}: {e}")
 
         if tp_qty >= self._min_qty(symbol):
             try:
                 self.client.place_limit_order(symbol, tp1_order_side, side, tp_price, tp_qty)
+                log.info(f"TP colocado {symbol}  tp={tp_price:.6g}  qty={tp_qty}")
             except Exception as e:
                 log.error(f"place_tp {symbol}: {e}")
