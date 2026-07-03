@@ -21,11 +21,14 @@ log = logging.getLogger("bingx")
 
 class BingXClient:
     def __init__(self, api_key: str, secret_key: str, base_url: str):
-        self.api_key    = api_key
-        self.secret_key = secret_key
+        # Doble seguridad: config.py ya hace .strip(), pero un espacio o
+        # salto de línea invisible aquí rompe la firma HMAC en el 100% de
+        # las llamadas — error BingX [100001] "Signature verification failed".
+        self.api_key    = (api_key or "").strip()
+        self.secret_key = (secret_key or "").strip()
         self.base_url   = base_url.rstrip("/")
         self._session   = requests.Session()
-        self._session.headers.update({"X-BX-APIKEY": api_key})
+        self._session.headers.update({"X-BX-APIKEY": self.api_key})
         self._ticker_cache: dict  = {}
         self._ticker_ts: float    = 0
 
