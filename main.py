@@ -140,7 +140,13 @@ def _scan_and_enter(client, pos_mgr, risk, tg, symbols, equity) -> int:
 
             # FIX (lección de renewed-love): gate de margen antes de abrir
             margin_needed = qty * mark / config.LEVERAGE
-            if client.get_available_margin() < margin_needed * 1.5:
+            # FIX: subido de 1.5x a 2x tras ver [101204] Insufficient margin
+            # en ZEC-USDC — 17s después de abrir ATH-USDT, con el gate ya
+            # superado. Probable desfase de BingX entre posición confirmada
+            # y margen disponible actualizado. 2x no lo garantiza del todo
+            # si el desfase es del lado del exchange, pero es más margen de
+            # seguridad que antes.
+            if client.get_available_margin() < margin_needed * 2.0:
                 log.warning(f"Margen insuficiente para {sym}, skip")
                 continue
 
