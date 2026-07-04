@@ -1,253 +1,185 @@
 """
-volob-standalone — Volume Order Block Scanner
-Bot nuevo, aislado. Estrategia propia (strategy_vol_ob.py), sin
-backtesting, sin track record.
+Main — Bot standalone: Supertrend + Unicorn Model + filtros de confluencia
+===============================================================================
+Cascada completa de filtros (cada uno solo se evalúa si el anterior confirma,
+para minimizar llamadas a la API sobre 500+ símbolos):
 
-Construido con las lecciones del resto del fleet desde el día 1:
-  - MAX_OPEN_TRADES escopado a state.get_tracked_positions(), no a
-    toda la cuenta.
-  - Gate de margen (1.5x) antes de cada entrada, no solo cap de notional.
-  - _manage_open_positions itera solo lo propio.
-  - Sin reduceOnly en bingx_client.py (BingX lo rechaza en hedge mode).
-  - Todo el estado persiste vía state.py desde el arranque.
+  1. Regime Filter (Choppiness Index)      → bloquea mercados en rango
+  2. Supertrend (1H)                        → bias macro direccional
+  3. Unicorn Model (3m)                     → timing: sweep + breaker + FVG
+  4. Order Flow / Absorción                 → confirma el sweep con trades reales
+  5. Funding Rate + Open Interest           → confirma "combustible" del movimiento
+  6. Correlation Manager                    → evita exposición oculta a BTC
+  7. Setup Memory                           → aprende de setups históricos propios
+
+No comparte código ni estado con otros bots (renewed-love / joyful-art).
 """
+import asyncio
 import logging
-import threading
+import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
-import state
-from bingx_client import BingXClient
-from position_manager import PositionManager
+from exchange_client import BingXClient
+from journal import TradeJournal
 from risk_manager import RiskManager
-from strategy_vol_ob import get_signal, check_tp_exit
-from telegram_client import TelegramClient
+from setup_memory import SetupMemory
+from correlation_manager import CorrelationManager
+from position_monitor import PositionMonitor
+from scanner import get_symbol_universe, scan_universe
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    stream=sys.stdout,
 )
-log = logging.getLogger("scanner")
+log = logging.getLogger("main")
+
+BTC_SYMBOL = "BTC-USDT"
 
 
-# ── Health server ─────────────────────────────────────────────
+async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles):
+    symbol = sig["symbol"]
+    side = sig["signal"]
+    entry = sig["entry_price"]
+    sl = sig["sl_price"]
+    tp = sig["tp_price"]
+    setup_key = sig.get("setup_key", "unknown")
 
-def _start_health():
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200); self.end_headers()
-            self.wfile.write(b"ok")
-        def log_message(self, *a): pass
-    try:
-        s = HTTPServer(("0.0.0.0", config.PORT), H)
-        threading.Thread(target=s.serve_forever, daemon=True).start()
-        log.info(f"Health server :{config.PORT}/health")
-    except Exception as e:
-        log.warning(f"Health server: {e}")
+    open_positions = await client.get_open_positions()
+    if any(p["symbol"] == symbol for p in open_positions):
+        log.info("[%s] Ya hay posición abierta, se omite señal", symbol)
+        return None
+
+    if getattr(config, "ENABLE_SETUP_MEMORY_FILTER", True):
+        allow, reason = setup_mem.should_allow(setup_key, config)
+        if not allow:
+            log.info("[%s] Señal descartada por setup memory: %s", symbol, reason)
+            journal.record({"symbol": symbol, "event": "signal_rejected",
+                             "reason": f"setup_memory: {reason}", "signal": sig})
+            return None
+
+    risk_pct = config.RISK_PCT_PER_TRADE
+    can_open, reason = risk_mgr.can_open_new_position(balance, len(open_positions), risk_pct)
+    if not can_open:
+        log.warning("[%s] Señal descartada por risk manager: %s", symbol, reason)
+        journal.record({"symbol": symbol, "event": "signal_rejected", "reason": reason, "signal": sig})
+        return None
+
+    corr = None
+    if getattr(config, "ENABLE_CORRELATION_FILTER", True) and btc_candles:
+        try:
+            candles_symbol_bias = await client.get_klines(symbol, config.BIAS_TF, limit=60)
+            can_open_corr, corr, corr_reason = corr_mgr.evaluate(symbol, side, candles_symbol_bias, btc_candles)
+            if not can_open_corr:
+                log.info("[%s] Señal descartada por correlación: %s", symbol, corr_reason)
+                journal.record({"symbol": symbol, "event": "signal_rejected",
+                                 "reason": f"correlation: {corr_reason}", "signal": sig})
+                return None
+        except Exception as e:
+            log.warning("[%s] No se pudo evaluar correlación, se permite por defecto: %s", symbol, e)
+
+    qty = risk_mgr.calc_position_size(balance, entry, sl)
+    if qty <= 0:
+        log.warning("[%s] Tamaño de posición inválido, se omite", symbol)
+        return None
+
+    await client.set_leverage(symbol, config.LEVERAGE, side)
+    result = await client.open_position(symbol, side, qty, sl_price=sl, tp_price=tp)
+
+    journal.record({
+        "symbol": symbol, "event": "position_opened", "side": side,
+        "entry": entry, "sl": sl, "tp": tp, "qty": qty, "setup_key": setup_key,
+        "engine": sig.get("engine"),
+        "htf_source": sig.get("htf_source"), "has_fvg": sig.get("has_fvg"),
+        "supertrend": sig.get("supertrend"), "order_flow": sig.get("order_flow"),
+        "funding_oi": sig.get("funding_oi"), "regime": sig.get("regime"),
+        "order_block": sig.get("order_block"),
+        "correlation_btc": corr, "result": result,
+    })
+
+    if result.get("code") == 0:
+        risk_mgr.register_open_risk(risk_pct)
+        corr_mgr.register_open(symbol, side, corr)
+        log.info("[%s] Posición %s abierta: qty=%.6f entry=%.6f SL=%.6f TP=%.6f",
+                  symbol, side, qty, entry, sl, tp)
+        return {"symbol": symbol, "setup_key": setup_key, "risk_pct": risk_pct,
+                "opened_at_ms": int(time.time() * 1000)}
+
+    log.error("[%s] Falló apertura de posición: %s", symbol, result)
+    return None
 
 
-# ── Exit helper ───────────────────────────────────────────────
-
-def _close_position(client, pos_mgr, risk, tg, symbol, side, reason):
-    pos = pos_mgr.get_position(symbol, side)
-    if not pos:
-        state.clear(symbol, side)
+async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, symbols):
+    balance = await client.get_balance_usdt()
+    if balance <= 0:
+        log.warning("Balance no disponible o cero, se omite ciclo")
         return
-    price = client.get_mark_price(symbol)
-    pnl   = pos["unrealizedPnl"]
-    if side == "LONG":
-        ok = pos_mgr.close_long(symbol, pos["size"], reason)
-    else:
-        ok = pos_mgr.close_short(symbol, pos["size"], reason)
-    if not ok:
-        log.error(f"close_position {symbol} {side}: falló, no se registra el cierre")
+
+    await pos_monitor.check_closures(balance)
+
+    if risk_mgr.daily_loss_breached(balance):
+        log.warning("Circuit breaker diario activo — no se buscan nuevas señales")
         return
-    risk.record_trade(pnl)
-    tg.exit_trade(config.BOT_NAME, symbol, side, price, reason, pnl)
 
-
-# ── Position management ───────────────────────────────────────
-
-def _manage_open_positions(client, pos_mgr, risk, tg):
-    for sym, side in state.get_tracked_positions():
-        pos = pos_mgr.get_position(sym, side)
-        if not pos:
-            # FIX: antes solo se limpiaba el estado, sin registrar PnL
-            # ni avisar — la mayoría de los cierres reales pasan por
-            # aquí (SL o TP1 del exchange disparando solos), no por
-            # max_hold/trail_stop. Eso dejaba day_pnl/day_trades
-            # incompletos y sin ningún aviso de Telegram para estos
-            # casos. Estimación aproximada (precio actual vs entrada
-            # guardada) — no es el fill exacto del exchange, pero es
-            # mejor que no registrar nada.
-            entry_price, qty = state.get_entry_details(sym, side)
-            state.clear(sym, side)
-            if entry_price and qty:
-                try:
-                    close_price = client.get_mark_price(sym)
-                    pnl = ((close_price - entry_price) if side == "LONG"
-                           else (entry_price - close_price)) * qty
-                    risk.record_trade(pnl)
-                    tg.exit_trade(config.BOT_NAME, sym, side, close_price,
-                                  "cierre_externo(SL/TP aprox)", pnl)
-                    log.info(f"{sym} {side}: cierre externo — PnL aprox {pnl:+.4f} USDT")
-                except Exception as e:
-                    log.warning(f"No se pudo estimar PnL de cierre externo {sym}: {e}")
-            else:
-                log.info(f"state.clear {sym} {side}: ya no existe en el exchange (sin datos para estimar PnL)")
-            continue
-
+    btc_candles = None
+    if getattr(config, "ENABLE_CORRELATION_FILTER", True):
         try:
-            price   = client.get_mark_price(sym)
-            candles = client.get_klines(sym, config.TIMEFRAME, 120)
-            if len(candles) < 30:
-                continue
-
-            sig = get_signal(candles, config)
-            atr = sig["atr"] or 0
-            if not atr:
-                continue
-
-            if pos_mgr.is_max_hold_expired(sym, side):
-                _close_position(client, pos_mgr, risk, tg, sym, side, "max_hold")
-                continue
-
-            stop, hit = pos_mgr.tick_trail(sym, side, price, atr)
-            if hit:
-                _close_position(client, pos_mgr, risk, tg, sym, side, "trail_stop")
-                continue
-
+            btc_candles = await client.get_klines(BTC_SYMBOL, config.BIAS_TF, limit=60)
         except Exception as e:
-            log.error(f"manage {sym}: {e}")
+            log.warning("No se pudo obtener velas de BTC para correlación: %s", e)
+
+    signals = await scan_universe(client, symbols, config)
+    for sig in signals:
+        opened = await execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, balance, btc_candles)
+        if opened:
+            pos_monitor.register_open(opened["symbol"], opened["setup_key"],
+                                      opened["risk_pct"], opened["opened_at_ms"])
 
 
-# ── Signal scanning ───────────────────────────────────────────
+async def main():
+    if not config.BINGX_API_KEY or not config.BINGX_API_SECRET:
+        log.warning("BINGX_API_KEY / BINGX_API_SECRET no configuradas — solo funcionará en DRY_RUN")
 
-def _scan_and_enter(client, pos_mgr, risk, tg, symbols, equity) -> int:
-    opened = 0
-    for sym in symbols:
-        if sym in config.BLACKLIST:
-            continue
+    journal = TradeJournal(config.JOURNAL_FILE)
+    risk_mgr = RiskManager(config)
+    setup_mem = SetupMemory(config.SETUP_MEMORY_FILE)
+    corr_mgr = CorrelationManager(config)
 
-        tracked = state.get_tracked_positions()
-        if len(tracked) >= config.MAX_OPEN_TRADES:
-            log.warning(f"MAX_OPEN_TRADES (propias) alcanzado: {len(tracked)}/{config.MAX_OPEN_TRADES}")
-            break
+    async with BingXClient(
+        config.BINGX_API_KEY, config.BINGX_API_SECRET,
+        config.BINGX_BASE_URL, dry_run=config.DRY_RUN,
+    ) as client:
 
-        allowed, reason = risk.can_trade(equity)
-        if not allowed:
-            log.warning(f"Risk block: {reason}")
-            break
+        pos_monitor = PositionMonitor(client, journal, risk_mgr, setup_mem, corr_mgr)
 
-        try:
-            candles = client.get_klines(sym, config.TIMEFRAME, 200)
-            if len(candles) < 60:
-                continue
+        log.info(
+            "Bot iniciado | DRY_RUN=%s | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
+            "regime=%s corr=%s order_flow=%s funding_oi=%s setup_memory=%s "
+            "ob_engine=%s scan_all_symbols=%s",
+            config.DRY_RUN, config.ENTRY_TF, config.BIAS_TF, getattr(config, "OB_TF", "15m"),
+            config.ENABLE_REGIME_FILTER, config.ENABLE_CORRELATION_FILTER,
+            config.ENABLE_ORDER_FLOW_FILTER, config.ENABLE_FUNDING_OI_FILTER,
+            config.ENABLE_SETUP_MEMORY_FILTER, getattr(config, "ENABLE_OB_ENGINE", True),
+            getattr(config, "SCAN_ALL_SYMBOLS", True),
+        )
 
-            sig = get_signal(candles, config)
-            if not sig["signal"]:
-                continue
+        symbols = await get_symbol_universe(client, config)
+        last_universe_refresh = asyncio.get_event_loop().time()
 
-            direction = sig["signal"]
-            if pos_mgr.has_position(sym, direction):
-                continue
+        while True:
+            try:
+                now = asyncio.get_event_loop().time()
+                if now - last_universe_refresh > 1800:
+                    symbols = await get_symbol_universe(client, config)
+                    last_universe_refresh = now
 
-            mark = client.get_mark_price(sym)
-            atr  = sig["atr"]
-            qty  = pos_mgr.calc_qty(sym, mark, atr, equity)
-            if not qty:
-                continue
+                await run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, symbols)
+            except Exception as e:
+                log.exception("Error en ciclo principal: %s", e)
 
-            # FIX (lección de renewed-love): gate de margen antes de abrir
-            margin_needed = qty * mark / config.LEVERAGE
-            # FIX: subido de 1.5x a 2x tras ver [101204] Insufficient margin
-            # en ZEC-USDC — 17s después de abrir ATH-USDT, con el gate ya
-            # superado. Probable desfase de BingX entre posición confirmada
-            # y margen disponible actualizado. 2x no lo garantiza del todo
-            # si el desfase es del lado del exchange, pero es más margen de
-            # seguridad que antes.
-            if client.get_available_margin() < margin_needed * 2.0:
-                log.warning(f"Margen insuficiente para {sym}, skip")
-                continue
-
-            log.info(
-                f"VOL_OB signal={direction} {sym}  "
-                f"zone={sig['zone_bot']:.6g}-{sig['zone_top']:.6g}  "
-                f"buy_ratio={sig['buy_ratio']:.2f}  trend={sig['trend']}  "
-                f"tp={sig['tp_price']:.6g}  atr={atr:.4g}"
-            )
-
-            if direction == "LONG":
-                ok = pos_mgr.open_long(sym, qty, atr)
-            else:
-                ok = pos_mgr.open_short(sym, qty, atr)
-
-            if ok:
-                pos_mgr.place_tp_sl(sym, direction, mark, qty, atr, sig["tp_price"])
-                try:
-                    stop = state.get_trail(sym, direction)
-                    tg.entry(config.BOT_NAME, sym, direction, mark, qty, stop, equity)
-                except Exception as e:
-                    log.warning(f"telegram entry {sym}: {e}")
-                opened += 1
-
-        except Exception as e:
-            log.error(f"scan {sym}: {e}")
-
-    return opened
-
-
-# ── Main loop ─────────────────────────────────────────────────
-
-def main():
-    _start_health()
-    log.info(f"=== {config.BOT_NAME} starting (DIRECTION={config.DIRECTION}) ===")
-    log.info("⚠️ Estrategia sin backtesting propio — sin track record todavía")
-
-    client  = BingXClient(config.API_KEY, config.SECRET_KEY, config.BASE_URL)
-    pos_mgr = PositionManager(client)
-    risk    = RiskManager(config)
-    tg      = TelegramClient(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT)
-
-    equity = client.get_equity()
-    risk.new_day(equity)
-    log.info(f"New day — equity: {equity:.2f} USDT")
-    tg.startup(config.BOT_NAME, config.TIMEFRAME, config.LEVERAGE)
-
-    last_scan_t = 0.0
-    iteration   = 0
-
-    while True:
-        try:
-            now    = time.time()
-            equity = client.get_equity()
-
-            _manage_open_positions(client, pos_mgr, risk, tg)
-
-            if now - last_scan_t >= config.SCAN_INTERVAL:
-                last_scan_t = now
-                iteration  += 1
-                t0 = time.time()
-
-                symbols = client.get_top_symbols(config.TOP_N_SYMBOLS, config.MIN_VOLUME_USDT)
-                opened  = _scan_and_enter(client, pos_mgr, risk, tg, symbols, equity)
-
-                log.info(
-                    f"scanner | Iter {iteration} | {len(symbols)} símbolos "
-                    f"| {opened} abiertos | {time.time()-t0:.1f}s"
-                )
-
-        except KeyboardInterrupt:
-            log.info("Stopping.")
-            break
-        except Exception as e:
-            log.error(f"Loop error: {e}")
-            tg.error(config.BOT_NAME, str(e)[:400])
-            time.sleep(30)
-
-        time.sleep(config.TRAILING_CHECK_SEC)
+            await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

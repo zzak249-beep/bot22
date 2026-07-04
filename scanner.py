@@ -1,84 +1,90 @@
 """
-Scanner — fetches candles for every BingX perpetual and runs the strategy engine.
-Returns a list of actionable signals sorted by score.
+Scanner — recorre todos los símbolos perpetuos de BingX (filtrados por
+liquidez y excluyendo no-cripto), descarga velas multi-timeframe y
+evalúa la señal combinada Supertrend + Unicorn Model.
 """
 import asyncio
 import logging
-from typing import Optional
 
-from bingx_client import BingXClient
-from engine import StrategyEngine
+from combined_engine import evaluate_symbol
+from order_flow import confirm_with_order_flow
+from funding_oi_filter import confirm_with_funding_oi
 
-log = logging.getLogger("qfjp.scanner")
+log = logging.getLogger("scanner")
 
 
-class MultiSymbolScanner:
-    def __init__(self, settings):
-        self.s = settings
+def _is_valid_symbol(symbol, non_crypto_prefixes):
+    base = symbol.split("-")[0] if "-" in symbol else symbol.replace("USDT", "")
+    return not any(base.startswith(p) for p in non_crypto_prefixes)
 
-    async def scan_symbol(
-        self,
-        symbol: str,
-        bingx: BingXClient,
-        engine: StrategyEngine,
-        semaphore: asyncio.Semaphore,
-    ) -> Optional[dict]:
-        async with semaphore:
-            try:
-                candles = await bingx.get_klines(symbol, self.s.TIMEFRAME, limit=150)
-                if len(candles) < 60:
-                    return None
 
-                # Optional HTF candles (15m, 1h, 4h) for alignment
-                htf = {}
-                for tf in (self.s.HTF_15M, self.s.HTF_1H, self.s.HTF_4H):
-                    c = await bingx.get_klines(symbol, tf, limit=30)
-                    if len(c) >= 22:
-                        htf[tf] = c
+async def get_symbol_universe(client, config):
+    """
+    Lista de símbolos filtrados por tipo (cripto) y, opcionalmente, por
+    liquidez. Con SCAN_ALL_SYMBOLS=True (default) se analizan TODAS las
+    monedas de BingX, sin filtro de volumen — solo se sigue excluyendo lo
+    que no es cripto (forex/índices/commodities que BingX a veces lista).
+    """
+    all_symbols = await client.get_all_symbols_with_volume()
+    scan_all = getattr(config, "SCAN_ALL_SYMBOLS", True)
+    min_vol = 0 if scan_all else config.MIN_24H_VOLUME_USDT
+    filtered = [
+        s["symbol"] for s in all_symbols
+        if s["volume_24h_usdt"] >= min_vol
+        and _is_valid_symbol(s["symbol"], config.NON_CRYPTO_PREFIXES)
+    ]
+    log.info(
+        "Universo de símbolos tras filtro: %d (SCAN_ALL_SYMBOLS=%s, min_vol=%s)",
+        len(filtered), scan_all, min_vol,
+    )
+    return filtered
 
-                sig = engine.evaluate(candles, htf if htf else None)
-                sig["symbol"] = symbol
 
-                # Only return if actionable
-                if sig["tier"] not in ("STD", "FUEL", "SUP", "PRE"):
-                    return None
+async def _evaluate_one(client, symbol, config, semaphore):
+    async with semaphore:
+        try:
+            candles_entry = await client.get_klines(symbol, config.ENTRY_TF, limit=150)
+            candles_bias = await client.get_klines(symbol, config.BIAS_TF, limit=120)
+            candles_1h = await client.get_klines(symbol, config.HTF_C_TF, limit=60)
+            candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=60)
+            candles_30m = await client.get_klines(symbol, config.HTF_B_TF, limit=60)
 
-                log.info(
-                    f"  📌 {symbol:18s} {sig['side']:5s} {sig['tier']:4s} "
-                    f"L:{sig['score_long']:3d} S:{sig['score_short']:3d} "
-                    f"TL_L:{sig['tl_break_long']} TL_S:{sig['tl_break_short']}"
-                )
-                return sig
+            candles_ob = None
+            if getattr(config, "ENABLE_OB_ENGINE", True):
+                # Timeframe propio (OB_TF) — llamada extra de klines por símbolo,
+                # aceptada a cambio de que el motor use velas coherentes con su
+                # propia noción de "pivote" (ver nota en la respuesta sobre coste
+                # de rate limit con SCAN_ALL_SYMBOLS activo).
+                candles_ob = await client.get_klines(symbol, getattr(config, "OB_TF", "15m"), limit=250)
 
-            except Exception as exc:
-                log.debug(f"scan_symbol {symbol}: {exc}")
+            if len(candles_entry) < 80 or len(candles_bias) < 55:
                 return None
 
-    async def scan_all(
-        self,
-        bingx: BingXClient,
-        engine: StrategyEngine,
-        symbols: list[str],
-    ) -> list[dict]:
-        semaphore = asyncio.Semaphore(self.s.CONCURRENT_SCANS)
-        tasks = [
-            self.scan_symbol(sym, bingx, engine, semaphore)
-            for sym in symbols
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            sig = evaluate_symbol(
+                symbol, candles_entry, candles_bias, candles_1h,
+                config, candles_15m, candles_30m, candles_ob,
+            )
 
-        signals = []
-        for r in results:
-            if isinstance(r, dict) and r is not None:
-                signals.append(r)
+            # Cascada de confirmaciones finales: solo se consulta la API cuando
+            # ya hay señal válida, para no gastar rate limit en 500+ símbolos.
+            if sig.get("signal") is not None:
+                sig = await confirm_with_order_flow(client, symbol, sig, config)
+            if sig.get("signal") is not None:
+                sig = await confirm_with_funding_oi(client, symbol, sig, config)
 
-        # Sort: SUP first, then FUEL, then STD, by score descending
-        tier_rank = {"SUP": 3, "FUEL": 2, "STD": 1, "PRE": 0}
-        signals.sort(
-            key=lambda x: (
-                tier_rank.get(x["tier"], 0),
-                max(x["score_long"], x["score_short"]),
-            ),
-            reverse=True,
-        )
-        return signals
+            return sig
+        except Exception as e:
+            log.error("Error evaluando %s: %s", symbol, e)
+            return None
+
+
+async def scan_universe(client, symbols, config):
+    """Evalúa todos los símbolos con concurrencia acotada. Devuelve señales válidas."""
+    semaphore = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+    tasks = [_evaluate_one(client, s, config, semaphore) for s in symbols]
+    results = await asyncio.gather(*tasks)
+
+    signals = [r for r in results if r and r.get("signal")]
+    log.info("Ciclo de scan completo: %d símbolos evaluados, %d señales válidas",
+              len(symbols), len(signals))
+    return signals
