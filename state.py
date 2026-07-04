@@ -132,6 +132,23 @@ def clear(symbol: str, side: str):
     log.debug(f"state.clear {symbol} {side} ({len(keys_to_del)} keys removed)")
 
 
+# ── Entry price/qty (para estimar PnL en cierres externos) ────
+
+def save_entry_details(symbol: str, side: str, entry_price: float, qty: float):
+    d = _load()
+    d[_key(symbol, side, "entry_price")] = entry_price
+    d[_key(symbol, side, "qty")] = qty
+    _save(d)
+
+
+def get_entry_details(symbol: str, side: str) -> tuple:
+    d = _load()
+    ep = d.get(_key(symbol, side, "entry_price"))
+    q  = d.get(_key(symbol, side, "qty"))
+    return (float(ep) if ep is not None else None,
+            float(q) if q is not None else None)
+
+
 # ── Daily PnL/trades state (bot-wide) ────────────────────────
 
 def save_day_state(day_pnl: float, day_trades: int, day_start_eq: float, day: str):
