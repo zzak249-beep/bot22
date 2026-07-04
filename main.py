@@ -73,8 +73,29 @@ def _manage_open_positions(client, pos_mgr, risk, tg):
     for sym, side in state.get_tracked_positions():
         pos = pos_mgr.get_position(sym, side)
         if not pos:
+            # FIX: antes solo se limpiaba el estado, sin registrar PnL
+            # ni avisar — la mayoría de los cierres reales pasan por
+            # aquí (SL o TP1 del exchange disparando solos), no por
+            # max_hold/trail_stop. Eso dejaba day_pnl/day_trades
+            # incompletos y sin ningún aviso de Telegram para estos
+            # casos. Estimación aproximada (precio actual vs entrada
+            # guardada) — no es el fill exacto del exchange, pero es
+            # mejor que no registrar nada.
+            entry_price, qty = state.get_entry_details(sym, side)
             state.clear(sym, side)
-            log.info(f"state.clear {sym} {side}: ya no existe en el exchange")
+            if entry_price and qty:
+                try:
+                    close_price = client.get_mark_price(sym)
+                    pnl = ((close_price - entry_price) if side == "LONG"
+                           else (entry_price - close_price)) * qty
+                    risk.record_trade(pnl)
+                    tg.exit_trade(config.BOT_NAME, sym, side, close_price,
+                                  "cierre_externo(SL/TP aprox)", pnl)
+                    log.info(f"{sym} {side}: cierre externo — PnL aprox {pnl:+.4f} USDT")
+                except Exception as e:
+                    log.warning(f"No se pudo estimar PnL de cierre externo {sym}: {e}")
+            else:
+                log.info(f"state.clear {sym} {side}: ya no existe en el exchange (sin datos para estimar PnL)")
             continue
 
         try:
