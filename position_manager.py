@@ -96,6 +96,7 @@ class PositionManager:
                 return False
 
             state.save_entry(symbol, "LONG")
+            state.save_entry_details(symbol, "LONG", confirmed["entryPrice"], confirmed["size"])
             state.set_tp1_hit(symbol, "LONG", False)
             state.set_be_moved(symbol, "LONG", False)
             mark = self.client.get_mark_price(symbol)
@@ -120,6 +121,7 @@ class PositionManager:
                 return False
 
             state.save_entry(symbol, "SHORT")
+            state.save_entry_details(symbol, "SHORT", confirmed["entryPrice"], confirmed["size"])
             state.set_tp1_hit(symbol, "SHORT", False)
             state.set_be_moved(symbol, "SHORT", False)
             mark = self.client.get_mark_price(symbol)
