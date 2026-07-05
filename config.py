@@ -45,7 +45,31 @@ NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
     "XAU", "XAG", "US30", "US100", "US500", "GER40", "UK100", "JP225",
     "OIL", "WTI", "BRENT", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
     "NZDUSD", "USDCAD", "USDCHF", "EURGBP", "EURJPY", "GBPJPY",
+    # Acciones/ETFs tokenizados (BingX "TradFi" — NO son cripto, confirmado
+    # tras ver NCSKMSFT2USD y NCSKQQQ2USD colarse con SCAN_ALL_SYMBOLS=True).
+    # "NCSK" es el prefijo del proveedor institucional; el resto son tickers
+    # directos o con sufijo de tokenización (ON=Ondo, X=xStocks) que BingX
+    # también lista. Lista best-effort, no exhaustiva — BingX sigue agregando
+    # acciones tokenizadas, revisar periódicamente igual que con forex/índices.
+    "NCSK", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
+    "PLTR", "HOOD", "MSTR", "CRCL", "QQQ", "SPY",
 ]
+REQUIRE_USDT_QUOTE = _b("REQUIRE_USDT_QUOTE", True)  # excluye pares que no cotizan en USDT
+                                                       # (ej. KAITO-USDC) — todo el risk_manager
+                                                       # asume balance y PnL en USDT; mezclar
+                                                       # otras monedas de cotización sin verificar
+                                                       # el margen real es un riesgo aparte, no
+                                                       # solo un tema de "no es cripto"
+
+# ── Loop rápido (símbolos de mayor volumen, más frecuente) ───────────────
+# Corre EN PARALELO al barrido completo (lento), sobre el mismo BingXClient
+# -> comparte el pacing/cooldown de rate limit, no suma presión extra "gratis".
+# Un asyncio.Lock protege la sección de apertura de posición para que los dos
+# loops no abran más posiciones que MAX_ACTIVE_POSITIONS por una condición de
+# carrera (ver main.py).
+ENABLE_FAST_SCAN = _b("ENABLE_FAST_SCAN", True)
+FAST_SCAN_TOP_N = _i("FAST_SCAN_TOP_N", 60)
+FAST_SCAN_INTERVAL_SEC = _i("FAST_SCAN_INTERVAL_SEC", 60)
 MAX_ACTIVE_POSITIONS = _i("MAX_ACTIVE_POSITIONS", 6)
 
 # ── Timeframes ───────────────────────────────────────────────────────
