@@ -125,6 +125,14 @@ ENABLE_OBI_FILTER = _b("ENABLE_OBI_FILTER", False)
 OBI_LEVELS = _i("OBI_LEVELS", 20)                  # niveles de profundidad a considerar
 OBI_THRESHOLD = _f("OBI_THRESHOLD", 0.15)          # desequilibrio mínimo (-1 a 1) para confirmar
 
+# ── Deduplicación de señales ──────────────────────────────────────────────
+# El loop rápido y el lento pueden evaluar el mismo símbolo en ventanas
+# superpuestas y encontrar la MISMA señal (mismas velas, mismo resultado).
+# El chequeo de "ya hay posición abierta" no alcanza para evitar esto en
+# DRY_RUN (las posiciones simuladas nunca aparecen en BingX real) — este
+# cooldown lo cubre en los dos modos, independiente de si hay posición real.
+DEDUP_COOLDOWN_SEC = _i("DEDUP_COOLDOWN_SEC", 300)
+
 # ── Order Flow / Absorción (confirmación final, post Supertrend+Unicorn) ──
 ENABLE_ORDER_FLOW_FILTER = _b("ENABLE_ORDER_FLOW_FILTER", False)  # off por defecto
 ORDER_FLOW_TRADES_LIMIT = _i("ORDER_FLOW_TRADES_LIMIT", 1000)     # trades recientes a pedir
