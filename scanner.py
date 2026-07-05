@@ -46,16 +46,24 @@ async def _evaluate_one(client, symbol, config, semaphore):
             candles_entry = await client.get_klines(symbol, config.ENTRY_TF, limit=150)
             candles_bias = await client.get_klines(symbol, config.BIAS_TF, limit=120)
             candles_1h = await client.get_klines(symbol, config.HTF_C_TF, limit=60)
-            candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=60)
-            candles_30m = await client.get_klines(symbol, config.HTF_B_TF, limit=60)
 
-            candles_ob = None
-            if getattr(config, "ENABLE_OB_ENGINE", True):
-                # Timeframe propio (OB_TF) — llamada extra de klines por símbolo,
-                # aceptada a cambio de que el motor use velas coherentes con su
-                # propia noción de "pivote" (ver nota en la respuesta sobre coste
-                # de rate limit con SCAN_ALL_SYMBOLS activo).
-                candles_ob = await client.get_klines(symbol, getattr(config, "OB_TF", "15m"), limit=250)
+            ob_tf = getattr(config, "OB_TF", "15m")
+            ob_engine_on = getattr(config, "ENABLE_OB_ENGINE", True)
+
+            if ob_engine_on and ob_tf == config.HTF_A_TF:
+                # OB_TF coincide con HTF_A_TF (default de ambos: "15m") -> una sola
+                # llamada de klines sirve para las dos cosas. El Order Block Engine
+                # necesita más histórico (limit=250) que el Unicorn Model para su
+                # warm-up (ST_LEN + pivotes), así que se pide con ese límite mayor
+                # y ese mismo set alcanza de sobra para los niveles de liquidez del
+                # Unicorn Model (que solo mira las últimas ~22 velas).
+                candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=250)
+                candles_ob = candles_15m
+            else:
+                candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=60)
+                candles_ob = await client.get_klines(symbol, ob_tf, limit=250) if ob_engine_on else None
+
+            candles_30m = await client.get_klines(symbol, config.HTF_B_TF, limit=60)
 
             if len(candles_entry) < 80 or len(candles_bias) < 55:
                 return None

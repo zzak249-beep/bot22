@@ -35,7 +35,10 @@ log = logging.getLogger("exchange_client")
 
 RATE_LIMIT_CODE = 100410
 RATE_LIMIT_MAX_RETRIES = 3
-RATE_LIMIT_MAX_WAIT_S = 20.0  # techo de espera por intento, aunque el mensaje pida más
+RATE_LIMIT_MAX_WAIT_S = 45.0  # techo por intento — antes 20s se quedaba corto contra
+                              # el bloqueo real observado, y forzaba reintentos en cadena
+DEFAULT_MIN_REQUEST_INTERVAL_S = 0.12  # ~8 req/s: espaciado base entre TODAS las
+                                        # requests de esta instancia, no solo klines
 
 
 def _parse_unblock_wait_s(msg):
@@ -55,12 +58,38 @@ def _parse_unblock_wait_s(msg):
 
 
 class BingXClient:
-    def __init__(self, api_key, api_secret, base_url, dry_run=True):
+    def __init__(self, api_key, api_secret, base_url, dry_run=True,
+                 min_request_interval=DEFAULT_MIN_REQUEST_INTERVAL_S):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         self._session = None
+        # Estado COMPARTIDO entre todas las corutinas que usan esta misma
+        # instancia (todo scan_universe corre sobre un único BingXClient).
+        # Antes cada corutina calculaba su propia espera de forma aislada al
+        # recibir un 100410 -> con SCAN_CONCURRENCY en paralelo, todas volvían
+        # a pegarle casi al mismo tiempo y se re-bloqueaban en cadena. Ahora
+        # una sola marca de tiempo gobierna a todas.
+        self._rate_limit_until = 0.0     # epoch seconds
+        self._last_request_at = 0.0
+        self._pacing_lock = asyncio.Lock()
+        self._min_request_interval = min_request_interval
+
+    async def _wait_for_slot(self):
+        """Espera compartida antes de CUALQUIER request: respeta el cooldown
+        activo (si BingX ya nos rate-limitó) y un espaciado mínimo entre
+        requests consecutivas, para no volver a disparar una ráfaga."""
+        async with self._pacing_lock:
+            now = time.time()
+            wait_cooldown = max(0.0, self._rate_limit_until - now)
+            if wait_cooldown > 0:
+                wait_cooldown += random.uniform(0, 1.0)  # jitter: no todas despiertan juntas
+            wait_pacing = max(0.0, self._last_request_at + self._min_request_interval - now)
+            wait_s = max(wait_cooldown, wait_pacing)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            self._last_request_at = time.time()
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession()
@@ -77,6 +106,7 @@ class BingXClient:
         ).hexdigest()
 
     async def _request(self, method, path, params=None, signed=False, _retry=0):
+        await self._wait_for_slot()
         original_params = dict(params or {})  # sin timestamp/signature — se re-firma en cada intento
         params = dict(original_params)
         if signed:
@@ -88,16 +118,23 @@ class BingXClient:
             async with self._session.request(method, url, params=params, headers=headers, timeout=15) as resp:
                 data = await resp.json(content_type=None)
                 code = data.get("code")
-                if code == RATE_LIMIT_CODE and _retry < RATE_LIMIT_MAX_RETRIES:
+                if code == RATE_LIMIT_CODE:
                     wait_s = min(_parse_unblock_wait_s(data.get("msg", "")), RATE_LIMIT_MAX_WAIT_S)
-                    wait_s += random.uniform(0, 1.5)  # jitter — evita que todas las corutinas reintenten a la vez
-                    log.warning(
-                        "Rate limit BingX (100410) en [%s %s], esperando %.1fs antes de reintentar (%d/%d)",
-                        method, path, wait_s, _retry + 1, RATE_LIMIT_MAX_RETRIES,
+                    # Cooldown COMPARTIDO: cualquier otra corutina que llame a
+                    # _request (para este o cualquier otro endpoint) va a
+                    # respetar este mismo "hasta cuándo" en su _wait_for_slot.
+                    self._rate_limit_until = max(self._rate_limit_until, time.time() + wait_s)
+                    if _retry < RATE_LIMIT_MAX_RETRIES:
+                        log.warning(
+                            "Rate limit BingX (100410) en [%s %s], cooldown compartido ~%.1fs (intento %d/%d)",
+                            method, path, wait_s, _retry + 1, RATE_LIMIT_MAX_RETRIES,
+                        )
+                        return await self._request(method, path, params=original_params,
+                                                    signed=signed, _retry=_retry + 1)
+                    log.error(
+                        "Rate limit BingX persistente tras %d reintentos en [%s %s] — se abandona este request",
+                        RATE_LIMIT_MAX_RETRIES, method, path,
                     )
-                    await asyncio.sleep(wait_s)
-                    return await self._request(method, path, params=original_params,
-                                                signed=signed, _retry=_retry + 1)
                 if code not in (0, None):
                     log.warning("BingX API error [%s %s]: %s", method, path, data)
                 return data

@@ -33,7 +33,11 @@ SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 8)        # requests simultáneas — 
                                                      # SCAN_ALL_SYMBOLS + 6 llamadas de klines/símbolo,
                                                      # 20 disparaba el rate limit 100410 de BingX en el
                                                      # endpoint de klines (ver exchange_client.py)
-SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 45)     # ciclo completo del scanner
+SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 420)    # 45s (default viejo) era irreal con
+                                                     # SCAN_ALL_SYMBOLS=True: ~694 símbolos x 5
+                                                     # klines c/u ≈ 3470 requests/ciclo, y con el
+                                                     # espaciado de exchange_client.py (~8 req/s)
+                                                     # un ciclo completo tarda ~7 min de por sí
 MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos (solo si SCAN_ALL_SYMBOLS=False)
 SCAN_ALL_SYMBOLS = _b("SCAN_ALL_SYMBOLS", True)  # True = ignora MIN_24H_VOLUME_USDT, escanea TODO BingX (menos no-cripto)
 NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
