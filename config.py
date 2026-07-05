@@ -84,6 +84,14 @@ OB_DELETE_ON_BREAK = _b("OB_DELETE_ON_BREAK", True)  # invalida el Order Block s
 OB_RR = _f("OB_RR", 1.5)                          # risk:reward del TP en señales del Order Block Engine
 OB_SL_ATR_BUFFER = _f("OB_SL_ATR_BUFFER", 0.2)    # colchón ATR extra en el SL
 
+# ── CVD Filter (Cumulative Volume Delta, sin llamada extra a la API) ─────
+# Inspirado en tu Confluence Gate de TradingView. Reusa candles_entry
+# (ENTRY_TF) como timeframe fino para aproximar volumen intrabar — no pide
+# velas 1m aparte. Off por defecto hasta validar en DRY_RUN, mismo criterio
+# que Order Flow / Funding-OI.
+ENABLE_CVD_FILTER = _b("ENABLE_CVD_FILTER", False)
+CVD_LOOKBACK = _i("CVD_LOOKBACK", 20)              # velas finas hacia atrás (mismo default que cvd_len en Pine)
+
 # ── Order Flow / Absorción (confirmación final, post Supertrend+Unicorn) ──
 ENABLE_ORDER_FLOW_FILTER = _b("ENABLE_ORDER_FLOW_FILTER", False)  # off por defecto
 ORDER_FLOW_TRADES_LIMIT = _i("ORDER_FLOW_TRADES_LIMIT", 1000)     # trades recientes a pedir

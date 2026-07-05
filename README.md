@@ -13,6 +13,10 @@ Scanner amplio sobre 500+ símbolos.
 3b. Order Block Engine (BigBeluga, 15m)    → si 3a no confirma: pivote + Order
                                               Block + retest, exigido a superar
                                               un ratio mínimo de volumen
+3.5. CVD Filter (opcional)                 → si está activo, exige que el CVD de
+                                              candles_entry también apunte en esa
+                                              dirección — si no, se prueba el
+                                              siguiente motor en vez de cortar
 4. Order Flow / Absorción                  → confirma el sweep con trades reales
 5. Funding Rate + Open Interest            → confirma "combustible" del movimiento
 6. Correlation Manager                     → evita exposición oculta a BTC
@@ -42,6 +46,7 @@ sweep del Unicorn Model, por lo que actualmente solo aplica a señales de 3a
 ├── config.py                  # Toda la configuración vía variables de entorno
 ├── unicorn_model.py           # Motor de entrada 3a: sweep + breaker + FVG
 ├── order_block_engine.py      # Motor de entrada 3b: Order Block + volumen (BigBeluga)
+├── cvd_filter.py               # Filtro opcional: Cumulative Volume Delta (sin llamada extra)
 ├── supertrend_engine.py       # Motor de bias: custom Supertrend (BigBeluga)
 ├── combined_engine.py         # Combina Supertrend + Unicorn + Order Block + Regime
 ├── order_flow.py              # Confirmación: absorción de volumen (trades reales)
@@ -129,6 +134,8 @@ el repo) y entornos virtuales.
 | `OB_TF` | `15m` | Timeframe propio del Order Block Engine |
 | `OB_PIVOT_LEN` | `7` | Barras a cada lado para confirmar un pivote |
 | `OB_MIN_BUY_PCT` / `OB_MIN_SELL_PCT` | `50.0` | % mínimo de volumen para confirmar el retest |
+| `ENABLE_CVD_FILTER` | `False` | Exige que el CVD (de `candles_entry`) confirme la dirección |
+| `CVD_LOOKBACK` | `20` | Velas finas hacia atrás para el cálculo de CVD |
 | `ENABLE_ORDER_FLOW_FILTER` | `False` | Confirmación por trades reales (solo aplica a señales del Unicorn Model) |
 | `ENABLE_FUNDING_OI_FILTER` | `False` | Confirmación por funding/OI |
 | `ENABLE_REGIME_FILTER` | `True` | Bloquea mercados en rango |

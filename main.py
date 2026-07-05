@@ -94,7 +94,7 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
         "htf_source": sig.get("htf_source"), "has_fvg": sig.get("has_fvg"),
         "supertrend": sig.get("supertrend"), "order_flow": sig.get("order_flow"),
         "funding_oi": sig.get("funding_oi"), "regime": sig.get("regime"),
-        "order_block": sig.get("order_block"),
+        "order_block": sig.get("order_block"), "cvd": sig.get("cvd"),
         "correlation_btc": corr, "result": result,
     })
 
