@@ -50,10 +50,10 @@ MAX_ACTIVE_POSITIONS = _i("MAX_ACTIVE_POSITIONS", 6)
 
 # ── Timeframes ───────────────────────────────────────────────────────
 ENTRY_TF = os.getenv("ENTRY_TF", "3m")       # Unicorn Model — timing de entrada
-BIAS_TF = os.getenv("BIAS_TF", "1H")         # Supertrend — bias macro
+BIAS_TF = os.getenv("BIAS_TF", "1h")         # Supertrend — bias macro (BingX exige minúscula: 1h, no 1H)
 HTF_A_TF = os.getenv("HTF_A_TF", "15m")      # fuente liquidez A del Unicorn Model
 HTF_B_TF = os.getenv("HTF_B_TF", "30m")      # fuente liquidez B
-HTF_C_TF = os.getenv("HTF_C_TF", "1H")       # fuente liquidez C
+HTF_C_TF = os.getenv("HTF_C_TF", "1h")       # fuente liquidez C (BingX exige minúscula: 1h, no 1H)
 OB_TF = os.getenv("OB_TF", "15m")            # Order Block Engine (BigBeluga) — su propio timeframe
 
 # ── Supertrend (BigBeluga custom) ─────────────────────────────────────
