@@ -29,10 +29,11 @@ BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
 # ── Scanner ────────────────────────────────────────────────────────────
-SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 8)        # requests simultáneas — bajado de 20: con
-                                                     # SCAN_ALL_SYMBOLS + 6 llamadas de klines/símbolo,
-                                                     # 20 disparaba el rate limit 100410 de BingX en el
-                                                     # endpoint de klines (ver exchange_client.py)
+SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 5)        # bajado de 8: el rate limit 100410 seguía en
+                                                     # loop porque cada reintento durante el bloqueo
+                                                     # parece extenderlo — ver exchange_client.py.
+                                                     # Menos concurrencia = ráfaga inicial más chica
+                                                     # antes de que el cooldown compartido se conozca.
 SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 420)    # 45s (default viejo) era irreal con
                                                      # SCAN_ALL_SYMBOLS=True: ~694 símbolos x 5
                                                      # klines c/u ≈ 3470 requests/ciclo, y con el

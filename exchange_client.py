@@ -34,11 +34,16 @@ import aiohttp
 log = logging.getLogger("exchange_client")
 
 RATE_LIMIT_CODE = 100410
-RATE_LIMIT_MAX_RETRIES = 3
-RATE_LIMIT_MAX_WAIT_S = 45.0  # techo por intento — antes 20s se quedaba corto contra
-                              # el bloqueo real observado, y forzaba reintentos en cadena
-DEFAULT_MIN_REQUEST_INTERVAL_S = 0.12  # ~8 req/s: espaciado base entre TODAS las
-                                        # requests de esta instancia, no solo klines
+RATE_LIMIT_SAFETY_CEILING_S = 600.0  # techo de SEGURIDAD solo por si el mensaje viniera
+                                      # corrupto/con un timestamp absurdo — NO es el caso normal.
+                                      # A diferencia de antes, ya NO reintentamos dentro del mismo
+                                      # request: cada intento adicional durante el "disabled period"
+                                      # parece hacer que BingX EXTIENDA el bloqueo (el log mostraba
+                                      # el tiempo de espera calculado sin bajar hacia 0, ciclo tras
+                                      # ciclo) — reintentar activamente perpetuaba el problema.
+DEFAULT_MIN_REQUEST_INTERVAL_S = 0.2  # ~5 req/s — más conservador que el intento anterior (~8 req/s);
+                                        # si el rate limit se extiende con cada request adicional
+                                        # recibida durante el bloqueo, más vale pecar de lento
 
 
 def _parse_unblock_wait_s(msg):
@@ -105,10 +110,9 @@ class BingXClient:
             self.api_secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    async def _request(self, method, path, params=None, signed=False, _retry=0):
+    async def _request(self, method, path, params=None, signed=False):
         await self._wait_for_slot()
-        original_params = dict(params or {})  # sin timestamp/signature — se re-firma en cada intento
-        params = dict(original_params)
+        params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["signature"] = self._sign(params)
@@ -119,23 +123,19 @@ class BingXClient:
                 data = await resp.json(content_type=None)
                 code = data.get("code")
                 if code == RATE_LIMIT_CODE:
-                    wait_s = min(_parse_unblock_wait_s(data.get("msg", "")), RATE_LIMIT_MAX_WAIT_S)
-                    # Cooldown COMPARTIDO: cualquier otra corutina que llame a
-                    # _request (para este o cualquier otro endpoint) va a
-                    # respetar este mismo "hasta cuándo" en su _wait_for_slot.
+                    wait_s = min(_parse_unblock_wait_s(data.get("msg", "")), RATE_LIMIT_SAFETY_CEILING_S)
+                    # Cooldown COMPARTIDO, sin reintento: cualquier otra corutina (para
+                    # este u otro endpoint) va a esperar este "hasta cuándo" en su
+                    # próximo _wait_for_slot ANTES de disparar su request. No reintentamos
+                    # aquí mismo porque cada intento adicional durante el "disabled period"
+                    # parece extender el bloqueo en vez de solo rechazarlo (ver nota arriba).
                     self._rate_limit_until = max(self._rate_limit_until, time.time() + wait_s)
-                    if _retry < RATE_LIMIT_MAX_RETRIES:
-                        log.warning(
-                            "Rate limit BingX (100410) en [%s %s], cooldown compartido ~%.1fs (intento %d/%d)",
-                            method, path, wait_s, _retry + 1, RATE_LIMIT_MAX_RETRIES,
-                        )
-                        return await self._request(method, path, params=original_params,
-                                                    signed=signed, _retry=_retry + 1)
-                    log.error(
-                        "Rate limit BingX persistente tras %d reintentos en [%s %s] — se abandona este request",
-                        RATE_LIMIT_MAX_RETRIES, method, path,
+                    log.warning(
+                        "Rate limit BingX (100410) en [%s %s] — cooldown compartido ~%.1fs, "
+                        "se abandona este request (sin reintentar)",
+                        method, path, wait_s,
                     )
-                if code not in (0, None):
+                elif code not in (0, None):
                     log.warning("BingX API error [%s %s]: %s", method, path, data)
                 return data
         except Exception as e:
