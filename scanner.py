@@ -13,57 +13,92 @@ from funding_oi_filter import confirm_with_funding_oi
 log = logging.getLogger("scanner")
 
 
-def _is_valid_symbol(symbol, non_crypto_prefixes):
+def _is_valid_symbol(symbol, non_crypto_prefixes, require_usdt_quote=True):
     base = symbol.split("-")[0] if "-" in symbol else symbol.replace("USDT", "")
-    return not any(base.startswith(p) for p in non_crypto_prefixes)
+    if any(base.startswith(p) for p in non_crypto_prefixes):
+        return False
+    if require_usdt_quote:
+        quote = symbol.split("-")[1] if "-" in symbol else "USDT"
+        if quote != "USDT":
+            return False
+    return True
 
 
 async def get_symbol_universe(client, config):
     """
-    Lista de símbolos filtrados por tipo (cripto) y, opcionalmente, por
-    liquidez. Con SCAN_ALL_SYMBOLS=True (default) se analizan TODAS las
-    monedas de BingX, sin filtro de volumen — solo se sigue excluyendo lo
-    que no es cripto (forex/índices/commodities que BingX a veces lista).
+    Lista de símbolos filtrados por tipo (cripto), moneda de cotización y,
+    opcionalmente, por liquidez. Con SCAN_ALL_SYMBOLS=True (default) se
+    analizan TODAS las monedas de BingX, sin filtro de volumen — solo se
+    sigue excluyendo lo que no es cripto (forex/índices/commodities/acciones
+    tokenizadas) y, por defecto, lo que no cotiza en USDT.
     """
     all_symbols = await client.get_all_symbols_with_volume()
     scan_all = getattr(config, "SCAN_ALL_SYMBOLS", True)
+    require_usdt_quote = getattr(config, "REQUIRE_USDT_QUOTE", True)
     min_vol = 0 if scan_all else config.MIN_24H_VOLUME_USDT
     filtered = [
         s["symbol"] for s in all_symbols
         if s["volume_24h_usdt"] >= min_vol
-        and _is_valid_symbol(s["symbol"], config.NON_CRYPTO_PREFIXES)
+        and _is_valid_symbol(s["symbol"], config.NON_CRYPTO_PREFIXES, require_usdt_quote)
     ]
     log.info(
-        "Universo de símbolos tras filtro: %d (SCAN_ALL_SYMBOLS=%s, min_vol=%s)",
-        len(filtered), scan_all, min_vol,
+        "Universo de símbolos tras filtro: %d (SCAN_ALL_SYMBOLS=%s, min_vol=%s, require_usdt_quote=%s)",
+        len(filtered), scan_all, min_vol, require_usdt_quote,
     )
     return filtered
+
+
+async def get_top_n_symbols(client, config, n):
+    """
+    Subconjunto de mayor volumen 24h, para el loop RÁPIDO (más frecuente que
+    el barrido completo). Mismos filtros de tipo/cotización que
+    get_symbol_universe, pero ignora SCAN_ALL_SYMBOLS/MIN_24H_VOLUME_USDT
+    a propósito — acá el orden por volumen ES el filtro.
+    """
+    all_symbols = await client.get_all_symbols_with_volume()
+    require_usdt_quote = getattr(config, "REQUIRE_USDT_QUOTE", True)
+    valid = [
+        s for s in all_symbols
+        if _is_valid_symbol(s["symbol"], config.NON_CRYPTO_PREFIXES, require_usdt_quote)
+    ]
+    valid.sort(key=lambda s: s["volume_24h_usdt"], reverse=True)
+    top = [s["symbol"] for s in valid[:n]]
+    log.info("Top %d símbolos por volumen para el loop rápido: %s...", n, top[:5])
+    return top
 
 
 async def _evaluate_one(client, symbol, config, semaphore):
     async with semaphore:
         try:
-            candles_entry = await client.get_klines(symbol, config.ENTRY_TF, limit=150)
-            candles_bias = await client.get_klines(symbol, config.BIAS_TF, limit=120)
-            candles_1h = await client.get_klines(symbol, config.HTF_C_TF, limit=60)
-
             ob_tf = getattr(config, "OB_TF", "15m")
             ob_engine_on = getattr(config, "ENABLE_OB_ENGINE", True)
+            ob_reuses_htf_a = ob_engine_on and ob_tf == config.HTF_A_TF
 
-            if ob_engine_on and ob_tf == config.HTF_A_TF:
-                # OB_TF coincide con HTF_A_TF (default de ambos: "15m") -> una sola
-                # llamada de klines sirve para las dos cosas. El Order Block Engine
-                # necesita más histórico (limit=250) que el Unicorn Model para su
-                # warm-up (ST_LEN + pivotes), así que se pide con ese límite mayor
-                # y ese mismo set alcanza de sobra para los niveles de liquidez del
-                # Unicorn Model (que solo mira las últimas ~22 velas).
-                candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=250)
-                candles_ob = candles_15m
-            else:
-                candles_15m = await client.get_klines(symbol, config.HTF_A_TF, limit=60)
-                candles_ob = await client.get_klines(symbol, ob_tf, limit=250) if ob_engine_on else None
+            # Las 5 llamadas de un mismo símbolo no dependen entre sí -> se piden
+            # en paralelo con gather en vez de una-tras-otra. El pacing/cooldown
+            # compartido de exchange_client.py sigue gobernando la tasa REAL de
+            # envío (esto no aumenta la carga total sobre BingX, solo evita que
+            # una espere a la otra sin necesidad dentro de un mismo símbolo).
+            htf_a_limit = 250 if ob_reuses_htf_a else 60
+            fetches = {
+                "entry": client.get_klines(symbol, config.ENTRY_TF, limit=150),
+                "bias": client.get_klines(symbol, config.BIAS_TF, limit=120),
+                "1h": client.get_klines(symbol, config.HTF_C_TF, limit=60),
+                "15m": client.get_klines(symbol, config.HTF_A_TF, limit=htf_a_limit),
+                "30m": client.get_klines(symbol, config.HTF_B_TF, limit=60),
+            }
+            if ob_engine_on and not ob_reuses_htf_a:
+                fetches["ob"] = client.get_klines(symbol, ob_tf, limit=250)
 
-            candles_30m = await client.get_klines(symbol, config.HTF_B_TF, limit=60)
+            results = await asyncio.gather(*fetches.values())
+            candles = dict(zip(fetches.keys(), results))
+
+            candles_entry = candles["entry"]
+            candles_bias = candles["bias"]
+            candles_1h = candles["1h"]
+            candles_15m = candles["15m"]
+            candles_30m = candles["30m"]
+            candles_ob = candles_15m if ob_reuses_htf_a else candles.get("ob")
 
             if len(candles_entry) < 80 or len(candles_bias) < 55:
                 return None
