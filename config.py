@@ -29,7 +29,10 @@ BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
 # ── Scanner ────────────────────────────────────────────────────────────
-SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 20)       # requests simultáneas
+SCAN_CONCURRENCY = _i("SCAN_CONCURRENCY", 8)        # requests simultáneas — bajado de 20: con
+                                                     # SCAN_ALL_SYMBOLS + 6 llamadas de klines/símbolo,
+                                                     # 20 disparaba el rate limit 100410 de BingX en el
+                                                     # endpoint de klines (ver exchange_client.py)
 SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 45)     # ciclo completo del scanner
 MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 3_000_000)  # filtra símbolos ilíquidos (solo si SCAN_ALL_SYMBOLS=False)
 SCAN_ALL_SYMBOLS = _b("SCAN_ALL_SYMBOLS", True)  # True = ignora MIN_24H_VOLUME_USDT, escanea TODO BingX (menos no-cripto)

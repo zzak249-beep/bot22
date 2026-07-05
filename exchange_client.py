@@ -20,15 +20,38 @@ este esquema, y consistente con cómo lo hace el resto del fleet) — no
 confirmado con tráfico real contra BingX todavía. Si el primer
 POST/GET autenticado falla con error de firma, revisar esto primero.
 """
+import asyncio
 import hashlib
 import hmac
 import logging
+import random
+import re
 import time
 from urllib.parse import urlencode
 
 import aiohttp
 
 log = logging.getLogger("exchange_client")
+
+RATE_LIMIT_CODE = 100410
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_MAX_WAIT_S = 20.0  # techo de espera por intento, aunque el mensaje pida más
+
+
+def _parse_unblock_wait_s(msg):
+    """
+    Extrae el epoch en ms de mensajes tipo:
+    "code:100410:The endpoint trigger frequency limit rule is currently in
+    the disabled period and will be unblocked after 1783232851826"
+    Devuelve segundos a esperar (>=0), o un default conservador si no
+    puede parsear el mensaje (BingX podría cambiar el formato del texto).
+    """
+    match = re.search(r"unblocked after (\d+)", msg or "")
+    if not match:
+        return 3.0
+    unblock_ms = int(match.group(1))
+    wait_s = (unblock_ms / 1000) - time.time()
+    return max(0.0, wait_s)
 
 
 class BingXClient:
@@ -53,8 +76,9 @@ class BingXClient:
             self.api_secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    async def _request(self, method, path, params=None, signed=False):
-        params = dict(params or {})
+    async def _request(self, method, path, params=None, signed=False, _retry=0):
+        original_params = dict(params or {})  # sin timestamp/signature — se re-firma en cada intento
+        params = dict(original_params)
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["signature"] = self._sign(params)
@@ -63,7 +87,18 @@ class BingXClient:
         try:
             async with self._session.request(method, url, params=params, headers=headers, timeout=15) as resp:
                 data = await resp.json(content_type=None)
-                if data.get("code") not in (0, None):
+                code = data.get("code")
+                if code == RATE_LIMIT_CODE and _retry < RATE_LIMIT_MAX_RETRIES:
+                    wait_s = min(_parse_unblock_wait_s(data.get("msg", "")), RATE_LIMIT_MAX_WAIT_S)
+                    wait_s += random.uniform(0, 1.5)  # jitter — evita que todas las corutinas reintenten a la vez
+                    log.warning(
+                        "Rate limit BingX (100410) en [%s %s], esperando %.1fs antes de reintentar (%d/%d)",
+                        method, path, wait_s, _retry + 1, RATE_LIMIT_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(wait_s)
+                    return await self._request(method, path, params=original_params,
+                                                signed=signed, _retry=_retry + 1)
+                if code not in (0, None):
                     log.warning("BingX API error [%s %s]: %s", method, path, data)
                 return data
         except Exception as e:
