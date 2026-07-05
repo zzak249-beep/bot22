@@ -138,7 +138,8 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
         log.warning("[%s] Balance no disponible o cero, se omite ciclo", tag)
         return
 
-    await pos_monitor.check_closures(balance)
+    async with exec_lock:
+        await pos_monitor.check_closures(balance)
 
     if risk_mgr.daily_loss_breached(balance):
         log.warning("[%s] Circuit breaker diario activo — no se buscan nuevas señales", tag)
@@ -156,8 +157,9 @@ async def run_cycle(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor,
         opened = await execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr,
                                        sig, balance, btc_candles, exec_lock)
         if opened:
-            pos_monitor.register_open(opened["symbol"], opened["setup_key"],
-                                      opened["risk_pct"], opened["opened_at_ms"])
+            async with exec_lock:
+                pos_monitor.register_open(opened["symbol"], opened["setup_key"],
+                                          opened["risk_pct"], opened["opened_at_ms"])
 
 
 async def _slow_loop(client, journal, risk_mgr, setup_mem, corr_mgr, pos_monitor, exec_lock):
