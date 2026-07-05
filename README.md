@@ -21,6 +21,10 @@ Scanner amplio sobre 500+ símbolos.
 5. Funding Rate + Open Interest            → confirma "combustible" del movimiento
 6. Correlation Manager                     → evita exposición oculta a BTC
 7. Setup Memory                            → aprende de setups históricos propios
+8. Order Book Imbalance (opcional)         → justo antes de ejecutar: confirma con
+                                              el libro de órdenes EN VIVO (no velas,
+                                              no trades — lo que está parado ahora
+                                              mismo en bids/asks)
 ```
 
 Cada filtro solo se evalúa si el anterior confirma — pensado para no
@@ -47,6 +51,7 @@ sweep del Unicorn Model, por lo que actualmente solo aplica a señales de 3a
 ├── unicorn_model.py           # Motor de entrada 3a: sweep + breaker + FVG
 ├── order_block_engine.py      # Motor de entrada 3b: Order Block + volumen (BigBeluga)
 ├── cvd_filter.py               # Filtro opcional: Cumulative Volume Delta (sin llamada extra)
+├── order_book_imbalance.py     # Filtro opcional: Order Book Imbalance (libro en vivo, confirmación final)
 ├── supertrend_engine.py       # Motor de bias: custom Supertrend (BigBeluga)
 ├── combined_engine.py         # Combina Supertrend + Unicorn + Order Block + Regime
 ├── order_flow.py              # Confirmación: absorción de volumen (trades reales)
@@ -136,6 +141,8 @@ el repo) y entornos virtuales.
 | `OB_MIN_BUY_PCT` / `OB_MIN_SELL_PCT` | `50.0` | % mínimo de volumen para confirmar el retest |
 | `ENABLE_CVD_FILTER` | `False` | Exige que el CVD (de `candles_entry`) confirme la dirección |
 | `CVD_LOOKBACK` | `20` | Velas finas hacia atrás para el cálculo de CVD |
+| `ENABLE_OBI_FILTER` | `False` | Confirma con el Order Book Imbalance justo antes de ejecutar |
+| `OBI_THRESHOLD` | `0.15` | Desequilibrio mínimo del libro (-1 a 1) para confirmar |
 | `ENABLE_ORDER_FLOW_FILTER` | `False` | Confirmación por trades reales (solo aplica a señales del Unicorn Model) |
 | `ENABLE_FUNDING_OI_FILTER` | `False` | Confirmación por funding/OI |
 | `ENABLE_REGIME_FILTER` | `True` | Bloquea mercados en rango |
@@ -210,11 +217,19 @@ nuevos), todos ejecutables sin red:
   volumen, lógica booleana de retest (cruce + umbral + anti-repintado +
   supresión por cambio de tendencia), invalidación por ruptura completa,
   y dos end-to-end (confirma LONG con volumen alto, rechaza con volumen bajo)
+- **Order Book Imbalance**: cálculo de desequilibrio, respeto del parámetro
+  de niveles de profundidad, libro vacío no bloquea, confirma/rechaza según
+  umbral, y un end-to-end dentro de `execute_signal` real (libro a favor abre,
+  libro en contra no)
 
 **Lo que NO fue validado** (requiere acceso a BingX real):
-1. Nombres exactos de los endpoints en `exchange_client.py`
+1. Nombres exactos de los endpoints en `exchange_client.py` — el de
+   `get_order_book()` es el menos confirmado de todos, se infirió de
+   wrappers de terceros, no de tráfico real contra BingX
 2. Formato real de campos de la API (`buyerMaker` vs `isBuyerMaker`, etc.)
 3. Rendimiento histórico real de la estrategia (backtesting con datos reales)
+4. Si el research de OBI (arXiv 2602.00776, validado sobre Binance Futures)
+   se sostiene igual en la liquidez y microestructura específicas de BingX
 
 ## Pendiente antes de operar en real
 

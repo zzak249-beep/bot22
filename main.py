@@ -28,6 +28,7 @@ from setup_memory import SetupMemory
 from correlation_manager import CorrelationManager
 from position_monitor import PositionMonitor
 from scanner import get_symbol_universe, get_top_n_symbols, scan_universe
+from order_book_imbalance import confirms_direction as obi_confirms
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -88,6 +89,23 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
             log.warning("[%s] Tamaño de posición inválido, se omite", symbol)
             return None
 
+        obi_info = {"skipped": True}
+        if getattr(config, "ENABLE_OBI_FILTER", False):
+            # Se pide el order book ACÁ, lo más tarde posible (justo antes de
+            # ejecutar) — es la confirmación más fresca que existe en el bot,
+            # tiene sentido pedirla al final, no durante el scan.
+            try:
+                order_book = await client.get_order_book(symbol, getattr(config, "OBI_LEVELS", 20))
+                obi_info = obi_confirms(order_book, side, config)
+                if obi_info["confirms"] is False:
+                    log.info("[%s] Señal descartada por OBI: %s", symbol, obi_info["reason"])
+                    journal.record({"symbol": symbol, "event": "signal_rejected",
+                                     "reason": f"obi: {obi_info['reason']}", "signal": sig})
+                    return None
+            except Exception as e:
+                log.warning("[%s] No se pudo evaluar OBI, se permite por defecto: %s", symbol, e)
+                obi_info = {"confirms": None, "reason": f"error: {e}"}
+
         await client.set_leverage(symbol, config.LEVERAGE, side)
         result = await client.open_position(symbol, side, qty, sl_price=sl, tp_price=tp)
 
@@ -98,7 +116,7 @@ async def execute_signal(client, journal, risk_mgr, setup_mem, corr_mgr, sig, ba
             "htf_source": sig.get("htf_source"), "has_fvg": sig.get("has_fvg"),
             "supertrend": sig.get("supertrend"), "order_flow": sig.get("order_flow"),
             "funding_oi": sig.get("funding_oi"), "regime": sig.get("regime"),
-            "order_block": sig.get("order_block"), "cvd": sig.get("cvd"),
+            "order_block": sig.get("order_block"), "cvd": sig.get("cvd"), "obi": obi_info,
             "correlation_btc": corr, "result": result,
         })
 

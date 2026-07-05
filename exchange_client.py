@@ -261,6 +261,32 @@ class BingXClient:
         trades.sort(key=lambda x: x["time"])
         return trades
 
+    async def get_order_book(self, symbol, limit=20):
+        """
+        Libro de órdenes público (bids/asks) para Order Book Imbalance
+        (order_book_imbalance.py). Devuelve {"bids": [[price, qty], ...],
+        "asks": [[price, qty], ...]} o {} si falla.
+
+        NOTA: el path exacto de este endpoint NO se confirmó contra tráfico
+        real de BingX — se infirió de wrappers de terceros (ej. clientes PHP/
+        C# no oficiales) que exponen un método `getDepth(symbol, limit)`,
+        pero no de la documentación oficial verificada en vivo. Mismo criterio
+        que get_recent_trades: revisar contra la documentación vigente antes
+        de operar en real, y no sorprenderse si el nombre de campo real
+        difiere (bids/asks vs a/b, strings vs floats, etc. — ya se maneja
+        defensivamente abajo, pero solo hasta donde se pudo anticipar).
+        """
+        params = {"symbol": symbol, "limit": limit}
+        data = await self._request("GET", "/openApi/swap/v2/quote/depth", params, signed=False)
+        raw = data.get("data", {}) if isinstance(data, dict) else {}
+        try:
+            bids = [[float(p), float(q)] for p, q in raw.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in raw.get("asks", [])]
+            return {"bids": bids, "asks": asks}
+        except (KeyError, ValueError, TypeError):
+            log.warning("No se pudo parsear order book de %s: %s", symbol, raw)
+            return {}
+
     async def get_funding_rate(self, symbol):
         """Funding rate actual del símbolo. Devuelve float (ej. 0.0001 = 0.01%)."""
         params = {"symbol": symbol}
