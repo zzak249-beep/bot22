@@ -51,7 +51,7 @@ NON_CRYPTO_PREFIXES = [  # instrumentos no-cripto que BingX a veces lista
     # directos o con sufijo de tokenización (ON=Ondo, X=xStocks) que BingX
     # también lista. Lista best-effort, no exhaustiva — BingX sigue agregando
     # acciones tokenizadas, revisar periódicamente igual que con forex/índices.
-    "NCSK", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
+    "NCSK", "NCCO", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
     "PLTR", "HOOD", "MSTR", "CRCL", "QQQ", "SPY",
 ]
 REQUIRE_USDT_QUOTE = _b("REQUIRE_USDT_QUOTE", True)  # excluye pares que no cotizan en USDT
