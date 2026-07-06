@@ -29,7 +29,15 @@ def _b(name, default):
 # verification failed") — y es mucho más común de lo que parece.
 BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
+BINGX_DEMO_MODE = _b("BINGX_DEMO_MODE", False)  # True = usa el dominio Demo/VST de BingX
+                                                  # (open-api-vst.bingx.com) en vez del real.
+                                                  # Si tu API key se generó estando en modo
+                                                  # "Demo Trading" (VST) de BingX, es probable
+                                                  # que NO sea válida contra el dominio real —
+                                                  # mismo síntoma que un secret incorrecto
+                                                  # (100001 Signature verification failed).
+_DEFAULT_BASE_URL = "https://open-api-vst.bingx.com" if BINGX_DEMO_MODE else "https://open-api.bingx.com"
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", _DEFAULT_BASE_URL)
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
 # ── Scanner ────────────────────────────────────────────────────────────
