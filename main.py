@@ -30,6 +30,11 @@ from position_monitor import PositionMonitor
 from scanner import get_symbol_universe, get_top_n_symbols, scan_universe
 from order_book_imbalance import confirms_direction as obi_confirms
 
+# Fingerprint de versión — subilo cada vez que cambies algo importante.
+# Sirve para confirmar en el log de arranque que un redeploy realmente
+# trajo el código nuevo, en vez de asumirlo por el ID de deploy de Railway.
+CODE_VERSION = "2026-07-06-signature-fix-demo-mode"
+
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -229,10 +234,11 @@ async def main():
         fast_on = getattr(config, "ENABLE_FAST_SCAN", True)
 
         log.info(
-            "Bot iniciado | DRY_RUN=%s | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
+            "Bot iniciado | CODE_VERSION=%s | DRY_RUN=%s | BINGX_BASE_URL=%s (demo_mode=%s) | ENTRY_TF=%s | BIAS_TF=%s | OB_TF=%s | "
             "regime=%s corr=%s order_flow=%s funding_oi=%s setup_memory=%s "
             "ob_engine=%s scan_all_symbols=%s | fast_scan=%s top_n=%s interval=%ss",
-            config.DRY_RUN, config.ENTRY_TF, config.BIAS_TF, getattr(config, "OB_TF", "15m"),
+            CODE_VERSION, config.DRY_RUN, config.BINGX_BASE_URL, getattr(config, "BINGX_DEMO_MODE", False),
+            config.ENTRY_TF, config.BIAS_TF, getattr(config, "OB_TF", "15m"),
             config.ENABLE_REGIME_FILTER, config.ENABLE_CORRELATION_FILTER,
             config.ENABLE_ORDER_FLOW_FILTER, config.ENABLE_FUNDING_OI_FILTER,
             config.ENABLE_SETUP_MEMORY_FILTER, getattr(config, "ENABLE_OB_ENGINE", True),
