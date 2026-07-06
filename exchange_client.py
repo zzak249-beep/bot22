@@ -69,8 +69,12 @@ def _parse_unblock_wait_s(msg):
 class BingXClient:
     def __init__(self, api_key, api_secret, base_url, dry_run=True,
                  min_request_interval=DEFAULT_MIN_REQUEST_INTERVAL_S):
-        self.api_key = api_key
-        self.api_secret = api_secret
+        # .strip() por si alguien instancia el cliente directamente sin pasar
+        # por config.py (que ya limpia) — un espacio/salto de línea invisible
+        # en la key o el secret produce el mismo síntoma que una firma mal
+        # calculada: "Signature verification failed".
+        self.api_key = (api_key or "").strip()
+        self.api_secret = (api_secret or "").strip()
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         self._session = None
