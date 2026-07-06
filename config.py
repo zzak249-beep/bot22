@@ -23,8 +23,12 @@ def _b(name, default):
 
 
 # ── Credenciales BingX ────────────────────────────────────────────────
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
+# .strip() es a propósito: un espacio o salto de línea invisible al pegar
+# la variable en Railway hace que la firma HMAC nunca coincida, con el
+# mismo síntoma exacto que un secret genuinamente incorrecto ("Signature
+# verification failed") — y es mucho más común de lo que parece.
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
 DRY_RUN = _b("DRY_RUN", True)  # True = solo loguea señales, no envía órdenes
 
