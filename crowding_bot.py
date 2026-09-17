@@ -136,7 +136,17 @@ CFG = {
     "SL_ATR": env("SL_ATR", 1.5),
     "TP_R": env("TP_R", 2.0),
     "MAX_BARS": env("MAX_BARS", 16),
-    "MIN_ATR_PCT": env("MIN_ATR_PCT", 1.0),
+    # MIN_ATR_PCT=1.0 en 15m exige ~200% de volatilidad anualizada: lo pasaban
+    # solo las microcaps de lotería, y en este universo NINGUNA. El filtro
+    # además DUPLICA a MAX_COST_R con peor criterio: con COST_PCT=0.25 y
+    # SL_ATR=1.5, exigir coste<=0.20R ya obliga a ATR>=0.83%. Se deja en 0 y
+    # manda el coste, que es el criterio económico.
+    "MIN_ATR_PCT": env("MIN_ATR_PCT", 0.0),
+    # Techo NUEVO. Sin él entraban símbolos con ATR del 11% por vela de 15m:
+    # el stop queda a 17% y el objetivo a 35%, inalcanzable en 16 velas. Ahí
+    # el coste en R sale ridículo y parece bueno, pero es el síntoma de que
+    # el stop está absurdamente lejos.
+    "MAX_ATR_PCT": env("MAX_ATR_PCT", 8.0),
     "COST_PCT": env("COST_PCT", 0.25),
     "MAX_COST_R": env("MAX_COST_R", 0.20),
     "STATE": env("STATE", "/data/crowding_state.json"),
@@ -146,8 +156,16 @@ CFG = {
     "REPORT_HOUR": env("REPORT_HOUR", 7),
     "TG_SIGNALS": env("TG_SIGNALS", False),
     "TG_CLOSES": env("TG_CLOSES", False),
+    # El volumen de Railway no tiene navegador de archivos; sendDocument sí.
+    "CSV_CON_INFORME": env("CSV_CON_INFORME", True),
+    "CSV_AL_ARRANCAR": env("CSV_AL_ARRANCAR", False),
     "PACING": env("PACING", 0.0),             # 0 = sin sleep extra (el pool controla)
-    "MAX_WORKERS": env("MAX_WORKERS", 20),    # paralelismo seguro bajo el rate limit
+    "MAX_WORKERS": env("MAX_WORKERS", 20),
+    # Sin esto el tamaño de la historia lo fija SCAN_SEC: a cadencia 2,2 min
+    # y 168 h de retención salen 4.580 puntos por símbolo, unos 80 MB de
+    # estado escritos en CADA ciclo. Con 300 s la historia mide lo mismo.
+    "MUESTRA_MIN_SEG": env("MUESTRA_MIN_SEG", 300.0),
+    "MAX_PUNTOS": env("MAX_PUNTOS", 2200),    # paralelismo seguro bajo el rate limit
     # 120 no alcanzaba para confirm.py: pedía 120 retornos y le llegaban 99,
     # así que conf_regimen salía siempre "pocas velas (99)".
     "KLINES_LIMIT": env("KLINES_LIMIT", 260),
@@ -382,6 +400,19 @@ def _cambios_oi(lo: list, look_h: float) -> list[float]:
     return out
 
 
+def _apuntar(h: deque, ahora: float, valor: float, min_seg: float, tope: int):
+    """
+    Guarda solo si han pasado min_seg desde la última. El valor ACTUAL no se
+    pierde: se usa siempre para el z, se guarde o no. Lo único que se
+    controla aquí es cuánta historia se acumula.
+    """
+    if h and (ahora - h[-1][0]) < min_seg:
+        return
+    h.append((ahora, valor))
+    while len(h) > tope:
+        h.popleft()
+
+
 def _span_horas(h: deque) -> float:
     return (h[-1][0] - h[0][0]) / 3600.0 if len(h) > 1 else 0.0
 
@@ -497,7 +528,41 @@ def tg(texto: str, tipo: str = "informe"):
         log.exception("Telegram falló")
 
 
+def enviar_csv(motivo: str = "") -> bool:
+    """Manda un CSV por Telegram como archivo. Nunca lanza."""
+    for ruta, nombre in ((CFG["CSV"], "crowding_ops.csv"),
+                         (CFG.get("PANEL_CSV", "/data/crowding_panel.csv"), "crowding_panel.csv")):
+        try:
+            if not os.path.exists(ruta) or os.path.getsize(ruta) < 100:
+                continue
+            if not CFG["TG_TOKEN"] or not CFG["TG_CHAT"]:
+                log.warning("Sin Telegram: el CSV está en %s", ruta)
+                return False
+            tam = os.path.getsize(ruta)
+            if tam > 48 * 1024 * 1024:
+                log.warning("%s pesa %.0f MB: Telegram no lo admite", nombre, tam / 1e6)
+                continue
+            with open(ruta, "rb") as f:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{CFG['TG_TOKEN']}/sendDocument",
+                    data={"chat_id": CFG["TG_CHAT"],
+                          "caption": f"{nombre} · {tam/1024:.0f} KB{(' · ' + motivo) if motivo else ''}"[:1000]},
+                    files={"document": (nombre, f, "text/csv")}, timeout=120)
+            if r.status_code == 200 and r.json().get("ok") is True:
+                log.info("%s enviado (%d bytes)", nombre, tam)
+            else:
+                log.error("Telegram rechazó %s: %s %s", nombre, r.status_code, r.text[:200])
+        except Exception:
+            log.exception("No se pudo enviar %s", nombre)
+    return True
+
+
 # ─────────────────────────────────────────────────────── lógica
+# Amplitud de los símbolos que SÍ se amontonaron. Es lo que permite fijar el
+# umbral con datos en vez de con una corazonada.
+ATR_AMONT: list[float] = []
+
+
 def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
             acc: list | None = None):
     """
@@ -516,8 +581,8 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
     ahora = time.time()
     hb = st.basis.setdefault(symbol, deque())
     ho = st.oi.setdefault(symbol, deque())
-    hb.append((ahora, p["basis"]))
-    ho.append((ahora, oi))
+    _apuntar(hb, ahora, p["basis"], float(CFG["MUESTRA_MIN_SEG"]), int(CFG["MAX_PUNTOS"]))
+    _apuntar(ho, ahora, oi, float(CFG["MUESTRA_MIN_SEG"]), int(CFG["MAX_PUNTOS"]))
     horas_ret = float(CFG["HIST_HORAS"])
     _podar(hb, ahora, horas_ret)
     _podar(ho, ahora, horas_ret)
@@ -562,8 +627,17 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
 
     if not (largos_amont or cortos_amont):
         return None, f"sin amontonamiento (zb {zb:.2f})"
+    # Se apunta el ATR de TODOS los amontonamientos, pasen o no el filtro. Sin
+    # esto, calibrar MIN/MAX_ATR_PCT es adivinar: ahora el log dice qué
+    # amplitud tienen de verdad los símbolos que se amontonan.
+    ATR_AMONT.append(atr_pct)
+    if len(ATR_AMONT) > 5000:
+        del ATR_AMONT[:2500]
+
     if atr_pct < float(CFG["MIN_ATR_PCT"]):
         return None, f"sin amplitud ({atr_pct:.2f}%)"
+    if atr_pct > float(CFG["MAX_ATR_PCT"]):
+        return None, f"amplitud excesiva ({atr_pct:.2f}%)"
     if coste_r > float(CFG["MAX_COST_R"]):
         return None, f"coste {coste_r:.2f}R"
 
@@ -682,10 +756,41 @@ def informe(st: Estado):
         for k, v in sorted(por_reg.items(), key=lambda kv: -len(kv[1])):
             aviso = " ⚠" if len(v) < 31 else ""
             L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)}){aviso}")
+    por_lado: dict[str, list] = {}
+    for x in filas:
+        por_lado.setdefault(x.get("lado") or "?", []).append(float(x["r_neto"]))
+    if len(por_lado) > 1:
+        L.append("Por lado:")
+        for k, v in sorted(por_lado.items(), key=lambda kv: -len(kv[1])):
+            L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)})"
+                     + (" ⚠" if len(v) < 31 else ""))
+    elif por_lado:
+        L.append(f"<i>Solo hay {next(iter(por_lado))}: el otro lado del filtro "
+                 f"no ha disparado ni una vez. Revisa Z_BASIS y EXT_PCT.</i>")
+    por_atr: dict[str, list] = {}
+    for x in filas:
+        try:
+            a = float(x.get("atr_pct") or 0)
+        except ValueError:
+            continue
+        cubo = "ATR <2%" if a < 2 else "ATR 2-5%" if a < 5 else "ATR >5%"
+        por_atr.setdefault(cubo, []).append(float(x["r_neto"]))
+    if len(por_atr) > 1:
+        L.append("Por amplitud:")
+        for k, v in sorted(por_atr.items()):
+            L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)})"
+                     + (" ⚠" if len(v) < 31 else ""))
     L.append(f"Virtuales abiertas: {len(st.abiertas)}")
     if not CFG["TG_SIGNALS"]:
         L.append("<i>Avisos por señal apagados (TG_SIGNALS). Todo está en el CSV.</i>")
     return "\n".join(L)
+
+
+# Embudo acumulado desde el arranque. El recuento de un ciclo suelto no dice
+# dónde se corta el sistema: aquí se ve que el 100% de los amontonamientos
+# moría en el filtro de amplitud, cosa que el log recortado a 3 razones
+# escondía.
+EMBUDO: dict[str, int] = {}
 
 
 def ciclo(st: Estado, simbolos: list[str]):
@@ -758,6 +863,8 @@ def ciclo(st: Estado, simbolos: list[str]):
         if escritas:
             log.info("Panel: %d filas apuntadas (%s)", escritas, CFG["PANEL_CSV"])
 
+    for k, v in razones.items():
+        EMBUDO[k] = EMBUDO.get(k, 0) + v
     top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
     global _ultimo_ciclo, _ultimo_heartbeat
     ahora = time.time()
@@ -795,6 +902,15 @@ def ciclo(st: Estado, simbolos: list[str]):
                  "(media %.1f h, %.0f muestras) | %s",
                  motivos, cad, calentando, total, media_h, media_n,
                  " · ".join(f"{k}: {v}" for k, v in top[:3]))
+    log.info("Embudo acumulado | %s",
+             " · ".join(f"{k}: {v}" for k, v in sorted(EMBUDO.items(), key=lambda kv: -kv[1])))
+    if len(ATR_AMONT) >= 20:
+        xs = sorted(ATR_AMONT)
+        q = lambda p: xs[min(len(xs) - 1, int(p * len(xs)))]
+        log.info("Amplitud de los amontonamientos (n=%d): p10 %.2f%% · mediana %.2f%% · "
+                 "p90 %.2f%% | filtro actual %.2f–%.2f%%",
+                 len(xs), q(0.10), q(0.50), q(0.90),
+                 float(CFG["MIN_ATR_PCT"]), float(CFG["MAX_ATR_PCT"]))
 
     # Heartbeat cada ~60 min
     if ahora - _ultimo_heartbeat >= 3600:
@@ -830,6 +946,9 @@ def main():
        f"<i>Sin claves de API: solo lee endpoints públicos. No puede operar.</i>\n"
        f"<i>Calentamiento: 30 h + 200 muestras por símbolo (~30-35 h de reloj).</i>")
 
+    if CFG["CSV_AL_ARRANCAR"]:
+        enviar_csv("pedido al arrancar")
+
     ultimo_universo = time.time()
     while True:
         try:
@@ -850,6 +969,8 @@ def main():
                 st.ultimo_informe = hoy
                 st.guardar()
                 tg(informe(st))
+                if CFG["CSV_CON_INFORME"]:
+                    enviar_csv("informe diario")
         except Exception:
             log.exception("Fallo en el ciclo")
         time.sleep(int(CFG["SCAN_SEC"]))
