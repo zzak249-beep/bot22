@@ -1,59 +1,58 @@
 """
-crowding_bot.py — bot de SEÑALES del posicionamiento amontonado. v3.0
+crowding_bot.py — bot de SEÑALES del posicionamiento amontonado.
 
-NO OPERA. NO PIDE CLAVES DE API. Solo endpoints públicos de BingX.
-
-═══════════════════════════════════════════════════════════════════════
-POR QUÉ ESTA VERSIÓN: "lleva días sin dar una señal" y no se sabía por qué
-═══════════════════════════════════════════════════════════════════════
-El bot tenía la respuesta y no la enseñaba. Cuatro defectos que se
-tapaban entre sí:
-
-1. SE PERDÍAN MUESTRAS SIN QUE NADA AVISARA. `_apuntar()` vivía DENTRO
-   de `evaluar()`, después de tres salidas tempranas ("pocas velas",
-   "sin premiumIndex", "sin open interest"). Y en el bucle, un símbolo
-   con virtual abierta hacía `continue` ANTES de llamar a `evaluar()`.
-   Resultado: cada fallo de descarga y cada virtual abierta (hasta 4 h)
-   dejaba un HUECO en la historia de ese símbolo. El calentamiento exige
-   200 muestras; los símbolos con más huecos tardaban el doble o no
-   llegaban. Ahora el muestreo va PRIMERO y es incondicional: si hay
-   dato, se apunta, pase lo que pase después.
-
-2. EL PANEL TAMBIÉN ESTABA VACÍO. `acc.append()` iba después del return
-   de "calentando", así que mientras algún símbolo calentaba no entraba
-   en el panel. Sin señales Y sin panel no hay nada que analizar.
-
-3. EL EMBUDO NO DECÍA LO QUE HACÍA FALTA. Contaba cuántos morían en cada
-   puerta, pero no A QUÉ DISTANCIA. "sin amontonamiento: 300" no
-   distingue "el mercado está plano" de "el umbral es inalcanzable".
-   Ahora hay AUTOPSIA: con cero señales, el log imprime el percentil 90,
-   99 y el máximo de cada variable frente a su umbral, y dice si el
-   umbral está fuera del alcance del mercado de hoy.
-
-4. LA VENTANA DEL Z CRECÍA HASTA 168 h. Medido por simulación: con
-   regímenes de volatilidad la tasa de disparo cae del 4,1% al 3,0% al
-   pasar de 30 h a 300 h de ventana, porque los tramos agitados engordan
-   la desviación típica. Es real pero secundario — no explica un cero.
-   Aun así ahora Z_WIN_HORAS es independiente de HIST_HORAS.
-
-Y una salida estructural: SELECCION=transversal. En vez de "z absoluto
->= 2", coge el X% más extremo del universo EN CADA INSTANTÁNEA. Siempre
-existe un peor 2%, así que siempre hay candidatos y la tasa de señales
-deja de depender de la volatilidad general del mercado. AVISO HONESTO:
-tener candidatos siempre NO es tener ventaja siempre. Es una forma de
-medir con muestra estable, no una mejora del resultado.
+NO OPERA. NO PIDE CLAVES DE API. Usa solo endpoints públicos de BingX, así
+que no puede tocar tu cuenta ni por error. Su único trabajo es generar
+señales y MEDIRSE A SÍ MISMO.
 
 ═══════════════════════════════════════════════════════════════════════
-CUÁNTA MUESTRA HACE FALTA
+MEJORAS DE VELOCIDAD Y PRECISIÓN (v2)
 ═══════════════════════════════════════════════════════════════════════
-Con desviación típica de 1R por operación:
+- premiumIndex de TODOS los símbolos en UNA sola llamada (ahorra ~300 req).
+- requests.Session con connection pooling.
+- ThreadPoolExecutor (MAX_WORKERS) para OI + klines en paralelo.
+- Evaluación y actualización de estado en serie (sin race conditions).
+- Rate limit BingX market data: 500 req / 10 s por IP. Con 20 workers
+  se mantiene cómodamente por debajo.
+- Cadencia típica: de ~9,4 min → ~2-3 min (depende de MAX_SYMBOLS).
+
+═══════════════════════════════════════════════════════════════════════
+LO QUE MIDE Y POR QUÉ ASÍ
+═══════════════════════════════════════════════════════════════════════
+Cada señal abre una operación VIRTUAL con stop y objetivo, y el bot la
+sigue hasta que toca uno o se agota el tiempo. Apunta el resultado en R,
+con el coste descontado. Sin eso, a los 15 días tendrías una lista de
+señales y cero respuestas.
+
+Convención: si en la misma vela el precio toca stop y objetivo, se cuenta
+STOP. No sabemos el orden dentro de la vela y equivocarse al revés es
+justo lo que infla los backtests.
+
+═══════════════════════════════════════════════════════════════════════
+CUÁNTA MUESTRA HACE FALTA (para que no te engañes al leerlo)
+═══════════════════════════════════════════════════════════════════════
+Con desviación típica de 1R por operación, para distinguir del ruido:
 
     ventaja 0.50 R/op  ->    31 operaciones
     ventaja 0.30 R/op  ->    87 operaciones
     ventaja 0.20 R/op  ->   196 operaciones
     ventaja 0.10 R/op  ->   784 operaciones
 
-Convención: si en la misma vela se tocan stop y objetivo, manda el STOP.
+En 15 días, escaneando todos los perpetuos, deberías rondar las 300-500.
+Eso solo alcanza para detectar una ventaja GRANDE. Si sale +0.08 R/op,
+la respuesta correcta no es "funciona poco": es "no lo sé todavía".
+
+Y ojo con la correlación: en un desplome las alts se mueven juntas, así
+que 500 señales del mismo día valen como muchas menos. Por eso el informe
+separa el resultado por día y avisa si un solo día domina el total.
+
+═══════════════════════════════════════════════════════════════════════
+CALENTAMIENTO
+═══════════════════════════════════════════════════════════════════════
+Los z-score de basis y open interest se calculan contra la historia que
+el propio bot va acumulando; BingX no sirve histórico de OI. Necesita
+unos 3 días antes de emitir nada. Durante ese tiempo dirá "calentando" y
+es correcto que no haga nada.
 """
 from __future__ import annotations
 
@@ -88,15 +87,15 @@ _ultimo_ciclo = 0.0
 _ultimo_heartbeat = 0.0
 
 BASE = "https://open-api.bingx.com"
-UA = {"User-Agent": "crowding-signal-bot/3.0"}
+UA = {"User-Agent": "crowding-signal-bot/2.2"}
 
+# Session reutilizable + pool grande (evita "Connection pool is full")
 SESSION = requests.Session()
 SESSION.headers.update(UA)
 _adapter = HTTPAdapter(
     pool_connections=40,
     pool_maxsize=40,
-    max_retries=Retry(total=2, backoff_factor=0.3,
-                      status_forcelist=[429, 500, 502, 503, 504]),
+    max_retries=Retry(total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504]),
 )
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
@@ -121,55 +120,56 @@ def env(k, d):
 
 CFG = {
     "TIMEFRAME": env("TIMEFRAME", "15m"),
-    "SCAN_SEC": env("SCAN_SEC", 120),
+    "SCAN_SEC": env("SCAN_SEC", 120),          # bajado: el trabajo es mucho más rápido
     "MIN_VOL_24H": env("MIN_VOL_24H", 2_000_000.0),
     "MAX_SYMBOLS": env("MAX_SYMBOLS", 300),
-    # EN HORAS, NO EN MUESTRAS: la duración del ciclo depende de cuántos
-    # símbolos escanee, así que un contador de muestras cambiaría de
-    # significado al tocar MAX_SYMBOLS.
-    "HIST_HORAS": env("HIST_HORAS", 168.0),    # retención
-    # VENTANA DEL Z, separada de la retención. Antes el z se calculaba
-    # contra TODA la historia guardada, así que se iba estrechando solo:
-    # al crecer la ventana entran tramos de volatilidad alta, la sd sube
-    # y el mismo movimiento deja de ser 2 sigma. Medido: 4.1% -> 3.0% de
-    # tasa de disparo al pasar de 30 h a 300 h. 0 = usar toda la historia
-    # (comportamiento anterior, para comparar).
-    "Z_WIN_HORAS": env("Z_WIN_HORAS", 48.0),
-    "MIN_HORAS": env("MIN_HORAS", 30.0),
-    "MIN_MUESTRAS": env("MIN_MUESTRAS", 200),
-    "OI_LOOK_H": env("OI_LOOK_H", 6.0),
-
-    # ── Selección ──────────────────────────────────────────────────
-    # "absoluto"   : z >= Z_BASIS contra la propia historia del símbolo.
-    #                La tasa de señales depende de la volatilidad general
-    #                del mercado: en calma, cero.
-    # "transversal": el XS_TOP_PCT% más extremo del universo en ESTA
-    #                instantánea. Siempre hay candidatos por construcción.
-    #                Eso arregla la MUESTRA, no la ventaja.
-    "SELECCION": env("SELECCION", "absoluto"),
-    "XS_TOP_PCT": env("XS_TOP_PCT", 2.0),
-    # Suelo de decencia en modo transversal: ser el más extremo de un
-    # universo plano no es estar amontonado.
-    "XS_Z_MIN": env("XS_Z_MIN", 1.0),
-
-    "Z_BASIS": env("Z_BASIS", 2.0),
-    "Z_OI": env("Z_OI", 1.0),
-    "EXT_PCT": env("EXT_PCT", 80.0),
+    # EN HORAS, NO EN MUESTRAS. El bot toma una muestra por ciclo, y la
+    # duración del ciclo depende de cuántos símbolos escanee.
+    "HIST_HORAS": env("HIST_HORAS", 168.0),   # retención (7 días)
+    "MIN_HORAS": env("MIN_HORAS", 30.0),      # antes de emitir
+    "MIN_MUESTRAS": env("MIN_MUESTRAS", 200), # y además esta cuenta mínima
+    "OI_LOOK_H": env("OI_LOOK_H", 6.0),       # ventana de variación de OI
+    # Datos ops 123: |z| 2.2–2.8 fue el único tramo con media positiva (+0.40R).
+    "Z_BASIS": env("Z_BASIS", 2.2),
+    "Z_OI": env("Z_OI", 1.2),
+    "EXT_PCT": env("EXT_PCT", 85.0),
     "ATR_LEN": env("ATR_LEN", 14),
     "SL_ATR": env("SL_ATR", 1.5),
-    "TP_R": env("TP_R", 2.0),
+    # TP 2R casi no se tocaba; 1.5R acerca el objetivo a lo que sí se alcanza.
+    "TP_R": env("TP_R", 1.5),
     "MAX_BARS": env("MAX_BARS", 16),
+    # Panel IC (63h, 250 snaps): basis ALTO se asocia a retornos futuros ALTOS
+    # (continuación), no a reversión. fade pierde -0.31R/op. momentum = ir A FAVOR.
+    "MODE": env("MODE", "momentum"),  # momentum | fade
+    "CUERPO_MIN": env("CUERPO_MIN", 0.45),
+    "DISP_ATR_MIN": env("DISP_ATR_MIN", 0.50),
+    # MIN_ATR_PCT=1.0 en 15m exige ~200% de volatilidad anualizada: lo pasaban
+    # solo las microcaps de lotería, y en este universo NINGUNA. El filtro
+    # además DUPLICA a MAX_COST_R con peor criterio: con COST_PCT=0.25 y
+    # SL_ATR=1.5, exigir coste<=0.20R ya obliga a ATR>=0.83%. Se deja en 0 y
+    # manda el coste, que es el criterio económico.
     "MIN_ATR_PCT": env("MIN_ATR_PCT", 0.0),
+    # Techo NUEVO. Sin él entraban símbolos con ATR del 11% por vela de 15m:
+    # el stop queda a 17% y el objetivo a 35%, inalcanzable en 16 velas. Ahí
+    # el coste en R sale ridículo y parece bueno, pero es el síntoma de que
+    # el stop está absurdamente lejos.
     "MAX_ATR_PCT": env("MAX_ATR_PCT", 8.0),
+    # ── LA CORRECCIÓN DEL DISPARO ──────────────────────────────────────
+    # El bot mira cada ~2 min pero las velas son de 15m: evaluaba la vela EN
+    # CURSO unas 7 veces antes de que cerrara, y bastaba con que UNO de esos
+    # vistazos pillara un retroceso para disparar el corto aunque la vela
+    # acabara VERDE. Simulado con esta misma cerilla:
+    #   vela alcista fuerte -> dispara intravela 68,7% · ya cerrada 33,4%
+    #   vela neutra         -> dispara intravela 79,4% · ya cerrada 50,8%
+    "SOLO_VELA_CERRADA": env("SOLO_VELA_CERRADA", True),
+    # No se vende un símbolo que sigue marcando máximos: eso no es la
+    # multitud soltando, es la multitud empujando con un retroceso dentro.
+    "NO_NUEVO_EXTREMO": env("NO_NUEVO_EXTREMO", 6),
+    # Sin enfriamiento, un rally reparte señales durante horas y todas son
+    # la misma apuesta contada como si fueran independientes.
+    "ENFRIA_BARRAS": env("ENFRIA_BARRAS", 12),
     "COST_PCT": env("COST_PCT", 0.25),
-    "MAX_COST_R": env("MAX_COST_R", 0.20),
-
-    # La vela de disparo. velas[-1] es la vela EN CURSO: evaluarla hace
-    # que una señal aparezca y desaparezca dentro del mismo bar, y que
-    # la 'entrada' apuntada no sea reproducible. Con true se exige que
-    # la vela en contra esté CERRADA. Menos señales y todas repetibles.
-    "VELA_CERRADA": env("VELA_CERRADA", True),
-
+    "MAX_COST_R": env("MAX_COST_R", 0.15),
     "STATE": env("STATE", "/data/crowding_state.json"),
     "CSV": env("CSV", "/data/crowding_ops.csv"),
     "TG_TOKEN": env("TG_TOKEN", ""),
@@ -177,20 +177,25 @@ CFG = {
     "REPORT_HOUR": env("REPORT_HOUR", 7),
     "TG_SIGNALS": env("TG_SIGNALS", False),
     "TG_CLOSES": env("TG_CLOSES", False),
+    # El volumen de Railway no tiene navegador de archivos; sendDocument sí.
     "CSV_CON_INFORME": env("CSV_CON_INFORME", True),
     "CSV_AL_ARRANCAR": env("CSV_AL_ARRANCAR", False),
-    # Aviso por Telegram cuando el bot lleva N horas sin emitir NADA.
-    # El silencio económico no da error en los logs: hay que vigilarlo.
-    "MUDO_ALERTA_H": env("MUDO_ALERTA_H", 12.0),
-    "PACING": env("PACING", 0.0),
+    "PACING": env("PACING", 0.0),             # 0 = sin sleep extra (el pool controla)
     "MAX_WORKERS": env("MAX_WORKERS", 20),
+    # Sin esto el tamaño de la historia lo fija SCAN_SEC: a cadencia 2,2 min
+    # y 168 h de retención salen 4.580 puntos por símbolo, unos 80 MB de
+    # estado escritos en CADA ciclo. Con 300 s la historia mide lo mismo.
     "MUESTRA_MIN_SEG": env("MUESTRA_MIN_SEG", 300.0),
-    "MAX_PUNTOS": env("MAX_PUNTOS", 2200),
+    "MAX_PUNTOS": env("MAX_PUNTOS", 2200),    # paralelismo seguro bajo el rate limit
+    # 120 no alcanzaba para confirm.py: pedía 120 retornos y le llegaban 99,
+    # así que conf_regimen salía siempre "pocas velas (99)".
     "KLINES_LIMIT": env("KLINES_LIMIT", 260),
+    # Panel transversal: ver panel.py. No decide nada, solo apunta.
     "PANEL_ENABLED": env("PANEL_ENABLED", True),
     "PANEL_CSV": env("PANEL_CSV", "/data/crowding_panel.csv"),
     "PANEL_CADA_SEG": env("PANEL_CADA_SEG", 900.0),
     "PANEL_MIN_SIMBOLOS": env("PANEL_MIN_SIMBOLOS", 30),
+    # Régimen: se APUNTA, no decide.
     "CONFIRM_ENABLED": env("CONFIRM_ENABLED", True),
     "CONFIRM_BLOQUEAR": False,
     "CONFIRM_Q": env("CONFIRM_Q", 8),
@@ -218,7 +223,7 @@ def _get(path: str, params: dict | None = None, intentos: int = 3):
         except Exception as e:
             if i == intentos - 1:
                 log.debug("%s falló: %s", path, e)
-            time.sleep(0.4 * (i + 1) + 0.1 * (i + 1) ** 2)
+            time.sleep(0.4 * (i + 1) + 0.1 * (i + 1) ** 2)  # backoff + jitter
     return None
 
 
@@ -248,7 +253,10 @@ def volumenes() -> dict:
 
 
 def premium_todos() -> dict[str, dict]:
-    """Una sola llamada para TODOS los símbolos."""
+    """
+    Una sola llamada para TODOS los símbolos.
+    Devuelve {symbol: {"mark", "index", "basis", "funding"}}
+    """
     d = _get("/openApi/swap/v2/quote/premiumIndex")
     if not d:
         return {}
@@ -263,9 +271,12 @@ def premium_todos() -> dict[str, dict]:
             fr = float(item.get("lastFundingRate") or 0)
             if not s or mark <= 0 or index <= 0:
                 continue
-            out[s] = {"mark": mark, "index": index,
-                      "basis": (mark - index) / index * 100.0,
-                      "funding": fr * 100.0}
+            out[s] = {
+                "mark": mark,
+                "index": index,
+                "basis": (mark - index) / index * 100.0,
+                "funding": fr * 100.0,
+            }
         except (TypeError, ValueError, KeyError):
             continue
     return out
@@ -297,9 +308,8 @@ def klines(symbol: str, limit: int | None = None):
     for k in d:
         try:
             if isinstance(k, dict):
-                filas.append({"t": int(k["time"]), "o": float(k["open"]),
-                              "h": float(k["high"]), "l": float(k["low"]),
-                              "c": float(k["close"])})
+                filas.append({"t": int(k["time"]), "o": float(k["open"]), "h": float(k["high"]),
+                              "l": float(k["low"]), "c": float(k["close"])})
             else:
                 filas.append({"t": int(k[0]), "o": float(k[1]), "h": float(k[2]),
                               "l": float(k[3]), "c": float(k[4])})
@@ -309,25 +319,15 @@ def klines(symbol: str, limit: int | None = None):
     return filas
 
 
-# Contadores de descarga. Un fallo de red que nadie cuenta es un hueco en
-# la historia que luego se lee como "calentando" sin motivo aparente.
-FETCH = {"ok": 0, "sin_oi": 0, "sin_velas": 0, "excepcion": 0}
-
-
 def _fetch_symbol_raw(symbol: str) -> dict | None:
+    """Worker: solo descarga OI + klines. Sin tocar estado compartido."""
     try:
         oi = open_interest(symbol)
         velas = klines(symbol)
-        if oi is None:
-            FETCH["sin_oi"] += 1
+        if oi is None or not velas:
             return None
-        if not velas:
-            FETCH["sin_velas"] += 1
-            return None
-        FETCH["ok"] += 1
         return {"oi": oi, "velas": velas}
     except Exception:
-        FETCH["excepcion"] += 1
         log.debug("fetch falló %s", symbol, exc_info=True)
         return None
 
@@ -357,13 +357,6 @@ def zscore(hist, x):
     return (x - mu) / sd if sd > 1e-12 else 0.0
 
 
-def pctl(xs: list[float], p: float) -> float:
-    if not xs:
-        return 0.0
-    s = sorted(xs)
-    return s[min(len(s) - 1, int(p / 100.0 * len(s)))]
-
-
 # ─────────────────────────────────────────────────────── estado
 @dataclass
 class Virtual:
@@ -382,29 +375,22 @@ class Virtual:
     conf_z: float = 0.0
     conf_regimen: str = "sin datos"
     barras: int = 0
+    # Excursión máxima a favor y en contra, en R. Contesta gratis si TP_R=2
+    # es el objetivo correcto: si el MFE medio de las perdedoras ronda 1.5R,
+    # el objetivo está demasiado lejos y lo estás devolviendo.
     mfe: float = 0.0
     mae: float = 0.0
 
 
 def _podar(h: deque, ahora: float, horas: float):
+    """Tira lo más viejo que la ventana de retención."""
     limite = ahora - horas * 3600.0
     while h and h[0][0] < limite:
         h.popleft()
 
 
-def _ventana(h: deque, ahora: float, horas: float) -> list:
-    """
-    Los puntos de las últimas N horas, para el z. Si horas<=0 devuelve
-    todo (comportamiento anterior). Separar esto de la retención es lo
-    que impide que el z se estreche solo según pasa el tiempo.
-    """
-    if horas <= 0:
-        return list(h)
-    limite = ahora - horas * 3600.0
-    return [p for p in h if p[0] >= limite]
-
-
 def _valor_hace(h: deque, ahora: float, horas: float):
+    """Valor de hace ~N horas: la muestra más cercana a ese instante."""
     if not h:
         return None
     objetivo = ahora - horas * 3600.0
@@ -415,7 +401,8 @@ def _valor_hace(h: deque, ahora: float, horas: float):
 
 
 def _cambios_oi(lo: list, look_h: float) -> list[float]:
-    """O(n log n). La versión con deque(lo[:i+1]) costaba 565 ms/símbolo."""
+    """O(n log n). La versión con deque(lo[:i+1]) costaba 565 ms por símbolo
+    con 4000 puntos, o sea ~170 s de CPU por ciclo con 300 símbolos."""
     ts = [p[0] for p in lo]
     look = look_h * 3600.0
     out: list[float] = []
@@ -435,6 +422,11 @@ def _cambios_oi(lo: list, look_h: float) -> list[float]:
 
 
 def _apuntar(h: deque, ahora: float, valor: float, min_seg: float, tope: int):
+    """
+    Guarda solo si han pasado min_seg desde la última. El valor ACTUAL no se
+    pierde: se usa siempre para el z, se guarde o no. Lo único que se
+    controla aquí es cuánta historia se acumula.
+    """
     if h and (ahora - h[-1][0]) < min_seg:
         return
     h.append((ahora, valor))
@@ -453,7 +445,6 @@ class Estado:
         self.oi: dict[str, deque] = {}
         self.abiertas: dict[str, Virtual] = {}
         self.ultimo_informe = ""
-        self.ultima_senal_ts = 0.0
         self._cargar()
 
     def _cargar(self):
@@ -464,7 +455,7 @@ class Estado:
             paso = float(CFG["SCAN_SEC"]) + 60.0
             migradas = 0
 
-            def _leer(bloque):
+            def _cargar(bloque):
                 nonlocal migradas
                 out = {}
                 for k, v in bloque.items():
@@ -480,28 +471,17 @@ class Estado:
                     out[k] = dq
                 return out
 
-            self.basis = _leer(d.get("basis", {}))
-            self.oi = _leer(d.get("oi", {}))
+            self.basis = _cargar(d.get("basis", {}))
+            self.oi = _cargar(d.get("oi", {}))
             if migradas:
-                log.warning("Migradas %d series del formato antiguo: tiempos estimados",
-                            migradas)
-            # Las virtuales van APARTE: si el dataclass cambió de campos,
-            # antes el except se comía TODO el bloque y perdías también
-            # ultimo_informe. Ahora un fallo aquí no arrastra lo demás.
-            try:
-                self.abiertas = {k: Virtual(**v) for k, v in d.get("abiertas", {}).items()}
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Virtuales del estado ilegibles (%s): se descartan, "
-                            "la historia de basis/OI se conserva", exc)
-                self.abiertas = {}
+                log.warning("Migradas %d series del formato antiguo (sin marca de "
+                            "tiempo): los tiempos son estimados", migradas)
+            self.abiertas = {k: Virtual(**v) for k, v in d.get("abiertas", {}).items()}
             self.ultimo_informe = d.get("ultimo_informe", "")
-            self.ultima_senal_ts = float(d.get("ultima_senal_ts", 0) or 0)
             log.info("Estado cargado: %d símbolos con historia, %d virtuales abiertas",
                      len(self.basis), len(self.abiertas))
         except FileNotFoundError:
-            log.warning("SIN ESTADO PREVIO en %s. Si Railway no tiene un volumen "
-                        "montado ahí, esto se repite en CADA despliegue y el "
-                        "calentamiento no termina nunca.", self.path)
+            log.info("Sin estado previo, empezando de cero")
         except Exception:
             log.exception("Estado ilegible, se empieza de cero")
 
@@ -515,7 +495,6 @@ class Estado:
                     "oi": {k: [list(p) for p in v] for k, v in self.oi.items()},
                     "abiertas": {k: asdict(v) for k, v in self.abiertas.items()},
                     "ultimo_informe": self.ultimo_informe,
-                    "ultima_senal_ts": self.ultima_senal_ts,
                 }, f)
             os.replace(tmp, self.path)
         except Exception:
@@ -523,7 +502,7 @@ class Estado:
 
 
 class _Cfg:
-    """Puente para que confirm.py y panel.py lean CFG con getattr."""
+    """Puente para que confirm.py lea CFG con getattr, sin config.py."""
 
     def __getattr__(self, k):
         if k in CFG:
@@ -553,6 +532,7 @@ def anotar(fila: dict):
 
 
 def tg(texto: str, tipo: str = "informe"):
+    """tipo: 'senal' | 'cierre' | 'informe'. Los dos primeros son opcionales."""
     if tipo == "senal" and not CFG["TG_SIGNALS"]:
         return
     if tipo == "cierre" and not CFG["TG_CLOSES"]:
@@ -570,9 +550,9 @@ def tg(texto: str, tipo: str = "informe"):
 
 
 def enviar_csv(motivo: str = "") -> bool:
+    """Manda un CSV por Telegram como archivo. Nunca lanza."""
     for ruta, nombre in ((CFG["CSV"], "crowding_ops.csv"),
-                         (CFG.get("PANEL_CSV", "/data/crowding_panel.csv"),
-                          "crowding_panel.csv")):
+                         (CFG.get("PANEL_CSV", "/data/crowding_panel.csv"), "crowding_panel.csv")):
         try:
             if not os.path.exists(ruta) or os.path.getsize(ruta) < 100:
                 continue
@@ -587,38 +567,45 @@ def enviar_csv(motivo: str = "") -> bool:
                 r = requests.post(
                     f"https://api.telegram.org/bot{CFG['TG_TOKEN']}/sendDocument",
                     data={"chat_id": CFG["TG_CHAT"],
-                          "caption": f"{nombre} · {tam/1024:.0f} KB"
-                                     f"{(' · ' + motivo) if motivo else ''}"[:1000]},
+                          "caption": f"{nombre} · {tam/1024:.0f} KB{(' · ' + motivo) if motivo else ''}"[:1000]},
                     files={"document": (nombre, f, "text/csv")}, timeout=120)
             if r.status_code == 200 and r.json().get("ok") is True:
                 log.info("%s enviado (%d bytes)", nombre, tam)
             else:
-                log.error("Telegram rechazó %s: %s %s", nombre, r.status_code,
-                          r.text[:200])
+                log.error("Telegram rechazó %s: %s %s", nombre, r.status_code, r.text[:200])
         except Exception:
             log.exception("No se pudo enviar %s", nombre)
     return True
 
 
-# ═══════════════════════════════════════════════════════ FASE 1 · muestreo
-def muestrear(symbol: str, velas: list, p: dict, oi: float, st: Estado) -> dict | None:
+# ─────────────────────────────────────────────────────── lógica
+# Amplitud de los símbolos que SÍ se amontonaron. Es lo que permite fijar el
+# umbral con datos en vez de con una corazonada.
+ATR_AMONT: list[float] = []
+
+# Última barra con señal por símbolo, para el enfriamiento.
+ULTIMA_SENAL: dict[str, int] = {}
+
+
+def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
+            acc: list | None = None):
     """
-    Apunta la observación y calcula las métricas. SIN NINGUNA PUERTA.
-
-    AQUÍ ESTABA EL FALLO DE LA VERSIÓN ANTERIOR. El muestreo vivía dentro
-    de evaluar(), detrás de tres salidas tempranas, y en el bucle un
-    símbolo con virtual abierta ni siquiera llegaba a evaluar(). Cada
-    fallo de OI y cada virtual abierta (hasta 4 h) abría un hueco en la
-    historia de ese símbolo; el calentamiento exige 200 muestras y esos
-    huecos lo alargaban sin que nada lo dijera.
-
-    Ahora: si hay dato, se apunta. Punto. Lo que decide si se puede
-    OPERAR se mira después, y no toca la historia.
-
-    Devuelve None solo si faltan datos de verdad.
+    Devuelve (senal|None, motivo).
+    senal = ('LONG'|'SHORT', datos).
+    p = dict de premium (mark/index/basis/funding)
+    oi = open interest actual
     """
-    if not velas or len(velas) < 60 or p is None or oi is None or oi <= 0:
-        return None
+    # La vela EN CURSO no decide nada. Todo el criterio va sobre cerradas.
+    if bool(CFG["SOLO_VELA_CERRADA"]) and velas:
+        if velas[-1]["t"] + BAR_SEC * 1000 > time.time() * 1000:
+            velas = velas[:-1]
+
+    if len(velas) < 60:
+        return None, "pocas velas"
+    if p is None:
+        return None, "sin premiumIndex"
+    if oi is None or oi <= 0:
+        return None, "sin open interest"
 
     ahora = time.time()
     hb = st.basis.setdefault(symbol, deque())
@@ -629,220 +616,126 @@ def muestrear(symbol: str, velas: list, p: dict, oi: float, st: Estado) -> dict 
     _podar(hb, ahora, horas_ret)
     _podar(ho, ahora, horas_ret)
 
-    m: dict[str, Any] = {"symbol": symbol, "listo": False, "motivo": ""}
-
     span = _span_horas(hb)
     min_h = float(CFG["MIN_HORAS"])
     min_n = int(CFG["MIN_MUESTRAS"])
-    m["span_h"] = span
-    m["n_muestras"] = len(hb)
     if span < min_h or len(hb) < min_n:
-        m["motivo"] = f"calentando ({span:.1f}/{min_h:.0f}h, {len(hb)}/{min_n})"
-        return m
+        return None, f"calentando ({span:.1f}/{min_h:.0f}h, {len(hb)}/{min_n})"
 
     look_h = float(CFG["OI_LOOK_H"])
     oi_prev = _valor_hace(ho, ahora, look_h)
     if oi_prev is None or oi_prev <= 0:
-        m["motivo"] = "sin ventana de OI"
-        return m
+        return None, "sin ventana de OI"
     oi_chg = (oi - oi_prev) / oi_prev * 100.0
 
-    zwin = float(CFG["Z_WIN_HORAS"])
-    hist_b = [x[1] for x in _ventana(hb, ahora, zwin)]
-    hist_o = _cambios_oi(_ventana(ho, ahora, zwin), look_h)
-    zb = zscore(hist_b, p["basis"])
-    zo = zscore(hist_o, oi_chg)
+    cambios = _cambios_oi(list(ho), look_h)
+    zb = zscore([x[1] for x in hb], p["basis"])
+    zo = zscore(cambios, oi_chg)
     if zb is None or zo is None:
-        m["motivo"] = (f"z no calculable (basis {len(hist_b)}, "
-                       f"OI {len(hist_o)} — hacen falta 30)")
-        return m
+        return None, "z no calculable"
 
+    cierres = [v["c"] for v in velas[-100:]]
     px = velas[-1]["c"]
+    pr = percentil(cierres, px)
+    cierres_reg = [v["c"] for v in velas[-(int(CFG["CONFIRM_WIN"]) + 1):]]
+
     a = atr(velas, int(CFG["ATR_LEN"]))
-    if px <= 0 or a <= 0:
-        m["motivo"] = "precio o ATR no válidos"
-        return m
+    atr_pct = a / px * 100.0 if px > 0 else 0.0
     riesgo = float(CFG["SL_ATR"]) * a
+    coste_r = (float(CFG["COST_PCT"]) / 100.0 * px) / riesgo if riesgo > 0 else 99.0
 
-    m.update({
-        "listo": True, "motivo": "ok",
-        "px": px, "basis_z": zb, "oi_z": zo,
-        "pct_precio": percentil([v["c"] for v in velas[-100:]], px),
-        "atr_pct": a / px * 100.0,
-        "funding": p["funding"],
-        "riesgo": riesgo,
-        "coste_r": (float(CFG["COST_PCT"]) / 100.0 * px) / riesgo,
-        "velas": velas,
-    })
-    return m
+    # Aquí es donde el bot tiraba 299 de cada 300 cálculos. Ahora se apuntan
+    # todos: es la misma información, y multiplica por 5.000 la muestra.
+    if acc is not None:
+        acc.append({"symbol": symbol, "px": px, "basis_z": zb, "oi_z": zo,
+                    "pct_precio": pr, "atr_pct": atr_pct,
+                    "funding": p["funding"], "coste_r": coste_r})
 
+    largos_amont = zb >= float(CFG["Z_BASIS"]) and zo >= float(CFG["Z_OI"]) and pr >= float(CFG["EXT_PCT"])
+    cortos_amont = zb <= -float(CFG["Z_BASIS"]) and zo >= float(CFG["Z_OI"]) and pr <= (100 - float(CFG["EXT_PCT"]))
 
-# ═══════════════════════════════════════════════════════ FASE 2 · puertas
-def umbrales_transversales(metricas: list[dict]) -> tuple[float, float]:
-    """
-    Umbrales de basis_z sacados del propio universo de esta instantánea.
-
-    Siempre existe un 2% más extremo, así que en modo transversal SIEMPRE
-    hay candidatos y la tasa de señales deja de depender de la
-    volatilidad general. Eso arregla la MUESTRA, no la ventaja: un
-    símbolo puede ser el más extremo de un universo plano y no estar
-    amontonado en absoluto. Por eso XS_Z_MIN pone un suelo por debajo del
-    cual no se opera aunque se sea el primero de la lista.
-    """
-    zs = sorted(m["basis_z"] for m in metricas if m.get("listo"))
-    if len(zs) < 30:
-        return float("inf"), float("-inf")
-    top = float(CFG["XS_TOP_PCT"])
-    suelo = float(CFG["XS_Z_MIN"])
-    alto = zs[max(0, int(len(zs) * (1 - top / 100.0)) - 1)]
-    bajo = zs[min(len(zs) - 1, int(len(zs) * (top / 100.0)))]
-    return max(alto, suelo), min(bajo, -suelo)
-
-
-def disparar(m: dict, st: Estado, z_alto: float, z_bajo: float) -> tuple[Any, str]:
-    """Devuelve (('LONG'|'SHORT', datos), motivo) o (None, motivo)."""
-    zb, zo, pr = m["basis_z"], m["oi_z"], m["pct_precio"]
-    ext = float(CFG["EXT_PCT"])
-
-    largos_amont = zb >= z_alto and zo >= float(CFG["Z_OI"]) and pr >= ext
-    cortos_amont = zb <= z_bajo and zo >= float(CFG["Z_OI"]) and pr <= (100 - ext)
     if not (largos_amont or cortos_amont):
         return None, f"sin amontonamiento (zb {zb:.2f})"
-
-    ATR_AMONT.append(m["atr_pct"])
+    # Se apunta el ATR de TODOS los amontonamientos, pasen o no el filtro. Sin
+    # esto, calibrar MIN/MAX_ATR_PCT es adivinar: ahora el log dice qué
+    # amplitud tienen de verdad los símbolos que se amontonan.
+    ATR_AMONT.append(atr_pct)
     if len(ATR_AMONT) > 5000:
         del ATR_AMONT[:2500]
 
-    if m["atr_pct"] < float(CFG["MIN_ATR_PCT"]):
-        return None, f"sin amplitud ({m['atr_pct']:.2f}%)"
-    if m["atr_pct"] > float(CFG["MAX_ATR_PCT"]):
-        return None, f"amplitud excesiva ({m['atr_pct']:.2f}%)"
-    if m["coste_r"] > float(CFG["MAX_COST_R"]):
-        return None, f"coste {m['coste_r']:.2f}R"
+    if atr_pct < float(CFG["MIN_ATR_PCT"]):
+        return None, f"sin amplitud ({atr_pct:.2f}%)"
+    if atr_pct > float(CFG["MAX_ATR_PCT"]):
+        return None, f"amplitud excesiva ({atr_pct:.2f}%)"
+    if coste_r > float(CFG["MAX_COST_R"]):
+        return None, f"coste {coste_r:.2f}R"
 
-    velas = m["velas"]
-    # Con VELA_CERRADA, la vela de disparo es la última CERRADA y su
-    # referencia la anterior. Sin esto se evalúa la vela en curso: la
-    # señal aparece y desaparece dentro del mismo bar y la 'entrada'
-    # apuntada no es reproducible ni en el propio CSV.
-    if bool(CFG["VELA_CERRADA"]):
-        if len(velas) < 3:
-            return None, "pocas velas para la cerrada"
-        ult, ant = velas[-2], velas[-3]
-        precio = ult["c"]
-        ts_ref = ult["t"]
-    else:
-        ult, ant = velas[-1], velas[-2]
-        precio = ult["c"]
-        ts_ref = ult["t"]
+    ult, ant = velas[-1], velas[-2]
+    modo = str(CFG["MODE"]).strip().lower()
+
+    nb = int(CFG["ENFRIA_BARRAS"])
+    if nb > 0 and (ult["t"] - ULTIMA_SENAL.get(symbol, -10**15)) < nb * BAR_SEC * 1000:
+        return None, "enfriamiento"
+
+    # En FADE: no entrar si sigue haciendo extremos (empujón, no agotamiento).
+    # En MOMENTUM: no aplicar ese veto (queremos fuerza).
+    if modo == "fade":
+        ne = int(CFG["NO_NUEVO_EXTREMO"])
+        if ne > 0 and len(velas) > ne + 1:
+            maxN = max(v["h"] for v in velas[-ne - 1:-1])
+            minN = min(v["l"] for v in velas[-ne - 1:-1])
+            if largos_amont and ult["h"] >= maxN:
+                return None, "sigue haciendo máximos"
+            if cortos_amont and ult["l"] <= minN:
+                return None, "sigue haciendo mínimos"
+
+    rng = ult["h"] - ult["l"]
+    body = abs(ult["c"] - ult["o"])
+    if rng <= 0 or (body / rng) < float(CFG["CUERPO_MIN"]):
+        return None, "cuerpo débil"
+    disp_min = float(CFG["DISP_ATR_MIN"]) * a if a > 0 else 0.0
 
     lado = None
-    if largos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
-        lado = "SHORT"
-    elif cortos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
-        lado = "LONG"
-    if lado is None:
-        return None, "esperando vela en contra"
-
-    cierres_reg = [v["c"] for v in velas[-(int(CFG["CONFIRM_WIN"]) + 1):]]
-    reg = cf.calcular(_CFG_OBJ, cierres_reg)
-    return (lado, {"px": precio, "ts": ts_ref, "riesgo": m["riesgo"],
-                   "coste_r": m["coste_r"], "zb": zb, "zo": zo,
-                   "funding": m["funding"], "atr_pct": m["atr_pct"],
-                   "conf_z": reg.z if reg.ok else 0.0,
-                   "conf_regimen": reg.etiqueta if reg.ok else reg.motivo}), "señal"
-
-
-ATR_AMONT: list[float] = []
-
-
-# ═══════════════════════════════════════════════════════ AUTOPSIA
-def autopsia(metricas: list[dict], z_alto: float, z_bajo: float) -> list[str]:
-    """
-    Con cero señales, ¿qué puerta las mató y POR CUÁNTO?
-
-    El embudo de antes decía "sin amontonamiento: 300" y eso no distingue
-    dos situaciones que piden arreglos opuestos:
-      · el mercado está plano y el umbral es correcto  -> esperar
-      · el umbral está fuera del alcance del mercado   -> bajarlo o
-        cambiar a selección transversal
-
-    La diferencia se ve en el MÁXIMO: si el zb más alto de 300 símbolos
-    es 1.4 y el umbral es 2.0, hoy no había forma de disparar. Si el
-    máximo es 3.1, el corte está en otra puerta.
-    """
-    listos = [m for m in metricas if m.get("listo")]
-    L = []
-    if not listos:
-        calientan = sum(1 for m in metricas if "calentando" in m.get("motivo", ""))
-        L.append(f"AUTOPSIA · ninguno listo ({calientan}/{len(metricas)} calentando)")
-        if metricas:
-            spans = [m.get("span_h", 0) for m in metricas]
-            ns = [m.get("n_muestras", 0) for m in metricas]
-            L.append(f"  historia: span p50 {pctl(spans,50):.1f}h p90 {pctl(spans,90):.1f}h "
-                     f"(hace falta {CFG['MIN_HORAS']}) · muestras p50 {pctl(ns,50):.0f} "
-                     f"p90 {pctl(ns,90):.0f} (hacen falta {CFG['MIN_MUESTRAS']})")
-        return L
-
-    zb = [m["basis_z"] for m in listos]
-    zo = [m["oi_z"] for m in listos]
-    pr = [m["pct_precio"] for m in listos]
-    cr = [m["coste_r"] for m in listos]
-    at = [m["atr_pct"] for m in listos]
-
-    def linea(nombre, xs, umbral, signo):
-        """
-        signo='>=' exige superar; '<=' exige quedar por debajo.
-
-        Se enseña la COLA QUE IMPORTA, no siempre la de arriba: para un
-        umbral '<=' los percentiles altos no dicen nada, y mirarlos fue
-        justo lo que escondía el problema en la versión anterior.
-        """
-        if signo == ">=":
-            n_pasan = sum(1 for x in xs if x >= umbral)
-            extremo = max(xs)
-            alcanza = extremo >= umbral
-            cola = (f"p50 {pctl(xs,50):+7.2f} p90 {pctl(xs,90):+7.2f} "
-                    f"p99 {pctl(xs,99):+7.2f} máx {extremo:+7.2f}")
-        else:
-            n_pasan = sum(1 for x in xs if x <= umbral)
-            extremo = min(xs)
-            alcanza = extremo <= umbral
-            cola = (f"p50 {pctl(xs,50):+7.2f} p10 {pctl(xs,10):+7.2f} "
-                    f"p01 {pctl(xs,1):+7.2f} mín {extremo:+7.2f}")
-        marca = "" if alcanza else "  ← INALCANZABLE HOY"
-        return (f"  {nombre:<14} {cola} · umbral {signo}{umbral:+.2f} · "
-                f"pasan {n_pasan}{marca}")
-
-    L.append(f"AUTOPSIA · {len(listos)} símbolos listos de {len(metricas)}")
-    L.append(linea("basis_z alto", zb, z_alto, ">="))
-    L.append(linea("basis_z bajo", zb, z_bajo, "<="))
-    L.append(linea("oi_z", zo, float(CFG["Z_OI"]), ">="))
-    L.append(linea("pct_precio", pr, float(CFG["EXT_PCT"]), ">="))
-    L.append(linea("coste_r", cr, float(CFG["MAX_COST_R"]), "<="))
-    L.append(linea("atr_pct", at, float(CFG["MAX_ATR_PCT"]), "<="))
-
-    # Cuántos superan las TRES condiciones a la vez: es lo que de verdad
-    # decide, porque pasar cada una por separado no implica pasarlas juntas.
-    tri_alto = sum(1 for m in listos
-                   if m["basis_z"] >= z_alto and m["oi_z"] >= float(CFG["Z_OI"])
-                   and m["pct_precio"] >= float(CFG["EXT_PCT"]))
-    tri_bajo = sum(1 for m in listos
-                   if m["basis_z"] <= z_bajo and m["oi_z"] >= float(CFG["Z_OI"])
-                   and m["pct_precio"] <= 100 - float(CFG["EXT_PCT"]))
-    L.append(f"  AMONTONADOS (las tres a la vez): {tri_alto} largos · {tri_bajo} cortos")
-    if tri_alto + tri_bajo == 0:
-        L.append("  → nadie se amontona. Si esto se repite día tras día y el máximo "
-                 "de basis_z no llega al umbral, el umbral no es del mercado: "
-                 "prueba SELECCION=transversal.")
+    if modo == "momentum":
+        # A FAVOR del amontonamiento (panel IC: basis alto -> retornos relativos altos)
+        if largos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
+            if (ult["c"] - ult["o"]) >= disp_min:
+                lado = "LONG"
+            else:
+                return None, "desplazamiento débil"
+        elif cortos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
+            if (ult["o"] - ult["c"]) >= disp_min:
+                lado = "SHORT"
+            else:
+                return None, "desplazamiento débil"
+        if lado is None:
+            return None, "esperando vela a favor"
     else:
-        L.append("  → hay amontonados; si no salen señales, mueren en amplitud, "
-                 "coste o en la vela en contra.")
-    return L
+        # FADE clásico (datos: -0.31 R/op en muestra; dejar por si el régimen cambia)
+        if largos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
+            if (ult["o"] - ult["c"]) >= disp_min:
+                lado = "SHORT"
+            else:
+                return None, "desplazamiento débil"
+        elif cortos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
+            if (ult["c"] - ult["o"]) >= disp_min:
+                lado = "LONG"
+            else:
+                return None, "desplazamiento débil"
+        if lado is None:
+            return None, "esperando vela en contra"
+
+    ULTIMA_SENAL[symbol] = ult["t"]
+    reg = cf.calcular(_CFG_OBJ, cierres_reg)
+    return (lado, {"px": px, "riesgo": riesgo, "coste_r": coste_r, "zb": zb,
+                   "zo": zo, "funding": p["funding"], "atr_pct": atr_pct,
+                   "conf_z": reg.z if reg.ok else 0.0,
+                   "conf_regimen": reg.etiqueta if reg.ok else reg.motivo,
+                   "mode": modo}), "señal"
 
 
-# ═══════════════════════════════════════════════════════ virtuales
 def seguir_virtuales(st: Estado, symbol: str, velas):
+    """Cierra las virtuales que tocaron stop, objetivo o se quedaron sin tiempo."""
     v = st.abiertas.get(symbol)
     if v is None:
         return
@@ -875,8 +768,7 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
     anotar({
         "cerrada_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "symbol": v.symbol, "lado": v.lado,
-        "abierta_utc": datetime.fromtimestamp(v.abierta_ts / 1000, timezone.utc)
-                               .isoformat(timespec="seconds"),
+        "abierta_utc": datetime.fromtimestamp(v.abierta_ts / 1000, timezone.utc).isoformat(timespec="seconds"),
         "entrada": v.entrada, "salida": salida, "motivo": motivo,
         "r_bruto": round(bruto, 4), "coste_r": round(v.coste_r, 4),
         "r_neto": round(neto, 4), "barras": v.barras,
@@ -886,12 +778,11 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
         "mfe": round(v.mfe, 3), "mae": round(v.mae, 3),
     })
     icono = "✅" if neto > 0 else "🔴"
-    tg(f"{icono} <b>{v.symbol.split('-')[0]}</b> {v.lado} virtual cerrada por "
-       f"{motivo}: <b>{neto:+.2f} R</b> en {v.barras} velas", "cierre")
+    tg(f"{icono} <b>{v.symbol.split('-')[0]}</b> {v.lado} virtual cerrada por {motivo}: "
+       f"<b>{neto:+.2f} R</b> en {v.barras} velas", "cierre")
     st.abiertas.pop(symbol, None)
 
 
-# ═══════════════════════════════════════════════════════ informe
 def informe(st: Estado):
     try:
         with open(CFG["CSV"], encoding="utf-8") as f:
@@ -901,8 +792,7 @@ def informe(st: Estado):
     if not filas:
         return (f"📊 <b>Crowding · informe</b>\nSin operaciones cerradas todavía.\n"
                 f"Historia acumulada en {len(st.basis)} símbolos.\n"
-                f"<i>Mira la línea AUTOPSIA del log: dice qué puerta corta y "
-                f"si el umbral está fuera del alcance del mercado.</i>")
+                f"<i>Necesita ~200 muestras por símbolo antes de emitir.</i>")
     rs = [float(x["r_neto"]) for x in filas]
     n = len(rs)
     media = statistics.fmean(rs)
@@ -935,53 +825,62 @@ def informe(st: Estado):
                  f"correlacionadas, no {n} independientes")
     if abs(t) < 2:
         L.append("Sin significación: <b>esto todavía no dice nada</b>")
-
-    # MFE/MAE: contesta gratis si el objetivo y el stop están donde deben.
-    mfes = [float(x["mfe"]) for x in filas if x.get("mfe")]
-    maes_g = [float(x["mae"]) for x in filas if x.get("mae") and float(x["r_neto"]) > 0]
-    if mfes:
-        perd = [float(x["mfe"]) for x in filas
-                if x.get("mfe") and float(x["r_neto"]) <= 0]
-        if perd:
-            cerca = sum(1 for x in perd if x >= 1.0)
-            L.append(f"MFE de las perdedoras: mediana {statistics.median(perd):.2f} R · "
-                     f"{cerca}/{len(perd)} pasaron de +1 R y aun así perdieron")
-    if maes_g:
-        L.append(f"MAE de las ganadoras: p90 {pctl(maes_g, 90):.2f} R "
-                 f"(stop en 1.00 R)")
-
-    for campo, titulo in (("conf_regimen", "Por régimen"), ("lado", "Por lado")):
-        g: dict[str, list] = {}
-        for x in filas:
-            g.setdefault(x.get(campo) or "?", []).append(float(x["r_neto"]))
-        if len(g) > 1:
-            L.append(titulo + ":")
-            for k, v in sorted(g.items(), key=lambda kv: -len(kv[1])):
-                L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)})"
-                         + (" ⚠" if len(v) < 31 else ""))
-        elif campo == "lado" and g:
-            L.append(f"<i>Solo hay {next(iter(g))}: el otro lado no ha disparado "
-                     f"ni una vez. Revisa Z_BASIS y EXT_PCT.</i>")
+    por_reg: dict[str, list] = {}
+    for x in filas:
+        por_reg.setdefault(x.get("conf_regimen") or "?", []).append(float(x["r_neto"]))
+    if len(por_reg) > 1:
+        L.append("Por régimen:")
+        for k, v in sorted(por_reg.items(), key=lambda kv: -len(kv[1])):
+            aviso = " ⚠" if len(v) < 31 else ""
+            L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)}){aviso}")
+    por_lado: dict[str, list] = {}
+    for x in filas:
+        por_lado.setdefault(x.get("lado") or "?", []).append(float(x["r_neto"]))
+    if len(por_lado) > 1:
+        L.append("Por lado:")
+        for k, v in sorted(por_lado.items(), key=lambda kv: -len(kv[1])):
+            L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)})"
+                     + (" ⚠" if len(v) < 31 else ""))
+    elif por_lado:
+        L.append(f"<i>Solo hay {next(iter(por_lado))}: el otro lado del filtro "
+                 f"no ha disparado ni una vez. Revisa Z_BASIS y EXT_PCT.</i>")
+    por_atr: dict[str, list] = {}
+    for x in filas:
+        try:
+            a = float(x.get("atr_pct") or 0)
+        except ValueError:
+            continue
+        cubo = "ATR <2%" if a < 2 else "ATR 2-5%" if a < 5 else "ATR >5%"
+        por_atr.setdefault(cubo, []).append(float(x["r_neto"]))
+    if len(por_atr) > 1:
+        L.append("Por amplitud:")
+        for k, v in sorted(por_atr.items()):
+            L.append(f"  {k}: {statistics.fmean(v):+.3f} R/op (n={len(v)})"
+                     + (" ⚠" if len(v) < 31 else ""))
     L.append(f"Virtuales abiertas: {len(st.abiertas)}")
+    if not CFG["TG_SIGNALS"]:
+        L.append("<i>Avisos por señal apagados (TG_SIGNALS). Todo está en el CSV.</i>")
     return "\n".join(L)
 
 
+# Embudo acumulado desde el arranque. El recuento de un ciclo suelto no dice
+# dónde se corta el sistema: aquí se ve que el 100% de los amontonamientos
+# moría en el filtro de amplitud, cosa que el log recortado a 3 razones
+# escondía.
 EMBUDO: dict[str, int] = {}
 
 
-# ═══════════════════════════════════════════════════════ ciclo
 def ciclo(st: Estado, simbolos: list[str]):
-    global _ultimo_ciclo, _ultimo_heartbeat
-    señales = 0
+    señales = motivos = 0
     razones: dict[str, int] = {}
-    for k in FETCH:
-        FETCH[k] = 0
 
+    # 1) premiumIndex de TODOS de una sola vez
     premiums = premium_todos()
     if not premiums:
-        log.warning("No se pudo obtener premiumIndex global: ciclo saltado")
+        log.warning("No se pudo obtener premiumIndex global")
         return
 
+    # 2) Descarga paralela de OI + klines
     raw: dict[str, dict] = {}
     workers = max(1, int(CFG["MAX_WORKERS"]))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -995,136 +894,119 @@ def ciclo(st: Estado, simbolos: list[str]):
             except Exception:
                 log.debug("Error en worker %s", sym, exc_info=True)
 
-    # ── FASE 1: muestrear TODO, sin puertas y sin excepciones ──────
-    # Incluidos los símbolos con virtual abierta: antes se saltaban con
-    # un `continue` y perdían hasta 4 h de historia cada vez.
-    metricas: list[dict] = []
+    # 3) Evaluación secuencial (estado compartido seguro)
+    acc: list | None = [] if pn.toca(_CFG_OBJ) else None
     for sym in simbolos:
-        data = raw.get(sym)
-        if not data:
-            razones["sin datos"] = razones.get("sin datos", 0) + 1
-            continue
         try:
-            seguir_virtuales(st, sym, data["velas"])
-            m = muestrear(sym, data["velas"], premiums.get(sym), data["oi"], st)
-            if m is None:
-                razones["sin datos"] = razones.get("sin datos", 0) + 1
+            data = raw.get(sym)
+            if not data:
                 continue
-            metricas.append(m)
-            if not m["listo"]:
-                clave = m["motivo"].split("(")[0].strip()
-                razones[clave] = razones.get(clave, 0) + 1
-        except Exception:
-            log.exception("Fallo muestreando %s", sym)
+            velas = data["velas"]
+            oi = data["oi"]
+            p = premiums.get(sym)
 
-    # ── Panel: se escribe con TODO lo que esté listo, calienten otros o no
-    if pn.toca(_CFG_OBJ):
-        filas = [{k: m[k] for k in ("symbol", "px", "basis_z", "oi_z",
-                                    "pct_precio", "atr_pct", "funding", "coste_r")}
-                 for m in metricas if m.get("listo")]
-        escritas = pn.registrar(_CFG_OBJ, filas)
-        if escritas:
-            log.info("Panel: %d filas apuntadas (%s)", escritas, CFG["PANEL_CSV"])
+            seguir_virtuales(st, sym, velas)
+            if sym in st.abiertas:
+                continue
 
-    # ── FASE 2: umbrales y disparo ─────────────────────────────────
-    modo = str(CFG["SELECCION"]).lower()
-    if modo == "transversal":
-        z_alto, z_bajo = umbrales_transversales(metricas)
-    else:
-        z_alto, z_bajo = float(CFG["Z_BASIS"]), -float(CFG["Z_BASIS"])
-
-    for m in metricas:
-        if not m.get("listo") or m["symbol"] in st.abiertas:
-            continue
-        try:
-            sig, motivo = disparar(m, st, z_alto, z_bajo)
+            sig, motivo = evaluar(sym, velas, p, oi, st, acc)
             clave = motivo.split("(")[0].strip()
             razones[clave] = razones.get(clave, 0) + 1
+            motivos += 1
             if sig is None:
                 continue
+
             lado, d = sig
-            sym = m["symbol"]
             entrada = d["px"]
             sl = entrada - d["riesgo"] if lado == "LONG" else entrada + d["riesgo"]
-            tp = (entrada + float(CFG["TP_R"]) * d["riesgo"] if lado == "LONG"
-                  else entrada - float(CFG["TP_R"]) * d["riesgo"])
+            tp = entrada + float(CFG["TP_R"]) * d["riesgo"] if lado == "LONG" else entrada - float(CFG["TP_R"]) * d["riesgo"]
             st.abiertas[sym] = Virtual(
-                symbol=sym, lado=lado, abierta_ts=d["ts"], entrada=entrada,
+                symbol=sym, lado=lado, abierta_ts=velas[-1]["t"], entrada=entrada,
                 sl=sl, tp=tp, riesgo=d["riesgo"], coste_r=d["coste_r"],
-                basis_z=d["zb"], oi_z=d["zo"], funding=d["funding"],
-                atr_pct=d["atr_pct"], conf_z=d["conf_z"],
-                conf_regimen=d["conf_regimen"])
+                basis_z=d["zb"], oi_z=d["zo"], funding=d["funding"], atr_pct=d["atr_pct"],
+                conf_z=d["conf_z"], conf_regimen=d["conf_regimen"])
             señales += 1
-            st.ultima_senal_ts = time.time()
             flecha = "🟢" if lado == "LONG" else "🔴"
             tg(f"{flecha} <b>{sym.split('-')[0]}</b> {lado} (virtual)\n"
-               f"Entrada <code>{entrada:.8g}</code> · SL <code>{sl:.8g}</code> · "
-               f"TP <code>{tp:.8g}</code>\n"
-               f"basis z {d['zb']:+.2f} · OI z {d['zo']:+.2f} · "
-               f"funding {d['funding']:+.4f}%\n"
+               f"Entrada <code>{entrada:.8g}</code> · SL <code>{sl:.8g}</code> · TP <code>{tp:.8g}</code>\n"
+               f"basis z {d['zb']:+.2f} · OI z {d['zo']:+.2f} · funding {d['funding']:+.4f}%\n"
                f"ATR {d['atr_pct']:.2f}% · coste {d['coste_r']:.2f} R\n"
                f"<i>Solo señal. El bot no opera.</i>", "senal")
         except Exception:
-            log.exception("Fallo disparando %s", m.get("symbol"))
+            log.exception("Fallo evaluando %s", sym)
 
-    # ── Log ────────────────────────────────────────────────────────
+    if acc:
+        escritas = pn.registrar(_CFG_OBJ, acc)
+        if escritas:
+            log.info("Panel: %d filas apuntadas (%s)", escritas, CFG["PANEL_CSV"])
+
     for k, v in razones.items():
         EMBUDO[k] = EMBUDO.get(k, 0) + v
+    top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
+    global _ultimo_ciclo, _ultimo_heartbeat
     ahora = time.time()
     cad = (ahora - _ultimo_ciclo) / 60.0 if _ultimo_ciclo else 0.0
     _ultimo_ciclo = ahora
 
-    listos = sum(1 for m in metricas if m.get("listo"))
-    total = len(simbolos)
-    top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
-    log.info("Ciclo: %d/%d con datos · %d listos · %d señales · cadencia %.1f min "
-             "| descargas ok=%d sin_oi=%d sin_velas=%d exc=%d | %s",
-             len(raw), total, listos, señales, cad,
-             FETCH["ok"], FETCH["sin_oi"], FETCH["sin_velas"], FETCH["excepcion"],
-             " · ".join(f"{k}: {v}" for k, v in top))
+    # Progreso de calentamiento
+    min_h = float(CFG["MIN_HORAS"])
+    min_n = int(CFG["MIN_MUESTRAS"])
+    listos = calentando = 0
+    sum_h = sum_n = 0.0
+    for sym in simbolos:
+        hb = st.basis.get(sym)
+        if not hb or len(hb) < 2:
+            calentando += 1
+            continue
+        span = (hb[-1][0] - hb[0][0]) / 3600.0
+        n = len(hb)
+        sum_h += span
+        sum_n += n
+        if span >= min_h and n >= min_n:
+            listos += 1
+        else:
+            calentando += 1
+    total = max(listos + calentando, 1)
+    media_h = sum_h / total
+    media_n = sum_n / total
+
+    if señales > 0 or calentando == 0:
+        log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | workers=%d | listos %d/%d · %s",
+                 motivos, señales, cad, workers, listos, total,
+                 " · ".join(f"{k}: {v}" for k, v in top))
+    else:
+        log.info("Ciclo: %d símbolos · 0 señales · cadencia %.1f min | calentando %d/%d "
+                 "(media %.1f h, %.0f muestras) | %s",
+                 motivos, cad, calentando, total, media_h, media_n,
+                 " · ".join(f"{k}: {v}" for k, v in top[:3]))
     log.info("Embudo acumulado | %s",
-             " · ".join(f"{k}: {v}" for k, v in sorted(EMBUDO.items(),
-                                                       key=lambda kv: -kv[1])))
-
-    # LA LÍNEA QUE CONTESTA "¿por qué no da señales?"
-    if señales == 0:
-        for linea in autopsia(metricas, z_alto, z_bajo):
-            log.info(linea)
-
+             " · ".join(f"{k}: {v}" for k, v in sorted(EMBUDO.items(), key=lambda kv: -kv[1])))
     if len(ATR_AMONT) >= 20:
-        log.info("Amplitud de los amontonamientos (n=%d): p10 %.2f%% · mediana "
-                 "%.2f%% · p90 %.2f%% | filtro actual %.2f–%.2f%%",
-                 len(ATR_AMONT), pctl(ATR_AMONT, 10), pctl(ATR_AMONT, 50),
-                 pctl(ATR_AMONT, 90), float(CFG["MIN_ATR_PCT"]),
-                 float(CFG["MAX_ATR_PCT"]))
+        xs = sorted(ATR_AMONT)
+        q = lambda p: xs[min(len(xs) - 1, int(p * len(xs)))]
+        log.info("Amplitud de los amontonamientos (n=%d): p10 %.2f%% · mediana %.2f%% · "
+                 "p90 %.2f%% | filtro actual %.2f–%.2f%%",
+                 len(xs), q(0.10), q(0.50), q(0.90),
+                 float(CFG["MIN_ATR_PCT"]), float(CFG["MAX_ATR_PCT"]))
 
-    # ── Silencio económico: el bot vivo y mudo no da error en el log ──
-    mudo_h = float(CFG["MUDO_ALERTA_H"])
-    if mudo_h > 0 and listos > 0 and st.ultima_senal_ts > 0:
-        horas = (ahora - st.ultima_senal_ts) / 3600.0
-        if horas >= mudo_h and (ahora - _ultimo_heartbeat) >= 3600:
-            tg("🔇 <b>Crowding lleva " + f"{horas:.0f} h sin una sola señal</b>\n"
-               + f"{listos}/{total} símbolos listos, o sea que NO es calentamiento.\n"
-               + "\n".join(autopsia(metricas, z_alto, z_bajo)[:8]))
-
+    # Heartbeat cada ~60 min
     if ahora - _ultimo_heartbeat >= 3600:
         _ultimo_heartbeat = ahora
-        spans = [m.get("span_h", 0) for m in metricas]
-        tg(f"💓 <b>Crowding heartbeat</b>\n"
-           f"Universo {total} · con datos {len(raw)} · listos {listos}\n"
-           f"Historia: span p50 {pctl(spans, 50):.1f} h (hace falta "
-           f"{CFG['MIN_HORAS']:.0f})\n"
-           f"Virtuales abiertas: {len(st.abiertas)} · cadencia {cad:.1f} min\n"
-           f"Selección: {modo}" + (f" (umbral vivo {z_alto:+.2f} / {z_bajo:+.2f})"
-                                   if modo == "transversal" else ""))
+        msg = (f"💓 <b>Crowding heartbeat</b>\n"
+               f"Universo {len(simbolos)} · listos {listos}/{total}\n"
+               f"Calentando: media {media_h:.1f} h / {media_n:.0f} muestras\n"
+               f"Virtuales abiertas: {len(st.abiertas)}\n"
+               f"Cadencia: {cad:.1f} min")
+        tg(msg, "informe")
+        log.info("Heartbeat: listos %d/%d · media %.1f h · %d virtuales",
+                 listos, total, media_h, len(st.abiertas))
 
     st.guardar()
 
 
 def main():
-    log.info("Crowding bot v3.0 — SOLO SEÑALES, sin claves de API, %s | "
-             "selección=%s | workers=%s",
-             CFG["TIMEFRAME"], CFG["SELECCION"], CFG["MAX_WORKERS"])
+    log.info("Crowding bot v2.2 — SOLO SEÑALES, sin claves de API, %s | workers=%s",
+             CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
     st = Estado(CFG["STATE"])
     syms = contratos()
     vols = volumenes()
@@ -1133,15 +1015,13 @@ def main():
         syms.sort(key=lambda s: vols.get(s, 0), reverse=True)
     syms = syms[: int(CFG["MAX_SYMBOLS"])]
     log.info("Universo: %d símbolos", len(syms))
-    tg(f"🤖 <b>Crowding bot v3.0 arrancado</b>\n"
-       f"{len(syms)} símbolos · {CFG['TIMEFRAME']} · selección "
-       f"<b>{CFG['SELECCION']}</b>\n"
-       f"Ventana del z: {CFG['Z_WIN_HORAS']:.0f} h · retención "
-       f"{CFG['HIST_HORAS']:.0f} h\n"
-       f"Vela de disparo: {'CERRADA' if CFG['VELA_CERRADA'] else 'en curso'}\n"
+    tg(f"🤖 <b>Crowding bot v2.2 arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
+       f"Workers: {CFG['MAX_WORKERS']} · SCAN_SEC: {CFG['SCAN_SEC']}\n"
+       f"Avisos: señal {'ON' if CFG['TG_SIGNALS'] else 'off'} · "
+       f"cierre {'ON' if CFG['TG_CLOSES'] else 'off'} · informe diario a las "
+       f"{CFG['REPORT_HOUR']}:00 UTC\n"
        f"<i>Sin claves de API: solo lee endpoints públicos. No puede operar.</i>\n"
-       f"<i>Con cero señales, el log imprime AUTOPSIA con la distancia a cada "
-       f"umbral.</i>")
+       f"<i>Calentamiento: 30 h + 200 muestras por símbolo (~30-35 h de reloj).</i>")
 
     if CFG["CSV_AL_ARRANCAR"]:
         enviar_csv("pedido al arrancar")
@@ -1152,8 +1032,7 @@ def main():
             if time.time() - ultimo_universo > 6 * 3600:
                 v2 = volumenes()
                 if v2:
-                    s2 = [s for s in contratos()
-                          if v2.get(s, 0) >= float(CFG["MIN_VOL_24H"])]
+                    s2 = [s for s in contratos() if v2.get(s, 0) >= float(CFG["MIN_VOL_24H"])]
                     s2.sort(key=lambda s: v2.get(s, 0), reverse=True)
                     if s2:
                         syms = s2[: int(CFG["MAX_SYMBOLS"])]
