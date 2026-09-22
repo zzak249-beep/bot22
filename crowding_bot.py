@@ -87,7 +87,7 @@ _ultimo_ciclo = 0.0
 _ultimo_heartbeat = 0.0
 
 BASE = "https://open-api.bingx.com"
-UA = {"User-Agent": "crowding-signal-bot/2.2"}
+UA = {"User-Agent": "crowding-signal-bot/2.5"}
 
 # Session reutilizable + pool grande (evita "Connection pool is full")
 SESSION = requests.Session()
@@ -129,20 +129,30 @@ CFG = {
     "MIN_HORAS": env("MIN_HORAS", 30.0),      # antes de emitir
     "MIN_MUESTRAS": env("MIN_MUESTRAS", 200), # y además esta cuenta mínima
     "OI_LOOK_H": env("OI_LOOK_H", 6.0),       # ventana de variación de OI
-    # Datos ops 123: |z| 2.2–2.8 fue el único tramo con media positiva (+0.40R).
     "Z_BASIS": env("Z_BASIS", 2.2),
     "Z_OI": env("Z_OI", 1.2),
     "EXT_PCT": env("EXT_PCT", 85.0),
     "ATR_LEN": env("ATR_LEN", 14),
     "SL_ATR": env("SL_ATR", 1.5),
-    # TP 2R casi no se tocaba; 1.5R acerca el objetivo a lo que sí se alcanza.
     "TP_R": env("TP_R", 1.5),
     "MAX_BARS": env("MAX_BARS", 16),
-    # Panel IC (63h, 250 snaps): basis ALTO se asocia a retornos futuros ALTOS
-    # (continuación), no a reversión. fade pierde -0.31R/op. momentum = ir A FAVOR.
-    "MODE": env("MODE", "momentum"),  # momentum | fade
-    "CUERPO_MIN": env("CUERPO_MIN", 0.45),
-    "DISP_ATR_MIN": env("DISP_ATR_MIN", 0.50),
+    # v2.5 — panel IC: basis predice CONTINUACIÓN → default momentum
+    "MODE": env("MODE", "momentum"),
+    "CUERPO_MIN": env("CUERPO_MIN", 0.50),
+    "DISP_ATR_MIN": env("DISP_ATR_MIN", 0.60),
+    "USE_DECIL": env("USE_DECIL", True),
+    "DECIL_SHORT_MIN": env("DECIL_SHORT_MIN", 8),
+    "DECIL_LONG_MAX": env("DECIL_LONG_MAX", 1),
+    # Funding: momentum tolera sesgo sano; extrema (>0.05%/8h) huele a squeeze
+    "FUNDING_MAX_ABS": env("FUNDING_MAX_ABS", 0.05),
+    "REQUIRE_FUNDING_ALIGN": env("REQUIRE_FUNDING_ALIGN", True),
+    # Anticorprelación: máx señales por ciclo (mismo régimen de mercado)
+    "MAX_SENALES_CICLO": env("MAX_SENALES_CICLO", 3),
+    # Trail virtual tras 1R a favor
+    "TRAIL_AFTER_R": env("TRAIL_AFTER_R", 1.0),
+    "TRAIL_ATR": env("TRAIL_ATR", 1.0),
+    # Score mínimo (0–5): z + decil + cuerpo + funding + OI
+    "SCORE_MIN": env("SCORE_MIN", 3),
     # MIN_ATR_PCT=1.0 en 15m exige ~200% de volatilidad anualizada: lo pasaban
     # solo las microcaps de lotería, y en este universo NINGUNA. El filtro
     # además DUPLICA a MAX_COST_R con peor criterio: con COST_PCT=0.25 y
@@ -170,6 +180,8 @@ CFG = {
     "ENFRIA_BARRAS": env("ENFRIA_BARRAS", 12),
     "COST_PCT": env("COST_PCT", 0.25),
     "MAX_COST_R": env("MAX_COST_R", 0.15),
+    "MIN_VOL_24H": env("MIN_VOL_24H", 5_000_000.0),
+    "MAX_SYMBOLS": env("MAX_SYMBOLS", 150),
     "STATE": env("STATE", "/data/crowding_state.json"),
     "CSV": env("CSV", "/data/crowding_ops.csv"),
     "TG_TOKEN": env("TG_TOKEN", ""),
@@ -671,14 +683,17 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
         return None, f"coste {coste_r:.2f}R"
 
     ult, ant = velas[-1], velas[-2]
-    modo = str(CFG["MODE"]).strip().lower()
+    modo = str(CFG.get("MODE", "momentum")).strip().lower()
+    fund = float(p.get("funding") or 0.0)
 
     nb = int(CFG["ENFRIA_BARRAS"])
     if nb > 0 and (ult["t"] - ULTIMA_SENAL.get(symbol, -10**15)) < nb * BAR_SEC * 1000:
         return None, "enfriamiento"
 
-    # En FADE: no entrar si sigue haciendo extremos (empujón, no agotamiento).
-    # En MOMENTUM: no aplicar ese veto (queremos fuerza).
+    # Funding extremo: setup de squeeze, no de continuación limpia
+    if abs(fund) > float(CFG.get("FUNDING_MAX_ABS", 0.05)):
+        return None, f"funding extremo ({fund:+.4f}%)"
+
     if modo == "fade":
         ne = int(CFG["NO_NUEVO_EXTREMO"])
         if ne > 0 and len(velas) > ne + 1:
@@ -691,47 +706,62 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
 
     rng = ult["h"] - ult["l"]
     body = abs(ult["c"] - ult["o"])
-    if rng <= 0 or (body / rng) < float(CFG["CUERPO_MIN"]):
+    cuerpo_min = float(CFG.get("CUERPO_MIN", 0.5))
+    if rng <= 0 or (body / rng) < cuerpo_min:
         return None, "cuerpo débil"
-    disp_min = float(CFG["DISP_ATR_MIN"]) * a if a > 0 else 0.0
+    disp_min = float(CFG.get("DISP_ATR_MIN", 0.6)) * a if a > 0 else 0.0
 
     lado = None
     if modo == "momentum":
-        # A FAVOR del amontonamiento (panel IC: basis alto -> retornos relativos altos)
+        # A FAVOR del crowding (IC del panel: basis alto → retornos relativos altos)
         if largos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
-            if (ult["c"] - ult["o"]) >= disp_min:
-                lado = "LONG"
-            else:
+            if (ult["c"] - ult["o"]) < disp_min:
                 return None, "desplazamiento débil"
+            if bool(CFG.get("REQUIRE_FUNDING_ALIGN", True)) and fund < -0.01:
+                return None, "funding no alineado (LONG)"
+            lado = "LONG"
         elif cortos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
-            if (ult["o"] - ult["c"]) >= disp_min:
-                lado = "SHORT"
-            else:
+            if (ult["o"] - ult["c"]) < disp_min:
                 return None, "desplazamiento débil"
+            if bool(CFG.get("REQUIRE_FUNDING_ALIGN", True)) and fund > 0.01:
+                return None, "funding no alineado (SHORT)"
+            lado = "SHORT"
         if lado is None:
             return None, "esperando vela a favor"
     else:
-        # FADE clásico (datos: -0.31 R/op en muestra; dejar por si el régimen cambia)
         if largos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
-            if (ult["o"] - ult["c"]) >= disp_min:
-                lado = "SHORT"
-            else:
+            if (ult["o"] - ult["c"]) < disp_min:
                 return None, "desplazamiento débil"
+            lado = "SHORT"
         elif cortos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
-            if (ult["c"] - ult["o"]) >= disp_min:
-                lado = "LONG"
-            else:
+            if (ult["c"] - ult["o"]) < disp_min:
                 return None, "desplazamiento débil"
+            lado = "LONG"
         if lado is None:
             return None, "esperando vela en contra"
+
+    # Score de calidad 0–5 (solo dispara si >= SCORE_MIN)
+    score = 0
+    if abs(zb) >= float(CFG["Z_BASIS"]) + 0.3:
+        score += 1
+    if abs(zb) >= 2.5:
+        score += 1
+    if zo >= float(CFG["Z_OI"]) + 0.5:
+        score += 1
+    if (body / rng) >= 0.60:
+        score += 1
+    if abs(fund) <= 0.02:
+        score += 1
+    if score < int(CFG.get("SCORE_MIN", 3)):
+        return None, f"score {score}<{int(CFG.get('SCORE_MIN', 3))}"
 
     ULTIMA_SENAL[symbol] = ult["t"]
     reg = cf.calcular(_CFG_OBJ, cierres_reg)
     return (lado, {"px": px, "riesgo": riesgo, "coste_r": coste_r, "zb": zb,
-                   "zo": zo, "funding": p["funding"], "atr_pct": atr_pct,
+                   "zo": zo, "funding": fund, "atr_pct": atr_pct,
                    "conf_z": reg.z if reg.ok else 0.0,
                    "conf_regimen": reg.etiqueta if reg.ok else reg.motivo,
-                   "mode": modo}), "señal"
+                   "mode": modo, "score": score}), "señal"
 
 
 def seguir_virtuales(st: Estado, symbol: str, velas):
@@ -745,11 +775,24 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
     v.barras = len(nuevas)
     largo = v.lado == "LONG"
     salida = motivo = None
+    trail_after = float(CFG.get("TRAIL_AFTER_R", 1.0))
+    trail_atr_m = float(CFG.get("TRAIL_ATR", 1.0))
     for k in nuevas:
         favor = (k["h"] - v.entrada) if largo else (v.entrada - k["l"])
         contra = (v.entrada - k["l"]) if largo else (k["h"] - v.entrada)
         v.mfe = max(v.mfe, favor / v.riesgo)
         v.mae = max(v.mae, contra / v.riesgo)
+        # Trail: tras +1R mueve SL a favor (breakeven+)
+        if trail_after > 0 and v.mfe >= trail_after and v.riesgo > 0:
+            atr_aprox = v.riesgo / float(CFG["SL_ATR"]) if float(CFG["SL_ATR"]) > 0 else v.riesgo
+            if largo:
+                nuevo_sl = k["c"] - atr_aprox * trail_atr_m
+                if nuevo_sl > v.sl:
+                    v.sl = nuevo_sl
+            else:
+                nuevo_sl = k["c"] + atr_aprox * trail_atr_m
+                if nuevo_sl < v.sl:
+                    v.sl = nuevo_sl
         toca_sl = (k["l"] <= v.sl) if largo else (k["h"] >= v.sl)
         toca_tp = (k["h"] >= v.tp) if largo else (k["l"] <= v.tp)
         if toca_sl:
@@ -909,6 +952,10 @@ def ciclo(st: Estado, simbolos: list[str]):
             if sym in st.abiertas:
                 continue
 
+            if señales >= int(CFG.get("MAX_SENALES_CICLO", 3)):
+                razones["tope ciclo"] = razones.get("tope ciclo", 0) + 1
+                continue
+
             sig, motivo = evaluar(sym, velas, p, oi, st, acc)
             clave = motivo.split("(")[0].strip()
             razones[clave] = razones.get(clave, 0) + 1
@@ -927,11 +974,11 @@ def ciclo(st: Estado, simbolos: list[str]):
                 conf_z=d["conf_z"], conf_regimen=d["conf_regimen"])
             señales += 1
             flecha = "🟢" if lado == "LONG" else "🔴"
-            tg(f"{flecha} <b>{sym.split('-')[0]}</b> {lado} (virtual)\n"
+            tg(f"{flecha} <b>{sym.split('-')[0]}</b> {lado} · {d.get('mode','?')} · score {d.get('score',0)}\n"
                f"Entrada <code>{entrada:.8g}</code> · SL <code>{sl:.8g}</code> · TP <code>{tp:.8g}</code>\n"
                f"basis z {d['zb']:+.2f} · OI z {d['zo']:+.2f} · funding {d['funding']:+.4f}%\n"
                f"ATR {d['atr_pct']:.2f}% · coste {d['coste_r']:.2f} R\n"
-               f"<i>Solo señal. El bot no opera.</i>", "senal")
+               f"<i>Solo señal virtual · v2.5</i>", "senal")
         except Exception:
             log.exception("Fallo evaluando %s", sym)
 
@@ -1005,8 +1052,8 @@ def ciclo(st: Estado, simbolos: list[str]):
 
 
 def main():
-    log.info("Crowding bot v2.2 — SOLO SEÑALES, sin claves de API, %s | workers=%s",
-             CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
+    log.info("Crowding bot v2.5 — SOLO SEÑALES · MODE=%s · score≥%s | %s workers=%s",
+             CFG.get("MODE"), CFG.get("SCORE_MIN"), CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
     st = Estado(CFG["STATE"])
     syms = contratos()
     vols = volumenes()
