@@ -62,7 +62,9 @@ import json
 import logging
 import math
 import os
+import signal
 import statistics
+import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -77,8 +79,11 @@ from urllib3.util.retry import Retry
 import confirm as cf
 import panel as pn
 
+VERSION = "2.6"   # ÚNICA fuente de versión: log, Telegram y User-Agent
+
 logging.basicConfig(
     level=logging.INFO,
+    stream=sys.stdout,          # stderr hace que Railway pinte todo en rojo como si fueran errores
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 log = logging.getLogger("crowding")
@@ -87,7 +92,7 @@ _ultimo_ciclo = 0.0
 _ultimo_heartbeat = 0.0
 
 BASE = "https://open-api.bingx.com"
-UA = {"User-Agent": "crowding-signal-bot/2.5"}
+UA = {"User-Agent": f"crowding-signal-bot/{VERSION}"}
 
 # Session reutilizable + pool grande (evita "Connection pool is full")
 SESSION = requests.Session()
@@ -121,8 +126,6 @@ def env(k, d):
 CFG = {
     "TIMEFRAME": env("TIMEFRAME", "15m"),
     "SCAN_SEC": env("SCAN_SEC", 120),          # bajado: el trabajo es mucho más rápido
-    "MIN_VOL_24H": env("MIN_VOL_24H", 2_000_000.0),
-    "MAX_SYMBOLS": env("MAX_SYMBOLS", 300),
     # EN HORAS, NO EN MUESTRAS. El bot toma una muestra por ciclo, y la
     # duración del ciclo depende de cuántos símbolos escanee.
     "HIST_HORAS": env("HIST_HORAS", 168.0),   # retención (7 días)
@@ -599,6 +602,27 @@ ATR_AMONT: list[float] = []
 ULTIMA_SENAL: dict[str, int] = {}
 
 
+def muestrear(symbol: str, p: dict | None, oi: float | None, st: Estado):
+    """Apunta basis y OI en la historia. Se llama SIEMPRE (también con virtual abierta
+    o con el tope de señales alcanzado): si no, la historia del z-score tiene huecos."""
+    if p is None or oi is None or oi <= 0:
+        return
+    ahora = time.time()
+    hb = st.basis.setdefault(symbol, deque())
+    ho = st.oi.setdefault(symbol, deque())
+    _apuntar(hb, ahora, p["basis"], float(CFG["MUESTRA_MIN_SEG"]), int(CFG["MAX_PUNTOS"]))
+    _apuntar(ho, ahora, oi, float(CFG["MUESTRA_MIN_SEG"]), int(CFG["MAX_PUNTOS"]))
+    horas_ret = float(CFG["HIST_HORAS"])
+    _podar(hb, ahora, horas_ret)
+    _podar(ho, ahora, horas_ret)
+
+
+def velas_cerradas(velas: list) -> list:
+    if velas and velas[-1]["t"] + BAR_SEC * 1000 > time.time() * 1000:
+        return velas[:-1]
+    return velas
+
+
 def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
             acc: list | None = None):
     """
@@ -620,13 +644,9 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
         return None, "sin open interest"
 
     ahora = time.time()
-    hb = st.basis.setdefault(symbol, deque())
-    ho = st.oi.setdefault(symbol, deque())
-    _apuntar(hb, ahora, p["basis"], float(CFG["MUESTRA_MIN_SEG"]), int(CFG["MAX_PUNTOS"]))
-    _apuntar(ho, ahora, oi, float(CFG["MUESTRA_MIN_SEG"]), int(CFG["MAX_PUNTOS"]))
-    horas_ret = float(CFG["HIST_HORAS"])
-    _podar(hb, ahora, horas_ret)
-    _podar(ho, ahora, horas_ret)
+    muestrear(symbol, p, oi, st)
+    hb = st.basis[symbol]
+    ho = st.oi[symbol]
 
     span = _span_horas(hb)
     min_h = float(CFG["MIN_HORAS"])
@@ -761,7 +781,7 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
                    "zo": zo, "funding": fund, "atr_pct": atr_pct,
                    "conf_z": reg.z if reg.ok else 0.0,
                    "conf_regimen": reg.etiqueta if reg.ok else reg.motivo,
-                   "mode": modo, "score": score}), "señal"
+                   "mode": modo, "score": score, "t_senal": ult["t"]}), "señal"
 
 
 def seguir_virtuales(st: Estado, symbol: str, velas):
@@ -769,7 +789,10 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
     v = st.abiertas.get(symbol)
     if v is None:
         return
-    nuevas = [k for k in velas if k["t"] > v.abierta_ts]
+    # Solo velas CERRADAS posteriores a la vela de la señal. Antes entraba la vela en
+    # curso: el trail se calculaba con un cierre provisional y la salida por tiempo
+    # usaba un precio que aún no existía.
+    nuevas = [k for k in velas_cerradas(velas) if k["t"] > v.abierta_ts]
     if not nuevas:
         return
     v.barras = len(nuevas)
@@ -782,6 +805,17 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
         contra = (v.entrada - k["l"]) if largo else (k["h"] - v.entrada)
         v.mfe = max(v.mfe, favor / v.riesgo)
         v.mae = max(v.mae, contra / v.riesgo)
+        # 1º la salida con el stop VIGENTE; el trail calculado con esta vela solo
+        # vale desde la siguiente (antes se movía con el cierre y se comprobaba con
+        # el mínimo de la MISMA vela: salidas que en real no habrían pasado).
+        toca_sl = (k["l"] <= v.sl) if largo else (k["h"] >= v.sl)
+        toca_tp = (k["h"] >= v.tp) if largo else (k["l"] <= v.tp)
+        if toca_sl:
+            salida, motivo = v.sl, "stop"
+            break
+        if toca_tp:
+            salida, motivo = v.tp, "objetivo"
+            break
         # Trail: tras +1R mueve SL a favor (breakeven+)
         if trail_after > 0 and v.mfe >= trail_after and v.riesgo > 0:
             atr_aprox = v.riesgo / float(CFG["SL_ATR"]) if float(CFG["SL_ATR"]) > 0 else v.riesgo
@@ -793,14 +827,6 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
                 nuevo_sl = k["c"] + atr_aprox * trail_atr_m
                 if nuevo_sl < v.sl:
                     v.sl = nuevo_sl
-        toca_sl = (k["l"] <= v.sl) if largo else (k["h"] >= v.sl)
-        toca_tp = (k["h"] >= v.tp) if largo else (k["l"] <= v.tp)
-        if toca_sl:
-            salida, motivo = v.sl, "stop"
-            break
-        if toca_tp:
-            salida, motivo = v.tp, "objetivo"
-            break
     if salida is None and v.barras >= int(CFG["MAX_BARS"]):
         salida, motivo = nuevas[-1]["c"], "tiempo"
     if salida is None:
@@ -950,13 +976,13 @@ def ciclo(st: Estado, simbolos: list[str]):
 
             seguir_virtuales(st, sym, velas)
             if sym in st.abiertas:
-                continue
-
-            if señales >= int(CFG.get("MAX_SENALES_CICLO", 3)):
-                razones["tope ciclo"] = razones.get("tope ciclo", 0) + 1
+                muestrear(sym, p, oi, st)       # la historia no se corta mientras hay virtual
                 continue
 
             sig, motivo = evaluar(sym, velas, p, oi, st, acc)
+            if sig is not None and señales >= int(CFG.get("MAX_SENALES_CICLO", 3)):
+                ULTIMA_SENAL.pop(sym, None)     # no abierta: que no cuente para el enfriamiento
+                sig, motivo = None, "tope ciclo"
             clave = motivo.split("(")[0].strip()
             razones[clave] = razones.get(clave, 0) + 1
             motivos += 1
@@ -968,7 +994,7 @@ def ciclo(st: Estado, simbolos: list[str]):
             sl = entrada - d["riesgo"] if lado == "LONG" else entrada + d["riesgo"]
             tp = entrada + float(CFG["TP_R"]) * d["riesgo"] if lado == "LONG" else entrada - float(CFG["TP_R"]) * d["riesgo"]
             st.abiertas[sym] = Virtual(
-                symbol=sym, lado=lado, abierta_ts=velas[-1]["t"], entrada=entrada,
+                symbol=sym, lado=lado, abierta_ts=d["t_senal"], entrada=entrada,
                 sl=sl, tp=tp, riesgo=d["riesgo"], coste_r=d["coste_r"],
                 basis_z=d["zb"], oi_z=d["zo"], funding=d["funding"], atr_pct=d["atr_pct"],
                 conf_z=d["conf_z"], conf_regimen=d["conf_regimen"])
@@ -978,7 +1004,7 @@ def ciclo(st: Estado, simbolos: list[str]):
                f"Entrada <code>{entrada:.8g}</code> · SL <code>{sl:.8g}</code> · TP <code>{tp:.8g}</code>\n"
                f"basis z {d['zb']:+.2f} · OI z {d['zo']:+.2f} · funding {d['funding']:+.4f}%\n"
                f"ATR {d['atr_pct']:.2f}% · coste {d['coste_r']:.2f} R\n"
-               f"<i>Solo señal virtual · v2.5</i>", "senal")
+               f"<i>Solo señal virtual · v{VERSION}</i>", "senal")
         except Exception:
             log.exception("Fallo evaluando %s", sym)
 
@@ -1052,9 +1078,22 @@ def ciclo(st: Estado, simbolos: list[str]):
 
 
 def main():
-    log.info("Crowding bot v2.5 — SOLO SEÑALES · MODE=%s · score≥%s | %s workers=%s",
-             CFG.get("MODE"), CFG.get("SCORE_MIN"), CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
+    log.info("Crowding bot v%s — SOLO SEÑALES · MODE=%s · score≥%s | %s workers=%s",
+             VERSION, CFG.get("MODE"), CFG.get("SCORE_MIN"), CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
     st = Estado(CFG["STATE"])
+
+    # Railway manda SIGTERM al redesplegar: se guarda el estado antes de salir.
+    def _salir(signum, _frame):
+        log.info("Señal %s recibida: guardando estado y saliendo", signum)
+        st.guardar()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _salir)
+
+    dir_estado = os.path.dirname(CFG["STATE"]) or "."
+    sin_volumen = not os.path.ismount(dir_estado)
+    if sin_volumen:
+        log.warning("%s NO es un volumen montado: el estado y los CSV se BORRAN en cada "
+                    "redeploy y el calentamiento de 30 h vuelve a cero", dir_estado)
     syms = contratos()
     vols = volumenes()
     if vols:
@@ -1062,7 +1101,12 @@ def main():
         syms.sort(key=lambda s: vols.get(s, 0), reverse=True)
     syms = syms[: int(CFG["MAX_SYMBOLS"])]
     log.info("Universo: %d símbolos", len(syms))
-    tg(f"🤖 <b>Crowding bot v2.2 arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
+    estado_txt = (f"Estado cargado: {len(st.basis)} símbolos con historia"
+                  if st.basis else "Estado vacío: empieza el calentamiento")
+    aviso_vol = (f"⚠️ <b>{dir_estado} no es un volumen</b>: cada redeploy borra datos y calentamiento\n"
+                 if sin_volumen else "")
+    tg(f"🤖 <b>Crowding bot v{VERSION} arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
+       f"{estado_txt}\n{aviso_vol}"
        f"Workers: {CFG['MAX_WORKERS']} · SCAN_SEC: {CFG['SCAN_SEC']}\n"
        f"Avisos: señal {'ON' if CFG['TG_SIGNALS'] else 'off'} · "
        f"cierre {'ON' if CFG['TG_CLOSES'] else 'off'} · informe diario a las "
