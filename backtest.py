@@ -1,156 +1,144 @@
-"""
-Quick backtest of the EMA strategy on historical BingX data.
-Run: python backtest.py
-"""
+"""Backtest EP5 con datos reales de BingX (misma lógica que el bot, incluido el filtro BTC).
 
+Uso:
+  python backtest.py --days 60 --top 30
+  python backtest.py --days 60 --symbols BTC-USDT,ETH-USDT,SOL-USDT
+  python backtest.py --csv mis_velas.csv      (time,open,high,low,close,volume[,symbol])
+Parámetros de estrategia: mismas variables de entorno que el bot (SL_ATR=1.6 python backtest.py ...).
+Las velas se guardan en ./bt_cache para no descargarlas otra vez (walkforward.py las reutiliza).
+Salida: resumen en consola + bt_trades.csv
+"""
+from __future__ import annotations
+
+import argparse
 import os
 import time
-import pandas as pd
+
 import numpy as np
-from dotenv import load_dotenv
-from bingx_client import BingXClient
-from strategy import EMAStrategy
+import pandas as pd
 
-load_dotenv()
+from bingx import BingX
+from config import norm_symbol
+from strategy import Params, apply_regime, backtest_symbol, compute, regime_series
 
-SYMBOL   = os.getenv("SYMBOL",   "BTC-USDT")
-INTERVAL = os.getenv("INTERVAL", "3m")
-EMA1_LEN = int(os.getenv("EMA1_LEN", "2"))
-EMA2_LEN = int(os.getenv("EMA2_LEN", "4"))
-EMA3_LEN = int(os.getenv("EMA3_LEN", "20"))
-SL_PCT   = float(os.getenv("SL_PCT",  "1.5")) / 100
-TP_RATIO = float(os.getenv("TP_RATIO","2.0"))
-LEVERAGE = int(os.getenv("LEVERAGE", "5"))
+BAR_MS = 300_000
+BTC = "BTC-USDT"
 
 
-def fetch_history(symbol: str, interval: str, pages: int = 10) -> pd.DataFrame:
-    """Fetch up to pages × 500 candles from BingX"""
-    client = BingXClient(
-        os.environ["BINGX_API_KEY"],
-        os.environ["BINGX_API_SECRET"],
-        demo=True,
-    )
-    all_candles = []
-    end_time = None
-    for _ in range(pages):
-        params = {"symbol": symbol, "interval": interval, "limit": 500}
-        if end_time:
-            params["endTime"] = end_time
-        try:
-            raw = client._get("/openApi/swap/v3/quote/klines", params)
-            candles = raw.get("data", [])
-            if not candles:
-                break
-            all_candles = candles + all_candles
-            end_time = int(candles[0][0]) - 1
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"Fetch error: {e}")
-            break
-
-    if not all_candles:
-        raise ValueError("No candles fetched")
-
-    df = pd.DataFrame(all_candles, columns=["timestamp","open","high","low","close","volume"])
-    df = df.astype({"timestamp":"int64","open":"float64","high":"float64",
-                    "low":"float64","close":"float64","volume":"float64"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+def fetch_history(bx: BingX, sym: str, days: int) -> pd.DataFrame:
+    end = int(time.time() * 1000) // BAR_MS * BAR_MS
+    start = end - days * 86_400_000
+    parts, cur = [], start
+    while cur < end:
+        df = bx.klines(sym, "5m", 1000, start_ms=cur, end_ms=min(end, cur + 1000 * BAR_MS) - 1)
+        if df.empty:
+            cur += 1000 * BAR_MS
+            continue
+        parts.append(df)
+        cur = int(df.time.iloc[-1]) + BAR_MS
+        time.sleep(0.15)
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts).drop_duplicates("time").sort_values("time")
+    return out[out.time + BAR_MS <= end].reset_index(drop=True)
 
 
-def run_backtest(df: pd.DataFrame) -> dict:
-    strat = EMAStrategy(EMA1_LEN, EMA2_LEN, EMA3_LEN)
-    df = strat.compute(df.copy())
+def pick_symbols(bx: BingX, top: int, min_vol: float) -> list[str]:
+    tk = [t for t in bx.tickers() if t.get("symbol", "").endswith("-USDT")
+          and not t["symbol"][:-5].endswith("USD") and float(t.get("quoteVolume") or 0) >= min_vol]
+    return [t["symbol"] for t in sorted(tk, key=lambda x: -float(x["quoteVolume"]))[:top]]
 
-    balance      = 1000.0
-    equity_curve = [balance]
-    trades       = []
-    position     = None   # {"side", "entry", "sl", "tp", "qty"}
 
-    for i in range(len(df) - 1):
-        row  = df.iloc[i]
-        next = df.iloc[i + 1]
-        price = float(row["close"])
+def load_data(syms: list[str], days: int, cache: str = "bt_cache", verbose: bool = True) -> dict:
+    """Velas por símbolo (con caché en disco). Incluye siempre BTC-USDT para el régimen."""
+    os.makedirs(cache, exist_ok=True)
+    bx = BingX()
+    out = {}
+    all_syms = list(dict.fromkeys(syms + [BTC]))
+    for i, s in enumerate(all_syms, 1):
+        path = os.path.join(cache, f"{s}_{days}d.csv")
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 12 * 3600:
+            df = pd.read_csv(path)
+        else:
+            df = fetch_history(bx, s, days)
+            if not df.empty:
+                df.to_csv(path, index=False)
+        if verbose:
+            print(f"[{i}/{len(all_syms)}] {s}: {len(df)} velas")
+        if len(df) >= 500:
+            out[s] = df
+    return out
 
-        # Check SL/TP on open position
-        if position:
-            hi = float(next["high"])
-            lo = float(next["low"])
-            hit_sl = hit_tp = False
 
-            if position["side"] == "LONG":
-                if lo <= position["sl"]:  hit_sl = True
-                if hi >= position["tp"]:  hit_tp = True
-            else:
-                if hi >= position["sl"]:  hit_sl = True
-                if lo <= position["tp"]:  hit_tp = True
+def run(p: Params, data: dict, feats: dict | None = None) -> pd.DataFrame:
+    """Opera todos los símbolos cargados (BTC incluido). feats: caché opcional de compute()."""
+    reg = regime_series(data[BTC], p) if p.btc_filter and BTC in data else None
+    trades = []
+    for s, df in data.items():
+        f = feats[s] if feats is not None and s in feats else compute(df, p)
+        f = apply_regime(f, reg, p)
+        trades += backtest_symbol(f, p, s)
+    return pd.DataFrame(trades)
 
-            if hit_tp or hit_sl:
-                exit_price = position["tp"] if hit_tp else position["sl"]
-                if position["side"] == "LONG":
-                    pnl = (exit_price - position["entry"]) / position["entry"]
-                else:
-                    pnl = (position["entry"] - exit_price) / position["entry"]
 
-                pnl_usdt = balance * 0.01 * LEVERAGE * (pnl / SL_PCT)
-                balance += pnl_usdt
-                equity_curve.append(balance)
-                trades.append({
-                    "ts":     str(row["timestamp"]),
-                    "side":   position["side"],
-                    "entry":  position["entry"],
-                    "exit":   exit_price,
-                    "result": "TP" if hit_tp else "SL",
-                    "pnl":    pnl_usdt,
-                })
-                position = None
+def stats(t: pd.DataFrame) -> dict:
+    if t.empty:
+        return {"n": 0, "avg": np.nan, "wr": np.nan, "pf": np.nan, "tot": 0.0, "dd": 0.0}
+    g = t.sort_values("cerrada_ms").r_neto
+    loss = -g[g < 0].sum()
+    eq = g.cumsum()
+    return {"n": len(g), "avg": g.mean(), "wr": (g > 0).mean(), "pf": g[g > 0].sum() / loss if loss else np.inf,
+            "tot": g.sum(), "dd": (eq - eq.cummax()).min()}
 
-        # New signal
-        if not position:
-            if row["signal_long"]:
-                sl = price * (1 - SL_PCT)
-                tp = price * (1 + SL_PCT * TP_RATIO)
-                position = {"side": "LONG", "entry": price, "sl": sl, "tp": tp}
-            elif row["signal_short"]:
-                sl = price * (1 + SL_PCT)
-                tp = price * (1 - SL_PCT * TP_RATIO)
-                position = {"side": "SHORT", "entry": price, "sl": sl, "tp": tp}
 
-    # Results
-    trades_df = pd.DataFrame(trades)
-    if trades_df.empty:
-        print("No trades generated.")
-        return {}
+def summary(t: pd.DataFrame) -> str:
+    if t.empty:
+        return "sin operaciones"
+    s = stats(t)
+    days = (t.cerrada_ms.max() - t.abierta_ms.min()) / 86_400_000
+    lines = [
+        f"operaciones {s['n']} ({s['n'] / max(days, 1):.1f}/día) · WR {s['wr'] * 100:.1f}% · PF {s['pf']:.2f}",
+        f"R neto total {s['tot']:+.1f} · medio {s['avg']:+.3f} · bruto medio {t.r_bruto.mean():+.3f} · "
+        f"coste medio {t.coste_r.mean():.3f} · maxDD {s['dd']:.1f}R",
+    ]
+    for col in ["lado", "motivo"]:
+        lines.append(t.groupby(col).r_neto.agg(["count", "mean", "sum"]).round(3).to_string())
+    t = t.assign(semana=pd.to_datetime(t.abierta_ms, unit="ms").dt.to_period("W"))
+    lines.append(t.groupby("semana").r_neto.agg(["count", "sum"]).round(2).to_string())
+    top = t.groupby("symbol").r_neto.sum()
+    lines.append(f"mejor símbolo {top.idxmax()} {top.max():+.1f}R · peor {top.idxmin()} {top.min():+.1f}R · "
+                 f"sin el mejor: {s['tot'] - top.max():+.1f}R")
+    return "\n".join(lines)
 
-    wins  = trades_df[trades_df["pnl"] > 0]
-    loss  = trades_df[trades_df["pnl"] <= 0]
-    eq    = pd.Series(equity_curve)
-    peak  = eq.cummax()
-    dd    = ((peak - eq) / peak).max()
 
-    results = {
-        "total_trades":  len(trades_df),
-        "win_rate":      f"{len(wins)/len(trades_df)*100:.1f}%",
-        "total_pnl":     f"${trades_df['pnl'].sum():.2f}",
-        "avg_win":       f"${wins['pnl'].mean():.2f}" if len(wins) else "N/A",
-        "avg_loss":      f"${loss['pnl'].mean():.2f}" if len(loss) else "N/A",
-        "max_drawdown":  f"{dd*100:.1f}%",
-        "final_balance": f"${balance:.2f}",
-        "return":        f"{(balance-1000)/10:.1f}%",
-    }
-
-    print("\n" + "="*45)
-    print(f"  BACKTEST RESULTS — {SYMBOL} {INTERVAL}")
-    print("="*45)
-    for k, v in results.items():
-        print(f"  {k:<18}: {v}")
-    print("="*45)
-
-    return results
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=60)
+    ap.add_argument("--top", type=int, default=30)
+    ap.add_argument("--symbols", default="")
+    ap.add_argument("--min-vol", type=float, default=20_000_000)
+    ap.add_argument("--csv", default="")
+    ap.add_argument("--cache", default="bt_cache")
+    ap.add_argument("--out", default="bt_trades.csv")
+    a = ap.parse_args()
+    p = Params.from_env()
+    if a.csv:
+        raw = pd.read_csv(a.csv)
+        data = {s: g.sort_values("time") for s, g in raw.groupby("symbol")} if "symbol" in raw else {"CSV": raw}
+        if BTC not in data and p.btc_filter:
+            print("aviso: el CSV no trae BTC-USDT → filtro BTC desactivado")
+            p.btc_filter = False
+    else:
+        syms = [norm_symbol(s) for s in a.symbols.split(",") if s.strip()] or \
+            pick_symbols(BingX(), a.top, a.min_vol)
+        data = load_data(syms, a.days, a.cache)
+    t = run(p, data)
+    if not t.empty:
+        t.to_csv(a.out, index=False)
+    print("\n" + summary(t))
+    print(f"\nParams: {p}")
 
 
 if __name__ == "__main__":
-    print(f"Fetching {SYMBOL} {INTERVAL} history from BingX...")
-    df = fetch_history(SYMBOL, INTERVAL, pages=5)
-    print(f"Loaded {len(df)} candles from {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}")
-    run_backtest(df)
+    np.seterr(all="ignore")
+    main()

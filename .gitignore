@@ -1,7 +1,4 @@
 __pycache__/
-*.py[cod]
-.env
+data/
 *.csv
-*.json
-!railway.toml
-.venv/
+.env

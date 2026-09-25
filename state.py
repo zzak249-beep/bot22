@@ -1,171 +1,84 @@
-"""
-Persistent bot state — survives Railway restarts.
-Stores: entry_time, tp1_hit, trail_stop, day_pnl/day_trades per symbol/side.
+"""Estado persistente (JSON atómico) y diario de operaciones (CSV)."""
+from __future__ import annotations
 
-Construido con las lecciones ya aprendidas en el resto del fleet, no
-desde cero de verdad: get_tracked_positions() y el day-state estaban
-desde el día 1, no como parche posterior.
-"""
+import csv
 import json
-import logging
 import os
-import time
+from datetime import datetime, timezone
 
-log = logging.getLogger("state")
+from strategy import Pos
 
-_STATE_FILE = os.getenv("STATE_FILE", "/data/bot_state.json")
-
-
-# ── Internal I/O ──────────────────────────────────────────────
-
-def _load() -> dict:
-    try:
-        with open(_STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+JOURNAL_COLS = ["cerrada_utc", "symbol", "lado", "abierta_utc", "entrada", "salida", "motivo",
+                "r_bruto", "coste_r", "r_neto", "barras", "score", "dist_htf", "er_pct", "rvol",
+                "atr_pct", "mfe", "mae", "pnl_usdt", "modo", "slip_bps", "btc_reg",
+                "pnl_real_usdt", "r_real"]
 
 
-def _save(data: dict):
-    try:
-        os.makedirs(os.path.dirname(_STATE_FILE) or ".", exist_ok=True)
-        with open(_STATE_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        log.error(f"state write error: {e}")
+def iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
 
-def _key(symbol: str, side: str, field: str) -> str:
-    return f"{symbol}_{side}_{field}"
+class State:
+    def __init__(self, path: str):
+        self.path = path
+        self.positions: dict[str, Pos] = {}
+        self.day = ""
+        self.day_r = 0.0
+        self.day_trades = 0
+        self.day_wins = 0
+        self.day_closed = 0
+        self.paper_equity: float | None = None
+        self.last_exit: dict[str, int] = {}
+        self.blocked_notified = False
+        self.leverage_set: list[str] = []
+        self.paused = False
+        self.pause_reason = ""
+        self.cum_r = 0.0
+        self.peak_r = 0.0
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return
+        with open(self.path) as f:
+            d = json.load(f)
+        self.positions = {k: Pos.from_dict(v) for k, v in d.get("positions", {}).items()}
+        self.day = d.get("day", "")
+        self.day_r = float(d.get("day_r", 0))
+        self.day_trades = int(d.get("day_trades", 0))
+        self.day_wins = int(d.get("day_wins", 0))
+        self.day_closed = int(d.get("day_closed", 0))
+        self.paper_equity = d.get("paper_equity")
+        self.last_exit = {k: int(v) for k, v in d.get("last_exit", {}).items()}
+        self.blocked_notified = bool(d.get("blocked_notified", False))
+        self.leverage_set = list(d.get("leverage_set", []))
+        self.paused = bool(d.get("paused", False))
+        self.pause_reason = d.get("pause_reason", "")
+        self.cum_r = float(d.get("cum_r", 0))
+        self.peak_r = float(d.get("peak_r", 0))
+
+    def save(self):
+        d = {
+            "positions": {k: v.to_dict() for k, v in self.positions.items()},
+            "day": self.day, "day_r": self.day_r, "day_trades": self.day_trades, "day_wins": self.day_wins,
+            "day_closed": self.day_closed, "paper_equity": self.paper_equity, "last_exit": self.last_exit,
+            "blocked_notified": self.blocked_notified, "leverage_set": self.leverage_set,
+            "paused": self.paused, "pause_reason": self.pause_reason,
+            "cum_r": self.cum_r, "peak_r": self.peak_r,
+        }
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, self.path)
 
 
-# ── Entry time ────────────────────────────────────────────────
+class Journal:
+    def __init__(self, path: str):
+        self.path = path
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(JOURNAL_COLS)
 
-def save_entry(symbol: str, side: str, ts: float = None):
-    d = _load()
-    d[_key(symbol, side, "entry_ts")] = ts or time.time()
-    _save(d)
-    log.debug(f"state.save_entry {symbol} {side}")
-
-
-def get_entry_ts(symbol: str, side: str) -> float | None:
-    v = _load().get(_key(symbol, side, "entry_ts"))
-    return float(v) if v is not None else None
-
-
-def is_max_hold_expired(symbol: str, side: str, max_minutes: int) -> bool:
-    ts = get_entry_ts(symbol, side)
-    if ts is None:
-        return False
-    elapsed = (time.time() - ts) / 60.0
-    if elapsed >= max_minutes:
-        log.info(f"MAX_HOLD expired {symbol} {side} | elapsed={elapsed:.0f}m limit={max_minutes}m")
-        return True
-    return False
-
-
-# ── Tracked positions (this bot's own) ──────────────────────────
-
-def get_tracked_positions() -> list:
-    """
-    Returns [(symbol, side), ...] para cada posición con entry_ts propio.
-    Usado en vez de client.get_positions() (toda la cuenta) — aunque este
-    bot esté pensado para cuenta propia, escopar a lo propio no cuesta
-    nada y evita reintroducir el bug que ya vimos en 4 bots distintos.
-    """
-    d = _load()
-    out = []
-    for k in d:
-        if k.endswith("_entry_ts"):
-            base = k[: -len("_entry_ts")]
-            if "_" not in base:
-                continue
-            symbol, side = base.rsplit("_", 1)
-            out.append((symbol, side))
-    return out
-
-
-# ── Trail stop ────────────────────────────────────────────────
-
-def save_trail(symbol: str, side: str, stop: float):
-    d = _load()
-    d[_key(symbol, side, "trail")] = stop
-    _save(d)
-
-
-def get_trail(symbol: str, side: str) -> float | None:
-    v = _load().get(_key(symbol, side, "trail"))
-    return float(v) if v is not None else None
-
-
-# ── TP1 / breakeven flags ────────────────────────────────────
-
-def set_tp1_hit(symbol: str, side: str, hit: bool = True):
-    d = _load()
-    d[_key(symbol, side, "tp1_hit")] = hit
-    _save(d)
-
-
-def is_tp1_hit(symbol: str, side: str) -> bool:
-    return bool(_load().get(_key(symbol, side, "tp1_hit"), False))
-
-
-def set_be_moved(symbol: str, side: str, moved: bool = True):
-    d = _load()
-    d[_key(symbol, side, "be_moved")] = moved
-    _save(d)
-
-
-def is_be_moved(symbol: str, side: str) -> bool:
-    return bool(_load().get(_key(symbol, side, "be_moved"), False))
-
-
-# ── Clear all state for a position ───────────────────────────
-
-def clear(symbol: str, side: str):
-    d = _load()
-    prefix = f"{symbol}_{side}_"
-    keys_to_del = [k for k in d if k.startswith(prefix)]
-    for k in keys_to_del:
-        del d[k]
-    _save(d)
-    log.debug(f"state.clear {symbol} {side} ({len(keys_to_del)} keys removed)")
-
-
-# ── Entry price/qty (para estimar PnL en cierres externos) ────
-
-def save_entry_details(symbol: str, side: str, entry_price: float, qty: float):
-    d = _load()
-    d[_key(symbol, side, "entry_price")] = entry_price
-    d[_key(symbol, side, "qty")] = qty
-    _save(d)
-
-
-def get_entry_details(symbol: str, side: str) -> tuple:
-    d = _load()
-    ep = d.get(_key(symbol, side, "entry_price"))
-    q  = d.get(_key(symbol, side, "qty"))
-    return (float(ep) if ep is not None else None,
-            float(q) if q is not None else None)
-
-
-# ── Daily PnL/trades state (bot-wide) ────────────────────────
-
-def save_day_state(day_pnl: float, day_trades: int, day_start_eq: float, day: str):
-    d = _load()
-    d["_day_pnl"]      = day_pnl
-    d["_day_trades"]   = day_trades
-    d["_day_start_eq"] = day_start_eq
-    d["_day"]          = day
-    _save(d)
-
-
-def get_day_state() -> tuple:
-    d = _load()
-    return d.get("_day_pnl"), d.get("_day_trades"), d.get("_day_start_eq"), d.get("_day")
-
-
-# ── Debug dump ────────────────────────────────────────────────
-
-def dump() -> dict:
-    return _load()
+    def write(self, row: dict):
+        with open(self.path, "a", newline="") as f:
+            csv.writer(f).writerow([row.get(c, "") for c in JOURNAL_COLS])

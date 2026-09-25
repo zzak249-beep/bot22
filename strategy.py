@@ -1,463 +1,444 @@
-"""
-strategy.py — Motor de señales v5 EDGE
+"""EP5 v4 · Entrada Precisa 5m (reparada). Lógica pura, sin red.
 
-7 ventajas sobre bots normales:
-  1. Regime filter  — detecta si el mercado está en tendencia o rango
-                      y solo opera en tendencia (elimina >60% de falsas señales)
-  2. Volume imbalance — detecta desequilibrio comprador/vendedor en las
-                        últimas velas antes de entrar (smart money footprint)
-  3. Fair Value Gap  — identifica gaps de precio no rellenados que actúan
-                       como imanes; solo entra si el precio acaba de salir de uno
-  4. Funding rate    — evita entrar LONG cuando funding > 0.1% (caro y saturado)
-                       y SHORT cuando funding < -0.05% (squeeze inminente)
-  5. ATR adaptativo  — SL/TP se calculan sobre la volatilidad real de las
-                       últimas 14 velas, no sobre % fijo
-  6. Multi-timeframe — 3m entrada, 15m tendencia, 1h macro, todos alineados
-  7. Score 0-100     — pondera los 7 filtros; solo opera con score >= 60
+Reparaciones respecto al Pine EP5-v3:
+  1. HTF sin repintado: la EMA 15m se construye solo con velas 15m CERRADAS.
+  2. distATR coherente: en v3 un LONG exigía htfBull (precio > EMA HTF) y a la vez
+     distATR <= -0.4 (precio < EMA HTF) → casi imposible. Ahora el pullback válido
+     es la banda [-touch_band, +pb_max] ATR alrededor de la EMA HTF a favor de tendencia.
+  3. No-chase invertido en v3 (bloqueaba el long cuando estaba muy por DEBAJO).
+     Ahora lo cubre pb_max: si está demasiado lejos a favor, no entra.
+  4. Score redundante (todo lo que puntuaba ya era obligatorio). Ahora hay un núcleo
+     obligatorio y un score de confluencias opcionales (sweep, FVG, killzone,
+     dominancia, wavelet-trend) con mínimo configurable.
+  5. El cruce ya no tiene que coincidir en la misma vela que todo lo demás: vale
+     un cruce en las últimas cross_age velas si la tendencia sigue por encima.
+  6. Trail monótono: el stop solo se mueve a favor (v3 podía bajarlo), y el BE
+     cubre las comisiones.
+  7. RVOL sin autoinclusión (media de volumen de las velas anteriores).
+  8. Tamaño por riesgo (v3 usaba el 100% del equity) y salida por tiempo.
 """
 from __future__ import annotations
-import logging
-from dataclasses import dataclass, field
-from typing import Optional
+
+import os
+from dataclasses import dataclass, fields, asdict
+
 import numpy as np
+import pandas as pd
 
-log = logging.getLogger("strategy")
 
-
-# ══════════════════════════════════════════════════════════════
-#  ESTRUCTURAS
-# ══════════════════════════════════════════════════════════════
-
-@dataclass
-class Candle:
-    open:   float
-    high:   float
-    low:    float
-    close:  float
-    volume: float
-
-    @property
-    def body(self) -> float:   return abs(self.close - self.open)
-    @property
-    def range(self) -> float:  return self.high - self.low
-    @property
-    def bullish(self) -> bool: return self.close > self.open
-    @property
-    def bearish(self) -> bool: return self.close < self.open
-    @property
-    def wick_up(self) -> float:
-        return self.high - max(self.open, self.close)
-    @property
-    def wick_dn(self) -> float:
-        return min(self.open, self.close) - self.low
+def env_val(raw: str, typ):
+    raw = raw.strip().strip('"').strip("'").strip()
+    if typ is bool:
+        return raw.lower() in ("1", "true", "yes", "si", "sí", "on")
+    return typ(raw)
 
 
 @dataclass
-class Signal:
-    symbol:   str
-    side:     str         # LONG | SHORT
-    price:    float
-    sl:       float
-    tp1:      float
-    tp2:      float
-    tp3:      float       # NUEVO: tercer objetivo (RR 4:1)
-    score:    int         # 0-100
-    regime:   str         # TREND | RANGE | CHOPPY
-    reason:   str         # texto con filtros que pasó
-    atr:      float       # ATR en precio
-    rr:       float       # ratio riesgo/recompensa real
+class Params:
+    # Régimen
+    look_energy: int = 40
+    dom_umbral: float = 1.30
+    er_rank_len: int = 100
+    er_min_pct: float = 55.0
+    # Wavelet
+    wav_len: int = 32
+    wav_s1: int = 3
+    wav_s2: int = 8
+    wav_s3: int = 21
+    wav_trend_min: float = 0.38
+    wav_noise_max: float = 0.45
+    # Cruce
+    approx_len: int = 8
+    mra_smooth: int = 8
+    cross_age: int = 2
+    min_body_atr: float = 0.50
+    min_close_loc: float = 0.60
+    max_dist_approx: float = 1.20
+    # HTF
+    htf_minutes: int = 15
+    htf_ema_len: int = 50
+    htf_slope_bars: int = 3
+    touch_band: float = 0.50
+    pb_max: float = 1.20
+    # Confluencias
+    sweep_look: int = 12
+    sweep_age: int = 3
+    fvg_max_age: int = 20
+    score_min: int = 2
+    # Filtros
+    session_mode: str = "LONDRES_NY"   # LONDRES_NY | KILLZONES | OVERLAP | TODO
+    atr_len: int = 14
+    atr_base_len: int = 50
+    atr_min_mult: float = 0.90
+    vol_len: int = 20
+    vol_mult: float = 1.20
+    vol_max: float = 5.0
+    use_vwap: bool = True
+    allow_long: bool = True
+    allow_short: bool = True
+    # Régimen BTC: largos solo con BTC 1h alcista, cortos solo con BTC 1h bajista
+    btc_filter: bool = True
+    btc_tf_min: int = 60
+    btc_ema_len: int = 50
+    btc_slope_bars: int = 3
+    # Riesgo / gestión
+    sl_atr: float = 1.4
+    tp_atr: float = 2.2
+    cost_pct: float = 0.10
+    max_cost_r: float = 0.22
+    be_r: float = 1.0
+    trail_start_r: float = 1.5
+    trail_atr: float = 1.2
+    max_bars: int = 36
+    cooldown_bars: int = 6
+
+    @classmethod
+    def from_env(cls) -> "Params":
+        kw = {}
+        for f in fields(cls):
+            raw = os.getenv(f.name.upper())
+            if raw is not None and raw.strip().strip('"').strip("'") != "":
+                kw[f.name] = env_val(raw, type(f.default))
+        return cls(**kw)
 
 
+# ─────────────────────────── indicadores ───────────────────────────
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rma(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(alpha=1.0 / n, adjust=False).mean()
+
+
+def sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=n).mean()
+
+
+def true_atr(d: pd.DataFrame, n: int) -> pd.Series:
+    pc = d.close.shift(1)
+    tr = pd.concat([d.high - d.low, (d.high - pc).abs(), (d.low - pc).abs()], axis=1).max(axis=1)
+    return rma(tr, n)
+
+
+def percentrank(s: pd.Series, n: int) -> pd.Series:
+    """Como ta.percentrank: % de las n velas previas <= valor actual."""
+    a = s.to_numpy(dtype=float)
+    out = np.full(len(a), np.nan)
+    if len(a) > n:
+        w = np.lib.stride_tricks.sliding_window_view(a, n + 1)
+        cur, prev = w[:, -1:], w[:, :-1]
+        valid = ~np.isnan(w).any(axis=1)
+        pr = (prev <= cur).sum(axis=1) / n * 100.0
+        out[n:] = np.where(valid, pr, np.nan)
+    return pd.Series(out, index=s.index)
+
+
+def sessions(hour: pd.Series):
+    lon = (hour >= 7) & (hour < 16)
+    ny = (hour >= 13) & (hour < 21)
+    ov = (hour >= 13) & (hour < 16)
+    kz = ((hour >= 7) & (hour < 10)) | ov
+    return lon, ny, ov, kz
+
+
+def _htf(d: pd.DataFrame, t: pd.Series, p: Params, base_min: int) -> pd.DataFrame:
+    return htf_trend(d, t, p.htf_minutes, p.htf_ema_len, p.htf_slope_bars, base_min)
+
+
+def htf_trend(d: pd.DataFrame, t: pd.Series, m: int, ema_len: int, slope_bars: int, base_min: int = 5) -> pd.DataFrame:
+    """EMA HTF con velas HTF cerradas, alineada sin lookahead a cada vela base."""
+    per = max(1, m // base_min)
+    x = pd.Series(d.close.to_numpy(), index=pd.DatetimeIndex(t))
+    g = x.resample(f"{m}min", label="left", closed="left")
+    hc = pd.DataFrame({"close": g.last(), "n": g.count()})
+    hc = hc[hc.n == per].copy()
+    hc["ema"] = ema(hc.close, ema_len)
+    hc["slope"] = hc.ema - hc.ema.shift(slope_bars)
+    hc["avail"] = hc.index + pd.Timedelta(minutes=m)
+    left = pd.DataFrame({"ct": (t + pd.Timedelta(minutes=base_min)).to_numpy()})
+    right = hc.reset_index(drop=True)[["avail", "close", "ema", "slope"]]
+    right["avail"] = right["avail"].astype(left["ct"].dtype)
+    return pd.merge_asof(left, right, left_on="ct", right_on="avail", direction="backward")
+
+
+def compute(df: pd.DataFrame, p: Params, base_min: int = 5) -> pd.DataFrame:
+    """df: time(ms, apertura), open, high, low, close, volume — SOLO velas cerradas."""
+    d = df[["time", "open", "high", "low", "close", "volume"]].astype(float).reset_index(drop=True)
+    d["time"] = d["time"].astype("int64")
+    o, h, l, c, v = d.open, d.high, d.low, d.close, d.volume
+    t = pd.Series(pd.to_datetime(d.time, unit="ms", utc=True))
+
+    atr = true_atr(d, p.atr_len)
+    atr_pct = atr / c * 100.0
+    atr_exp = atr >= sma(atr, p.atr_base_len) * p.atr_min_mult
+
+    trend = ema(c, p.mra_smooth)
+    approx = sma(trend, p.approx_len)
+
+    r_fino = c.diff().abs()
+    r_grueso = (trend - trend.shift(max(1, p.mra_smooth // 2))).abs()
+    ratio = sma(r_grueso ** 2, p.look_energy) / sma(r_fino ** 2, p.look_energy)
+    dominante = ratio >= p.dom_umbral
+
+    er = (c - c.shift(p.look_energy)).abs() / c.diff().abs().rolling(p.look_energy).sum()
+    er_pct = percentrank(er, p.er_rank_len)
+    er_ok = er_pct >= p.er_min_pct
+
+    e1, e2, e3 = ema(c, p.wav_s1), ema(c, p.wav_s2), ema(c, p.wav_s3)
+    en1 = sma((c - e1) ** 2, p.wav_len)
+    en2 = sma((e1 - e2) ** 2, p.wav_len)
+    en3 = sma((e2 - e3) ** 2, p.wav_len)
+    tot = (en1 + en2 + en3).replace(0, np.nan)
+    wave_noise = (en1 / tot) >= p.wav_noise_max
+    wave_trend = (en3 / tot) >= p.wav_trend_min
+
+    h8 = trend - trend.shift(p.mra_smooth)
+    body = (c - o).abs()
+    rng = h - l
+    close_loc = ((c - l) / rng.replace(0, np.nan)).fillna(0.5)
+    body_ok = body >= atr * p.min_body_atr
+
+    cross_up = (trend > approx) & (trend.shift(1) <= approx.shift(1))
+    cross_dn = (trend < approx) & (trend.shift(1) >= approx.shift(1))
+    k = p.cross_age + 1
+    cross_up_rec = cross_up.astype(int).rolling(k, min_periods=1).max().astype(bool) & (trend > approx)
+    cross_dn_rec = cross_dn.astype(int).rolling(k, min_periods=1).max().astype(bool) & (trend < approx)
+    no_chase_apx = ((trend - approx) / atr).abs() <= p.max_dist_approx
+
+    rvol = v / sma(v, p.vol_len).shift(1)
+    vol_ok = (rvol >= p.vol_mult) & (rvol <= p.vol_max)
+
+    day = t.dt.floor("D")
+    hlc3 = (h + l + c) / 3.0
+    vwap = (hlc3 * v).groupby(day).cumsum() / v.groupby(day).cumsum().replace(0, np.nan)
+
+    hx = _htf(d, t, p, base_min)
+    htf_ema = hx["ema"]
+    htf_bull = (hx["close"] > htf_ema) & (hx["slope"] > 0)
+    htf_bear = (hx["close"] < htf_ema) & (hx["slope"] < 0)
+    dist = (c - htf_ema) / atr
+    dist_ok_l = (dist >= -p.touch_band) & (dist <= p.pb_max)
+    dist_ok_s = (dist <= p.touch_band) & (dist >= -p.pb_max)
+
+    lo_ref = l.shift(1).rolling(p.sweep_look).min()
+    hi_ref = h.shift(1).rolling(p.sweep_look).max()
+    sw_l = ((l < lo_ref) & (c > lo_ref)).astype(int).rolling(p.sweep_age + 1, min_periods=1).max().astype(bool)
+    sw_s = ((h > hi_ref) & (c < hi_ref)).astype(int).rolling(p.sweep_age + 1, min_periods=1).max().astype(bool)
+    fvg_l = (l > h.shift(2)).astype(int).rolling(p.fvg_max_age, min_periods=1).max().astype(bool)
+    fvg_s = (h < l.shift(2)).astype(int).rolling(p.fvg_max_age, min_periods=1).max().astype(bool)
+
+    hour = t.dt.hour
+    lon, ny, ov, kz = sessions(hour)
+    mode = p.session_mode.upper()
+    if mode == "TODO":
+        in_sess = pd.Series(True, index=d.index)
+    elif mode == "OVERLAP":
+        in_sess = ov
+    elif mode == "KILLZONES":
+        in_sess = kz
+    else:
+        in_sess = lon | ny
+
+    sl_dist = atr * p.sl_atr
+    coste_r = (p.cost_pct / 100.0 * c) / sl_dist
+    cost_ok = coste_r <= p.max_cost_r
+
+    vwap_l = (c > vwap) if p.use_vwap else pd.Series(True, index=d.index)
+    vwap_s = (c < vwap) if p.use_vwap else pd.Series(True, index=d.index)
+
+    score_l = sw_l.astype(int) + fvg_l.astype(int) + kz.astype(int) + dominante.astype(int) + wave_trend.astype(int)
+    score_s = sw_s.astype(int) + fvg_s.astype(int) + kz.astype(int) + dominante.astype(int) + wave_trend.astype(int)
+
+    common = er_ok & ~wave_noise & body_ok & vol_ok & atr_exp & in_sess & no_chase_apx & cost_ok
+    long_sig = common & htf_bull & dist_ok_l & cross_up_rec & (h8 > 0) & (c > o) \
+        & (close_loc >= p.min_close_loc) & vwap_l & (score_l >= p.score_min)
+    short_sig = common & htf_bear & dist_ok_s & cross_dn_rec & (h8 < 0) & (c < o) \
+        & (close_loc <= 1.0 - p.min_close_loc) & vwap_s & (score_s >= p.score_min)
+    if not p.allow_long:
+        long_sig[:] = False
+    if not p.allow_short:
+        short_sig[:] = False
+
+    sig = np.where(long_sig, 1, np.where(short_sig, -1, 0))
+    return pd.DataFrame({
+        "time": d.time, "open": o, "high": h, "low": l, "close": c,
+        "atr": atr, "atr_pct": atr_pct, "sig": sig,
+        "score": np.where(sig == 1, score_l, np.where(sig == -1, score_s, np.maximum(score_l, score_s))),
+        "dist": dist, "er_pct": er_pct, "rvol": rvol, "coste_r": coste_r,
+        "htf_bull": htf_bull, "htf_bear": htf_bear,
+        # diagnóstico por filtro
+        "f_er": er_ok, "f_noise_ok": ~wave_noise, "f_body": body_ok, "f_vol": vol_ok, "f_atrexp": atr_exp,
+        "f_sess": in_sess, "f_apx": no_chase_apx, "f_cost": cost_ok, "f_distL": dist_ok_l, "f_distS": dist_ok_s,
+        "f_crossL": cross_up_rec, "f_crossS": cross_dn_rec, "f_vwapL": vwap_l, "f_vwapS": vwap_s,
+        "scoreL": score_l, "scoreS": score_s,
+    })
+
+
+# ─────────────────────────── régimen BTC ───────────────────────────
+def regime_series(btc: pd.DataFrame, p: Params, base_min: int = 5) -> pd.DataFrame:
+    """time → reg (+1 alcista, -1 bajista, 0 neutro) de BTC en velas 1h cerradas."""
+    d = btc[["time", "close"]].reset_index(drop=True).copy()
+    d["time"] = d["time"].astype("int64")
+    d["close"] = d["close"].astype(float)
+    t = pd.Series(pd.to_datetime(d.time, unit="ms", utc=True))
+    hx = htf_trend(d, t, p.btc_tf_min, p.btc_ema_len, p.btc_slope_bars, base_min)
+    reg = np.where((hx["close"] > hx["ema"]) & (hx["slope"] > 0), 1,
+                   np.where((hx["close"] < hx["ema"]) & (hx["slope"] < 0), -1, 0))
+    return pd.DataFrame({"time": d.time, "reg": reg})
+
+
+def apply_regime(feat: pd.DataFrame, reg: pd.DataFrame | None, p: Params) -> pd.DataFrame:
+    """Anula señales contra el régimen BTC. Sin datos de BTC y filtro activo → sin señales."""
+    f = feat.copy()
+    if not p.btc_filter:
+        f["btc_reg"] = 0
+        return f
+    if reg is None or reg.empty:
+        f["btc_reg"] = 0
+        f["sig"] = 0
+        return f
+    m = pd.merge_asof(f[["time"]].astype("int64"), reg.astype({"time": "int64"}).sort_values("time"),
+                      on="time", direction="backward")
+    r = m["reg"].fillna(0).astype(int).to_numpy()
+    s = f["sig"].to_numpy()
+    f["btc_reg"] = r
+    f["sig"] = np.where(((s == 1) & (r == 1)) | ((s == -1) & (r == -1)), s, 0)
+    return f
+
+
+# ─────────────────────────── gestión de posición ───────────────────────────
 @dataclass
-class MarketContext:
-    """Contexto de mercado completo para tomar decisiones."""
-    funding_rate: float = 0.0
-    open_interest_delta: float = 0.0   # % cambio OI últimas 4h
-    volume_imbalance: float = 0.0      # >0 presión compradora, <0 vendedora
-    regime: str = "UNKNOWN"            # TREND_UP | TREND_DOWN | RANGE | CHOPPY
+class Pos:
+    symbol: str
+    side: int
+    entry: float
+    sl: float
+    tp: float
+    r: float
+    atr: float
+    opened_ms: int
+    last_ms: int
+    bars: int = 0
+    extreme: float = 0.0
+    sl_state: str = "inicial"      # inicial | be | trail
+    mfe: float = 0.0
+    mae: float = 0.0
+    score: int = 0
+    dist: float = 0.0
+    er_pct: float = 0.0
+    rvol: float = 0.0
+    atr_pct: float = 0.0
+    coste_r: float = 0.0
+    qty: float = 0.0
+    risk_usdt: float = 0.0
+    pos_side: str = ""
+    sl_order: str = ""
+    tp_order: str = ""
+    sl_live: float = 0.0
+    signal_px: float = 0.0
+    btc_reg: int = 0
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Pos":
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
 
 
-# ══════════════════════════════════════════════════════════════
-#  INDICADORES TÉCNICOS
-# ══════════════════════════════════════════════════════════════
-
-def _ema(values: list[float], p: int) -> np.ndarray:
-    arr = np.array(values, dtype=float)
-    out = np.full_like(arr, np.nan)
-    if len(arr) < p:
-        return out
-    k = 2 / (p + 1)
-    out[p - 1] = arr[:p].mean()
-    for i in range(p, len(arr)):
-        out[i] = arr[i] * k + out[i - 1] * (1 - k)
-    return out
+def new_pos(symbol: str, row, p: Params, entry: float | None = None) -> Pos:
+    side = int(row.sig)
+    e = float(entry if entry is not None else row.close)
+    r = float(row.atr) * p.sl_atr
+    return Pos(
+        symbol=symbol, side=side, entry=e, sl=e - side * r, tp=e + side * float(row.atr) * p.tp_atr,
+        r=r, atr=float(row.atr), opened_ms=int(row.time), last_ms=int(row.time), extreme=e,
+        score=int(row.score), dist=float(row.dist), er_pct=float(row.er_pct), rvol=float(row.rvol),
+        atr_pct=float(row.atr_pct), coste_r=p.cost_pct / 100.0 * e / r,
+        signal_px=float(row.close), btc_reg=int(getattr(row, "btc_reg", 0) or 0),
+    )
 
 
-def _rsi(closes: list[float], p: int = 14) -> float:
-    arr = np.diff(np.array(closes[-(p * 3):], dtype=float))
-    g = np.where(arr > 0, arr, 0.0)
-    l = np.where(arr < 0, -arr, 0.0)
-    ag, al = g[-p:].mean(), l[-p:].mean()
-    return 100.0 if al == 0 else 100 - (100 / (1 + ag / al))
+def track(pos: Pos, bar) -> None:
+    if pos.side == 1:
+        pos.extreme = max(pos.extreme, bar.high)
+        pos.mae = max(pos.mae, (pos.entry - bar.low) / pos.r)
+    else:
+        pos.extreme = min(pos.extreme, bar.low)
+        pos.mae = max(pos.mae, (bar.high - pos.entry) / pos.r)
+    pos.mfe = max(pos.mfe, pos.side * (pos.extreme - pos.entry) / pos.r)
 
 
-def _atr(candles: list[Candle], p: int = 14) -> float:
-    if len(candles) < p + 1:
-        return candles[-1].range if candles else 0.0
-    trs = [max(c.high - c.low,
-               abs(c.high - candles[i - 1].close),
-               abs(c.low  - candles[i - 1].close))
-           for i, c in enumerate(candles) if i > 0]
-    return float(np.mean(trs[-p:]))
+def check_exit(pos: Pos, bar):
+    """Stop tiene prioridad si stop y objetivo caen en la misma vela (conservador)."""
+    reason_stop = {"inicial": "stop", "be": "be", "trail": "trail"}[pos.sl_state]
+    if pos.side == 1:
+        if bar.low <= pos.sl:
+            return min(pos.sl, bar.open), reason_stop
+        if bar.high >= pos.tp:
+            return max(pos.tp, bar.open), "objetivo"
+    else:
+        if bar.high >= pos.sl:
+            return max(pos.sl, bar.open), reason_stop
+        if bar.low <= pos.tp:
+            return min(pos.tp, bar.open), "objetivo"
+    return None
 
 
-def _adx(candles: list[Candle], p: int = 14) -> float:
-    """ADX simplificado — mide fuerza de tendencia (0-100)."""
-    if len(candles) < p + 2:
-        return 0.0
-    dm_pos, dm_neg, tr_list = [], [], []
-    for i in range(1, len(candles)):
-        h, l = candles[i].high, candles[i].low
-        ph, pl, pc = candles[i-1].high, candles[i-1].low, candles[i-1].close
-        up   = h - ph
-        down = pl - l
-        dm_pos.append(up   if up > down and up > 0   else 0.0)
-        dm_neg.append(down if down > up and down > 0 else 0.0)
-        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
-    def _smooth(arr):
-        out = [sum(arr[:p])]
-        for v in arr[p:]:
-            out.append(out[-1] - out[-1] / p + v)
-        return out
-    atr_s = _smooth(tr_list)
-    dmp_s = _smooth(dm_pos)
-    dmn_s = _smooth(dm_neg)
-    dx = []
-    for a, p_, n in zip(atr_s, dmp_s, dmn_s):
-        if a == 0:
-            dx.append(0.0)
-            continue
-        di_p = 100 * p_ / a
-        di_n = 100 * n / a
-        s = di_p + di_n
-        dx.append(100 * abs(di_p - di_n) / s if s else 0.0)
-    return float(np.mean(dx[-p:])) if dx else 0.0
-
-
-def _volume_imbalance(candles: list[Candle], n: int = 5) -> float:
-    """
-    Ratio de presión compradora vs vendedora en las últimas n velas.
-    >1.3 → presión compradora fuerte
-    <0.7 → presión vendedora fuerte
-    """
-    recent = candles[-n:]
-    buy_vol  = sum(c.volume * (c.close - c.low)  / c.range if c.range else 0 for c in recent)
-    sell_vol = sum(c.volume * (c.high - c.close) / c.range if c.range else 0 for c in recent)
-    total = buy_vol + sell_vol
-    return buy_vol / total if total > 0 else 0.5
-
-
-def _detect_regime(candles: list[Candle], adx_val: float) -> str:
-    """
-    Detecta el régimen de mercado.
-    TREND_UP / TREND_DOWN / RANGE / CHOPPY
-    Clave: solo operar en TREND_UP o TREND_DOWN.
-    """
-    if adx_val >= 25:
-        closes = [c.close for c in candles[-20:]]
-        ema_fast = _ema(closes, 8)
-        ema_slow = _ema(closes, 21)
-        if ema_fast[-1] > ema_slow[-1]:
-            return "TREND_UP"
-        return "TREND_DOWN"
-    if adx_val >= 18:
-        return "RANGE"
-    return "CHOPPY"
-
-
-def _fair_value_gap(candles: list[Candle]) -> tuple[bool, bool]:
-    """
-    Detecta Fair Value Gaps (FVG) en las últimas 10 velas.
-    FVG alcista: vela i-2 high < vela i low (hueco sin rellenar)
-    FVG bajista: vela i-2 low > vela i high
-    Retorna (fvg_bull, fvg_bear)
-    """
-    recent = candles[-10:]
-    fvg_bull = fvg_bear = False
-    for i in range(2, len(recent)):
-        if recent[i-2].high < recent[i].low:       # gap alcista
-            fvg_bull = True
-        if recent[i-2].low  > recent[i].high:      # gap bajista
-            fvg_bear = True
-    return fvg_bull, fvg_bear
-
-
-def _structure_break(candles: list[Candle], n: int = 10) -> tuple[bool, bool]:
-    """
-    Break of Structure (BoS): precio rompe el swing high/low reciente.
-    Retorna (bullish_break, bearish_break)
-    """
-    highs = [c.high for c in candles[-n-1:-1]]
-    lows  = [c.low  for c in candles[-n-1:-1]]
-    curr  = candles[-1]
-    return (curr.close > max(highs),
-            curr.close < min(lows))
-
-
-def _pin_bar(c: Candle, side: str) -> bool:
-    if c.body == 0:
+def update_levels(pos: Pos, bar, atr_now: float, p: Params) -> bool:
+    """BE + chandelier. Solo mueve el stop a favor y nunca por encima/debajo del cierre."""
+    fav_r = pos.side * (pos.extreme - pos.entry) / pos.r
+    new_sl, state = pos.sl, pos.sl_state
+    better = max if pos.side == 1 else min
+    if state == "inicial" and fav_r >= p.be_r:
+        be = pos.entry * (1 + pos.side * p.cost_pct / 100.0)
+        if better(new_sl, be) != new_sl:
+            new_sl, state = be, "be"
+    if fav_r >= p.trail_start_r and atr_now > 0:
+        ch = pos.extreme - pos.side * p.trail_atr * atr_now
+        if better(new_sl, ch) != new_sl:
+            new_sl, state = ch, "trail"
+    if pos.side == 1 and new_sl >= bar.close:
         return False
-    if side == "LONG":
-        return c.wick_dn > c.body * 2.2 and c.wick_up < c.body
-    return c.wick_up > c.body * 2.2 and c.wick_dn < c.body
+    if pos.side == -1 and new_sl <= bar.close:
+        return False
+    if new_sl != pos.sl:
+        pos.sl, pos.sl_state = new_sl, state
+        return True
+    return False
 
 
-# ══════════════════════════════════════════════════════════════
-#  ESTRATEGIA PRINCIPAL
-# ══════════════════════════════════════════════════════════════
+def result(pos: Pos, exit_price: float) -> dict:
+    r_bruto = pos.side * (exit_price - pos.entry) / pos.r
+    return {"r_bruto": r_bruto, "coste_r": pos.coste_r, "r_neto": r_bruto - pos.coste_r}
 
-class EdgeStrategy:
-    """
-    Estrategia con 7 capas de filtro y score ponderado 0-100.
-    Score >= 60 para operar.
-    """
 
-    # Pesos de cada filtro en el score total
-    WEIGHTS = {
-        "ema_align":    20,   # EMAs 8/21/55 alineadas
-        "htf_align":    15,   # 15m y 1h alineados
-        "adx_trend":    15,   # ADX > 25 (tendencia real)
-        "rsi_zone":     10,   # RSI en zona correcta
-        "vol_imbal":    15,   # imbalance comprador/vendedor
-        "fvg_or_bos":   15,   # FVG o BoS reciente
-        "pin_or_vol":   10,   # pin bar o volumen spike
-    }
-    SCORE_MIN = 60
-
-    def __init__(self, cfg):
-        self.cfg = cfg
-
-    def evaluate(
-        self,
-        symbol:     str,
-        c3m:        list[Candle],
-        c15m:       list[Candle],
-        c1h:        list[Candle],
-        ctx:        MarketContext,
-    ) -> Optional[Signal]:
-
-        cfg = self.cfg
-        closes = [c.close for c in c3m]
-        curr   = c3m[-1]
-        prev   = c3m[-2]
-
-        # ── Indicadores base ──────────────────────────────────
-        e8  = _ema(closes, 8)
-        e21 = _ema(closes, 21)
-        e55 = _ema(closes, 55)
-        if any(np.isnan(x[-1]) for x in [e8, e21, e55]):
-            return None
-
-        atr_val = _atr(c3m, 14)
-        adx_val = _adx(c3m, 14)
-        rsi_val = _rsi(closes, 14)
-        regime  = _detect_regime(c3m, adx_val)
-        vim     = _volume_imbalance(c3m, 5)
-        fvg_b, fvg_s = _fair_value_gap(c3m)
-        bos_b, bos_s = _structure_break(c3m, 10)
-
-        # HTF tendencia
-        cl15  = [c.close for c in c15m]
-        e21_15 = _ema(cl15, 21)
-        e55_15 = _ema(cl15, 55)
-        htf_up = cl15[-1] > e21_15[-1] > e55_15[-1]
-        htf_dn = cl15[-1] < e21_15[-1] < e55_15[-1]
-
-        # Macro 1h
-        if len(c1h) >= 200:
-            cl1h   = [c.close for c in c1h]
-            e200_1h = _ema(cl1h, 200)
-            macro_up = cl1h[-1] > e200_1h[-1]
-            macro_dn = cl1h[-1] < e200_1h[-1]
-        else:
-            macro_up = macro_dn = True  # sin datos suficientes, neutro
-
-        # ── Filtro de régimen: no operar en RANGE/CHOPPY ─────
-        if regime in ("RANGE", "CHOPPY"):
-            log.debug("%s: régimen %s — skip", symbol, regime)
-            return None
-
-        # ── Funding rate filter ───────────────────────────────
-        # No LONG si funding muy positivo (costoso y saturado de longs)
-        # No SHORT si funding muy negativo (squeeze inminente)
-        if ctx.funding_rate > 0.001 and regime == "TREND_UP":
-            log.debug("%s: funding %.4f%% — long caro, skip", symbol, ctx.funding_rate*100)
-            return None
-        if ctx.funding_rate < -0.0005 and regime == "TREND_DOWN":
-            log.debug("%s: funding %.4f%% — short squeeze riesgo, skip", symbol, ctx.funding_rate*100)
-            return None
-
-        # ══════════════════════════════════════════════════════
-        #  EVALUACIÓN LONG
-        # ══════════════════════════════════════════════════════
-        if regime == "TREND_UP":
-            score = 0
-            reasons = []
-
-            # 1. EMA alineadas alcistas (20pts)
-            if e8[-1] > e21[-1] > e55[-1]:
-                cross = prev.close <= e8[-2] and curr.close > e8[-1]
-                if cross:
-                    score += self.WEIGHTS["ema_align"]
-                    reasons.append("EMA✓")
-                else:
-                    score += 10   # alineadas pero sin cross reciente
-                    reasons.append("EMA~")
-            else:
-                return None  # EMAs no alineadas = no operar
-
-            # 2. HTF alineado (15pts)
-            if htf_up and macro_up:
-                score += self.WEIGHTS["htf_align"]
-                reasons.append("HTF✓")
-            elif htf_up or macro_up:
-                score += 7
-                reasons.append("HTF~")
-
-            # 3. ADX fuerza tendencia (15pts)
-            if adx_val >= 30:
-                score += self.WEIGHTS["adx_trend"]
-                reasons.append(f"ADX{adx_val:.0f}")
-            elif adx_val >= 25:
-                score += 10
-                reasons.append(f"ADX{adx_val:.0f}")
-
-            # 4. RSI no sobrecomprado (10pts)
-            if 40 <= rsi_val <= 65:
-                score += self.WEIGHTS["rsi_zone"]
-                reasons.append(f"RSI{rsi_val:.0f}✓")
-            elif rsi_val < 70:
-                score += 5
-                reasons.append(f"RSI{rsi_val:.0f}")
-            else:
-                return None  # RSI > 70 = sobrecomprado, no entrar
-
-            # 5. Volume imbalance comprador (15pts)
-            if vim >= 0.60:
-                score += self.WEIGHTS["vol_imbal"]
-                reasons.append(f"VI{vim:.2f}✓")
-            elif vim >= 0.52:
-                score += 8
-                reasons.append(f"VI{vim:.2f}")
-
-            # 6. FVG o BoS alcista (15pts)
-            if fvg_b or bos_b:
-                score += self.WEIGHTS["fvg_or_bos"]
-                reasons.append("FVG/BoS✓")
-
-            # 7. Pin bar o volumen spike (10pts)
-            vol_avg = np.mean([c.volume for c in c3m[-20:-1]])
-            vol_spike = curr.volume >= vol_avg * 1.5
-            if _pin_bar(curr, "LONG") or vol_spike:
-                score += self.WEIGHTS["pin_or_vol"]
-                reasons.append("PIN/VOL✓")
-
-            if score < self.SCORE_MIN:
-                log.debug("%s LONG score=%d < %d — skip", symbol, score, self.SCORE_MIN)
-                return None
-
-            # ── Calcular niveles con ATR ──────────────────────
-            sl  = round(curr.close - atr_val * cfg.ATR_SL_MULT,  8)
-            tp1 = round(curr.close + atr_val * cfg.ATR_TP1_MULT, 8)
-            tp2 = round(curr.close + atr_val * cfg.ATR_TP2_MULT, 8)
-            tp3 = round(curr.close + atr_val * cfg.ATR_TP3_MULT, 8)
-            rr  = (tp1 - curr.close) / (curr.close - sl) if (curr.close - sl) > 0 else 0
-            if rr < 1.5:
-                log.debug("%s LONG RR=%.2f < 1.5 — skip", symbol, rr)
-                return None
-
-            return Signal(
-                symbol=symbol, side="LONG", price=curr.close,
-                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-                score=score, regime=regime,
-                reason=" | ".join(reasons), atr=atr_val, rr=rr,
-            )
-
-        # ══════════════════════════════════════════════════════
-        #  EVALUACIÓN SHORT
-        # ══════════════════════════════════════════════════════
-        if regime == "TREND_DOWN":
-            score = 0
-            reasons = []
-
-            if e8[-1] < e21[-1] < e55[-1]:
-                cross = prev.close >= e8[-2] and curr.close < e8[-1]
-                if cross:
-                    score += self.WEIGHTS["ema_align"]
-                    reasons.append("EMA✓")
-                else:
-                    score += 10
-                    reasons.append("EMA~")
-            else:
-                return None
-
-            if htf_dn and macro_dn:
-                score += self.WEIGHTS["htf_align"]
-                reasons.append("HTF✓")
-            elif htf_dn or macro_dn:
-                score += 7
-                reasons.append("HTF~")
-
-            if adx_val >= 30:
-                score += self.WEIGHTS["adx_trend"]
-                reasons.append(f"ADX{adx_val:.0f}")
-            elif adx_val >= 25:
-                score += 10
-                reasons.append(f"ADX{adx_val:.0f}")
-
-            if 35 <= rsi_val <= 60:
-                score += self.WEIGHTS["rsi_zone"]
-                reasons.append(f"RSI{rsi_val:.0f}✓")
-            elif rsi_val > 30:
-                score += 5
-                reasons.append(f"RSI{rsi_val:.0f}")
-            else:
-                return None  # RSI < 30 = posible rebote
-
-            if vim <= 0.40:
-                score += self.WEIGHTS["vol_imbal"]
-                reasons.append(f"VI{vim:.2f}✓")
-            elif vim <= 0.48:
-                score += 8
-                reasons.append(f"VI{vim:.2f}")
-
-            if fvg_s or bos_s:
-                score += self.WEIGHTS["fvg_or_bos"]
-                reasons.append("FVG/BoS✓")
-
-            vol_avg = np.mean([c.volume for c in c3m[-20:-1]])
-            if _pin_bar(curr, "SHORT") or curr.volume >= vol_avg * 1.5:
-                score += self.WEIGHTS["pin_or_vol"]
-                reasons.append("PIN/VOL✓")
-
-            if score < self.SCORE_MIN:
-                log.debug("%s SHORT score=%d < %d — skip", symbol, score, self.SCORE_MIN)
-                return None
-
-            sl  = round(curr.close + atr_val * cfg.ATR_SL_MULT,  8)
-            tp1 = round(curr.close - atr_val * cfg.ATR_TP1_MULT, 8)
-            tp2 = round(curr.close - atr_val * cfg.ATR_TP2_MULT, 8)
-            tp3 = round(curr.close - atr_val * cfg.ATR_TP3_MULT, 8)
-            rr  = (curr.close - tp1) / (sl - curr.close) if (sl - curr.close) > 0 else 0
-            if rr < 1.5:
-                log.debug("%s SHORT RR=%.2f < 1.5 — skip", symbol, rr)
-                return None
-
-            return Signal(
-                symbol=symbol, side="SHORT", price=curr.close,
-                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-                score=score, regime=regime,
-                reason=" | ".join(reasons), atr=atr_val, rr=rr,
-            )
-
-        return None
+def backtest_symbol(feat: pd.DataFrame, p: Params, symbol: str) -> list[dict]:
+    """Entrada al cierre de la vela de señal, gestión vela a vela (misma lógica que el bot)."""
+    trades, pos, last_exit_i = [], None, -10 ** 9
+    rows = list(feat.itertuples(index=False))
+    for i, bar in enumerate(rows):
+        if pos is not None:
+            track(pos, bar)
+            ex = check_exit(pos, bar)
+            pos.bars += 1
+            if ex is None:
+                update_levels(pos, bar, bar.atr, p)
+                if pos.bars >= p.max_bars:
+                    ex = (bar.close, "tiempo")
+            if ex is not None:
+                res = result(pos, ex[0])
+                trades.append({
+                    "symbol": symbol, "lado": "LONG" if pos.side == 1 else "SHORT",
+                    "abierta_ms": pos.opened_ms, "cerrada_ms": int(bar.time), "entrada": pos.entry,
+                    "salida": ex[0], "motivo": ex[1], **res, "barras": pos.bars, "score": pos.score,
+                    "dist_htf": pos.dist, "er_pct": pos.er_pct, "rvol": pos.rvol, "atr_pct": pos.atr_pct,
+                    "mfe": pos.mfe, "mae": pos.mae,
+                })
+                pos, last_exit_i = None, i
+            continue
+        if bar.sig != 0 and i - last_exit_i >= p.cooldown_bars and np.isfinite(bar.atr) and bar.atr > 0:
+            pos = new_pos(symbol, bar, p)
+    return trades
