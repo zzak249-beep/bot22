@@ -1090,7 +1090,16 @@ def main():
     signal.signal(signal.SIGTERM, _salir)
 
     dir_estado = os.path.dirname(CFG["STATE"]) or "."
-    sin_volumen = not os.path.ismount(dir_estado)
+    # Railway define RAILWAY_VOLUME_MOUNT_PATH cuando el servicio tiene volumen; os.path.ismount
+    # puede dar falso negativo con su forma de montar, así que vale cualquiera de las dos.
+    vol_rw = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").rstrip("/")
+    en_volumen_rw = bool(vol_rw) and os.path.abspath(dir_estado).startswith(os.path.abspath(vol_rw))
+    sin_volumen = not (os.path.ismount(dir_estado) or en_volumen_rw)
+    log.info("Volumen: RAILWAY_VOLUME_MOUNT_PATH=%s · estado en %s · %s", vol_rw or "(no definido)",
+             dir_estado, "PERSISTENTE" if not sin_volumen else "EFÍMERO")
+    if vol_rw and not en_volumen_rw:
+        log.warning("Hay volumen en %s pero el estado se escribe en %s: cambia STATE/CSV/PANEL_CSV "
+                    "a esa ruta", vol_rw, dir_estado)
     if sin_volumen:
         log.warning("%s NO es un volumen montado: el estado y los CSV se BORRAN en cada "
                     "redeploy y el calentamiento de 30 h vuelve a cero", dir_estado)
