@@ -1,6 +1,23 @@
 """
 crowding_bot.py — bot de SEÑALES del posicionamiento amontonado.
 
+═══════════════════════════════════════════════════════════════════════
+v3.0 — POR QUÉ CAMBIA (revisión de 393 ops fade, 18-30 sept 2026)
+═══════════════════════════════════════════════════════════════════════
+v2.x fade: -0.344 R/op neto, -0.175 R/op BRUTO. 56% de salidas por stop.
+La dirección no era el problema principal: desde la entrada, el precio iba
++54 pb a 8 h y +101 pb a 24 h a favor, pero el stop de 1,5 ATR y la salida
+a 4 h cortaban justo antes. Cambios:
+  - GATILLO=ninguno: entra al cierre de la vela en que se cumple la
+    condición (sin esperar vela en contra ni score de cuerpo).
+  - SL_ATR 4.0 (stop de catástrofe), TP_R 0 (sin objetivo), sin trail.
+  - MAX_BARS 32 (8 h en 15m). ENFRIA_BARRAS 32.
+  - MAX_COST_R 0.08 (con SL 4 ATR equivale a ATR >= ~0,8%).
+  - Anota r_4h (R a mitad de camino) para comparar horizontes gratis.
+  - CSV nuevo (crowding_ops_v3.csv) para no mezclar con v2.
+Ojo: en el panel, deduplicando y con 25 pb de coste, la ventaja a 8 h es
+~0 (t≈0,5). Esto es un experimento con datos NUEVOS, no una mejora probada.
+
 NO OPERA. NO PIDE CLAVES DE API. Usa solo endpoints públicos de BingX, así
 que no puede tocar tu cuenta ni por error. Su único trabajo es generar
 señales y MEDIRSE A SÍ MISMO.
@@ -79,7 +96,7 @@ from urllib3.util.retry import Retry
 import confirm as cf
 import panel as pn
 
-VERSION = "2.6"   # ÚNICA fuente de versión: log, Telegram y User-Agent
+VERSION = "3.0"   # ÚNICA fuente de versión: log, Telegram y User-Agent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,11 +153,13 @@ CFG = {
     "Z_OI": env("Z_OI", 1.2),
     "EXT_PCT": env("EXT_PCT", 85.0),
     "ATR_LEN": env("ATR_LEN", 14),
-    "SL_ATR": env("SL_ATR", 1.5),
-    "TP_R": env("TP_R", 1.5),
-    "MAX_BARS": env("MAX_BARS", 16),
-    # v2.5 — panel IC: basis predice CONTINUACIÓN → default momentum
-    "MODE": env("MODE", "momentum"),
+    # v3.0: stop de catástrofe, sin objetivo, salida por tiempo a 8 h
+    "SL_ATR": env("SL_ATR", 4.0),
+    "TP_R": env("TP_R", 0.0),                 # 0 = sin objetivo
+    "MAX_BARS": env("MAX_BARS", 32),
+    "MODE": env("MODE", "fade"),
+    # ninguno = entra al cierre de la vela con condición | vela = gatillo v2
+    "GATILLO": env("GATILLO", "ninguno"),
     "CUERPO_MIN": env("CUERPO_MIN", 0.50),
     "DISP_ATR_MIN": env("DISP_ATR_MIN", 0.60),
     "USE_DECIL": env("USE_DECIL", True),
@@ -152,10 +171,10 @@ CFG = {
     # Anticorprelación: máx señales por ciclo (mismo régimen de mercado)
     "MAX_SENALES_CICLO": env("MAX_SENALES_CICLO", 3),
     # Trail virtual tras 1R a favor
-    "TRAIL_AFTER_R": env("TRAIL_AFTER_R", 1.0),
+    "TRAIL_AFTER_R": env("TRAIL_AFTER_R", 0.0),   # 0 = sin trail
     "TRAIL_ATR": env("TRAIL_ATR", 1.0),
     # Score mínimo (0–5): z + decil + cuerpo + funding + OI
-    "SCORE_MIN": env("SCORE_MIN", 3),
+    "SCORE_MIN": env("SCORE_MIN", 0),
     # MIN_ATR_PCT=1.0 en 15m exige ~200% de volatilidad anualizada: lo pasaban
     # solo las microcaps de lotería, y en este universo NINGUNA. El filtro
     # además DUPLICA a MAX_COST_R con peor criterio: con COST_PCT=0.25 y
@@ -180,13 +199,14 @@ CFG = {
     "NO_NUEVO_EXTREMO": env("NO_NUEVO_EXTREMO", 6),
     # Sin enfriamiento, un rally reparte señales durante horas y todas son
     # la misma apuesta contada como si fueran independientes.
-    "ENFRIA_BARRAS": env("ENFRIA_BARRAS", 12),
+    "ENFRIA_BARRAS": env("ENFRIA_BARRAS", 32),
     "COST_PCT": env("COST_PCT", 0.25),
-    "MAX_COST_R": env("MAX_COST_R", 0.15),
+    "MAX_COST_R": env("MAX_COST_R", 0.08),
     "MIN_VOL_24H": env("MIN_VOL_24H", 5_000_000.0),
     "MAX_SYMBOLS": env("MAX_SYMBOLS", 150),
     "STATE": env("STATE", "/data/crowding_state.json"),
-    "CSV": env("CSV", "/data/crowding_ops.csv"),
+    "CSV": env("CSV", "/data/crowding_ops_v3.csv"),
+    "R_MITAD_BARRAS": env("R_MITAD_BARRAS", 16),   # barra en la que se anota r_4h
     "TG_TOKEN": env("TG_TOKEN", ""),
     "TG_CHAT": env("TG_CHAT", ""),
     "REPORT_HOUR": env("REPORT_HOUR", 7),
@@ -395,6 +415,9 @@ class Virtual:
     # el objetivo está demasiado lejos y lo estás devolviendo.
     mfe: float = 0.0
     mae: float = 0.0
+    # R bruto al cierre de la barra R_MITAD_BARRAS (4 h en 15m). Compara
+    # horizontes 4 h vs 8 h con las mismas señales, sin otro experimento.
+    r_4h: float | None = None
 
 
 def _podar(h: deque, ahora: float, horas: float):
@@ -529,7 +552,8 @@ _CFG_OBJ = _Cfg()
 
 COLS = ["cerrada_utc", "symbol", "lado", "abierta_utc", "entrada", "salida",
         "motivo", "r_bruto", "coste_r", "r_neto", "barras", "basis_z",
-        "oi_z", "funding", "atr_pct", "conf_z", "conf_regimen", "mfe", "mae"]
+        "oi_z", "funding", "atr_pct", "conf_z", "conf_regimen", "mfe", "mae",
+        "r_4h", "version"]
 
 
 def anotar(fila: dict):
@@ -714,6 +738,30 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
     if abs(fund) > float(CFG.get("FUNDING_MAX_ABS", 0.05)):
         return None, f"funding extremo ({fund:+.4f}%)"
 
+    gatillo = str(CFG.get("GATILLO", "ninguno")).strip().lower()
+    if modo == "fade" and gatillo == "ninguno":
+        # v3.0: la condición basta; entra al cierre de la última vela cerrada.
+        lado = "SHORT" if largos_amont else "LONG"
+        score = 0
+        if abs(zb) >= float(CFG["Z_BASIS"]) + 0.3:
+            score += 1
+        if abs(zb) >= 2.5:
+            score += 1
+        if zo >= float(CFG["Z_OI"]) + 0.5:
+            score += 1
+        if abs(fund) <= 0.02:
+            score += 1
+        if score < int(CFG.get("SCORE_MIN", 0)):
+            return None, f"score {score}<{int(CFG.get('SCORE_MIN', 0))}"
+        ULTIMA_SENAL[symbol] = ult["t"]
+        reg = cf.calcular(_CFG_OBJ, cierres_reg)
+        return (lado, {"px": px, "riesgo": riesgo, "coste_r": coste_r, "zb": zb,
+                       "zo": zo, "funding": fund, "atr_pct": atr_pct,
+                       "conf_z": reg.z if reg.ok else 0.0,
+                       "conf_regimen": reg.etiqueta if reg.ok else reg.motivo,
+                       "mode": f"{modo}/{gatillo}", "score": score,
+                       "t_senal": ult["t"]}), "señal"
+
     if modo == "fade":
         ne = int(CFG["NO_NUEVO_EXTREMO"])
         if ne > 0 and len(velas) > ne + 1:
@@ -795,12 +843,15 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
     nuevas = [k for k in velas_cerradas(velas) if k["t"] > v.abierta_ts]
     if not nuevas:
         return
+    # Tras un parón/redeploy pueden llegar más velas que MAX_BARS: se sale en la N.
+    nuevas = nuevas[: int(CFG["MAX_BARS"])]
     v.barras = len(nuevas)
     largo = v.lado == "LONG"
     salida = motivo = None
     trail_after = float(CFG.get("TRAIL_AFTER_R", 1.0))
     trail_atr_m = float(CFG.get("TRAIL_ATR", 1.0))
-    for k in nuevas:
+    n_mitad = int(CFG.get("R_MITAD_BARRAS", 16))
+    for idx, k in enumerate(nuevas, start=1):
         favor = (k["h"] - v.entrada) if largo else (v.entrada - k["l"])
         contra = (v.entrada - k["l"]) if largo else (k["h"] - v.entrada)
         v.mfe = max(v.mfe, favor / v.riesgo)
@@ -809,13 +860,16 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
         # vale desde la siguiente (antes se movía con el cierre y se comprobaba con
         # el mínimo de la MISMA vela: salidas que en real no habrían pasado).
         toca_sl = (k["l"] <= v.sl) if largo else (k["h"] >= v.sl)
-        toca_tp = (k["h"] >= v.tp) if largo else (k["l"] <= v.tp)
+        # tp <= 0 = sin objetivo (v3.0, TP_R=0)
+        toca_tp = v.tp > 0 and ((k["h"] >= v.tp) if largo else (k["l"] <= v.tp))
         if toca_sl:
             salida, motivo = v.sl, "stop"
             break
         if toca_tp:
             salida, motivo = v.tp, "objetivo"
             break
+        if idx == n_mitad and v.r_4h is None and v.riesgo > 0:
+            v.r_4h = ((k["c"] - v.entrada) if largo else (v.entrada - k["c"])) / v.riesgo
         # Trail: tras +1R mueve SL a favor (breakeven+)
         if trail_after > 0 and v.mfe >= trail_after and v.riesgo > 0:
             atr_aprox = v.riesgo / float(CFG["SL_ATR"]) if float(CFG["SL_ATR"]) > 0 else v.riesgo
@@ -845,6 +899,8 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
         "funding": round(v.funding, 5), "atr_pct": round(v.atr_pct, 3),
         "conf_z": round(v.conf_z, 3), "conf_regimen": v.conf_regimen,
         "mfe": round(v.mfe, 3), "mae": round(v.mae, 3),
+        "r_4h": "" if v.r_4h is None else round(v.r_4h, 4),
+        "version": VERSION,
     })
     icono = "✅" if neto > 0 else "🔴"
     tg(f"{icono} <b>{v.symbol.split('-')[0]}</b> {v.lado} virtual cerrada por {motivo}: "
@@ -884,11 +940,21 @@ def informe(st: Estado):
     else:
         lectura = f"muestra {n}: detecta ventajas ≥0.20 R/op"
 
-    L = [f"📊 <b>Crowding · informe</b>",
+    r4 = []
+    for x in filas:
+        try:
+            if x.get("r_4h") not in (None, ""):
+                r4.append(float(x["r_4h"]) - float(x["coste_r"]))
+        except ValueError:
+            pass
+    L = [f"📊 <b>Crowding v{VERSION} · informe</b>",
          f"<b>{n}</b> operaciones · {gan / n * 100:.0f}% ganadoras",
          f"<b>{media:+.3f} R/op</b> · total {sum(rs):+.1f} R · t={t:.2f}",
          f"<i>{lectura}</i>",
          f"Días con operaciones: {len(por_dia)}"]
+    if r4:
+        L.append(f"Si hubiera salido a {int(CFG['R_MITAD_BARRAS'])} velas: "
+                 f"{statistics.fmean(r4):+.3f} R/op neto (n={len(r4)})")
     if dom > 40:
         L.append(f"⚠️ El día {peor[0]} pesa el {dom:.0f}% del total: son señales "
                  f"correlacionadas, no {n} independientes")
@@ -992,7 +1058,13 @@ def ciclo(st: Estado, simbolos: list[str]):
             lado, d = sig
             entrada = d["px"]
             sl = entrada - d["riesgo"] if lado == "LONG" else entrada + d["riesgo"]
-            tp = entrada + float(CFG["TP_R"]) * d["riesgo"] if lado == "LONG" else entrada - float(CFG["TP_R"]) * d["riesgo"]
+            tp_r = float(CFG["TP_R"])
+            if tp_r > 0:
+                tp = entrada + tp_r * d["riesgo"] if lado == "LONG" else entrada - tp_r * d["riesgo"]
+                if tp <= 0:
+                    tp = 0.0
+            else:
+                tp = 0.0                        # sin objetivo
             st.abiertas[sym] = Virtual(
                 symbol=sym, lado=lado, abierta_ts=d["t_senal"], entrada=entrada,
                 sl=sl, tp=tp, riesgo=d["riesgo"], coste_r=d["coste_r"],
@@ -1001,7 +1073,7 @@ def ciclo(st: Estado, simbolos: list[str]):
             señales += 1
             flecha = "🟢" if lado == "LONG" else "🔴"
             tg(f"{flecha} <b>{sym.split('-')[0]}</b> {lado} · {d.get('mode','?')} · score {d.get('score',0)}\n"
-               f"Entrada <code>{entrada:.8g}</code> · SL <code>{sl:.8g}</code> · TP <code>{tp:.8g}</code>\n"
+               f"Entrada <code>{entrada:.8g}</code> · SL <code>{sl:.8g}</code> · TP <code>{(f'{tp:.8g}' if tp > 0 else 'no')}</code> · salida {int(CFG['MAX_BARS'])} velas\n"
                f"basis z {d['zb']:+.2f} · OI z {d['zo']:+.2f} · funding {d['funding']:+.4f}%\n"
                f"ATR {d['atr_pct']:.2f}% · coste {d['coste_r']:.2f} R\n"
                f"<i>Solo señal virtual · v{VERSION}</i>", "senal")
@@ -1078,8 +1150,10 @@ def ciclo(st: Estado, simbolos: list[str]):
 
 
 def main():
-    log.info("Crowding bot v%s — SOLO SEÑALES · MODE=%s · score≥%s | %s workers=%s",
-             VERSION, CFG.get("MODE"), CFG.get("SCORE_MIN"), CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
+    log.info("Crowding bot v%s — SOLO SEÑALES · MODE=%s · GATILLO=%s · SL %.1f ATR · TP_R %.1f · "
+             "MAX_BARS %d · score≥%s | %s workers=%s",
+             VERSION, CFG.get("MODE"), CFG.get("GATILLO"), float(CFG["SL_ATR"]), float(CFG["TP_R"]),
+             int(CFG["MAX_BARS"]), CFG.get("SCORE_MIN"), CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
     st = Estado(CFG["STATE"])
 
     # Railway manda SIGTERM al redesplegar: se guarda el estado antes de salir.
